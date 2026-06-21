@@ -4,8 +4,7 @@
 
 ## 界面预览
 
-![控制台界面](screenshot.jpg)
-
+![控制台界面](docs/images/screenshot.jpg)
 
 ## 目录结构
 
@@ -15,6 +14,8 @@
 │  ├─ subtitle_frontend.py
 │  ├─ audio_to_subtitle.py
 │  └─ subtitle_pipeline.py
+├─ docs/                 # 项目文档及界面截图
+│  └─ images/
 ├─ scripts/              # 安装和示例运行脚本
 ├─ runtime/
 │  ├─ logs/              # 前端任务日志，可删除
