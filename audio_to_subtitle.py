@@ -12,6 +12,7 @@ from openai import OpenAI
 
 
 Segment = Dict[str, Any]
+VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m2ts", ".ts", ".mov", ".wmv"}
 
 
 def get_ffmpeg_path() -> str:
@@ -24,6 +25,38 @@ def get_ffmpeg_path() -> str:
         return imageio_ffmpeg.get_ffmpeg_exe()
     except Exception as exc:
         raise RuntimeError("ffmpeg not found in PATH. Install ffmpeg or imageio-ffmpeg.") from exc
+
+
+def find_main_video_in_folder(folder_path: Path) -> Path:
+    if not folder_path.is_dir():
+        raise NotADirectoryError(folder_path)
+
+    stream_dir = folder_path / "BDMV" / "STREAM"
+    search_roots = [stream_dir] if stream_dir.exists() else [folder_path]
+    candidates: List[Path] = []
+
+    for root in search_roots:
+        for candidate in root.rglob("*"):
+            if candidate.is_file() and candidate.suffix.lower() in VIDEO_EXTENSIONS:
+                candidates.append(candidate)
+
+    if not candidates and stream_dir.exists():
+        for candidate in folder_path.rglob("*"):
+            if candidate.is_file() and candidate.suffix.lower() in VIDEO_EXTENSIONS:
+                candidates.append(candidate)
+
+    if not candidates:
+        raise FileNotFoundError(f"No supported video file found in folder: {folder_path}")
+
+    return max(candidates, key=lambda path: path.stat().st_size)
+
+
+def resolve_video_path(input_path: Path) -> Path:
+    if input_path.is_dir():
+        video_path = find_main_video_in_folder(input_path)
+        print(f"Selected main video from folder: {video_path}")
+        return video_path
+    return input_path
 
 
 def extract_audio(video_path: Path, temp_audio_path: Path) -> None:
@@ -619,7 +652,7 @@ def default_output_root() -> Path:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Transcribe or import English subtitles and translate to ASS.")
-    parser.add_argument("--video", type=str, required=True, help="Path to the video file")
+    parser.add_argument("--video", type=str, required=True, help="Path to the video file or Blu-ray folder")
     parser.add_argument("--source", choices=["auto", "srt", "audio"], default="audio", help="Subtitle source")
     parser.add_argument("--srt", type=str, help="Explicit English SRT path")
     parser.add_argument("--output-root", type=str, help="Output root. Defaults to sibling '1 字幕' folder.")
@@ -633,7 +666,10 @@ def main() -> None:
     parser.add_argument("--max-duration", type=float, default=6.0, help="Maximum seconds per subtitle event before splitting")
     args = parser.parse_args()
 
-    video_path = Path(args.video)
+    input_path = Path(args.video)
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input path not found: {input_path}")
+    video_path = resolve_video_path(input_path)
     if not video_path.exists():
         raise FileNotFoundError(f"Video file not found: {video_path}")
 
@@ -646,6 +682,7 @@ def main() -> None:
     output_root = Path(args.output_root) if args.output_root else default_output_root()
     out_dir = output_root / series_name / movie_name
     checkpoint_path = out_dir / f"{movie_name}.segments.checkpoint.json"
+    source_segments_path = out_dir / f"{movie_name}.segments.source.json"
 
     srt_path = Path(args.srt) if args.srt else None
     if args.source in ("auto", "srt") and not srt_path:
@@ -666,6 +703,11 @@ def main() -> None:
             max_words=args.max_words,
             max_chars=args.max_chars,
             max_duration=args.max_duration,
+        )
+        source_segments_path.parent.mkdir(parents=True, exist_ok=True)
+        source_segments_path.write_text(
+            json.dumps(subtitle_segments, ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
         print_timing_report(subtitle_segments)
 
