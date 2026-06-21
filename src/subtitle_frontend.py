@@ -850,13 +850,27 @@ async function api(path, body = {}) {
 }
 
 async function selectFile() {
-  const data = await api('/api/select-file');
-  if (data.path) document.getElementById('path').value = data.path;
+  try {
+    const data = await api('/api/select-file');
+    if (data.path) {
+      document.getElementById('path').value = data.path;
+      saveFormState();
+    }
+  } catch (e) {
+    document.getElementById('log').textContent = `选择文件失败: ${e.message}`;
+  }
 }
 
 async function selectFolder() {
-  const data = await api('/api/select-folder');
-  if (data.path) document.getElementById('path').value = data.path;
+  try {
+    const data = await api('/api/select-folder');
+    if (data.path) {
+      document.getElementById('path').value = data.path;
+      saveFormState();
+    }
+  } catch (e) {
+    document.getElementById('log').textContent = `选择文件夹失败: ${e.message}`;
+  }
 }
 
 function payload() {
