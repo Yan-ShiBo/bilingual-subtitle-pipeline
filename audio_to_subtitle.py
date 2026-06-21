@@ -419,9 +419,11 @@ def translate_and_correct_segments(
     if checkpoint_path and checkpoint_path.exists():
         try:
             cached = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-            if isinstance(cached, list) and len(cached) <= len(segments):
+            if isinstance(cached, list) and len(cached) <= len(segments) and checkpoint_matches_segments(cached, segments):
                 processed_segments = cached
                 print(f"Resuming from checkpoint with {len(processed_segments)} completed segments.")
+            else:
+                print(f"Ignoring checkpoint because it does not match the current subtitle segmentation.")
         except Exception as exc:
             print(f"Ignoring unreadable checkpoint {checkpoint_path}: {exc}")
 
@@ -511,6 +513,23 @@ Rules:
             )
 
     return processed_segments
+
+
+def checkpoint_matches_segments(cached: List[Segment], segments: List[Segment]) -> bool:
+    for index, cached_segment in enumerate(cached):
+        current = segments[index]
+        same_start = abs(float(cached_segment["start"]) - float(current["start"])) <= 0.02
+        same_end = abs(float(cached_segment["end"]) - float(current["end"])) <= 0.02
+        same_text = clean_subtitle_text(str(cached_segment.get("text", ""))) == clean_subtitle_text(str(current.get("text", "")))
+        if not (same_start and same_end and same_text):
+            print(
+                "Checkpoint mismatch at item "
+                f"{index}: cached {cached_segment.get('start')}->{cached_segment.get('end')} "
+                f"{cached_segment.get('text')!r}, current {current.get('start')}->{current.get('end')} "
+                f"{current.get('text')!r}"
+            )
+            return False
+    return True
 
 
 def validate_timing_preserved(source_batch: List[Segment], processed_batch: List[Segment], global_start: int) -> None:
