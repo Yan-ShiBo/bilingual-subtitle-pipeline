@@ -9,6 +9,7 @@ test_outputs*/
 *.ass
 *.json
 *.checkpoint.json
+*.log
 
 *.mkv
 *.mp4
