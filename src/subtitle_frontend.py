@@ -787,7 +787,7 @@ def html_page() -> str:
         <label>最长秒数</label>
         <input id="maxDuration" type="number" value="6" min="1" max="20" step="0.5">
       </div>
-      <div class="span-2"><button onclick="analyze()">分析</button></div>
+      <div class="span-2"><button id="analyzeBtn" onclick="analyze()">分析</button></div>
     </div>
   </section>
 
@@ -894,14 +894,23 @@ function payload() {
 }
 
 async function analyze() {
+  const btn = document.getElementById('analyzeBtn');
+  if (btn) { btn.textContent = '分析中...'; btn.disabled = true; }
   try {
     const data = await api('/api/analyze', payload());
     state.lastAnalysis = data;
     document.getElementById('seriesName').value = data.series_name;
     document.getElementById('movieName').value = data.movie_name;
     render(data);
+    if (data.name_source && data.name_source.includes('heuristic (')) {
+      document.getElementById('log').textContent = `大模型提取片名失败，已回退到基础识别。报错信息: ${data.name_source}`;
+    } else {
+      document.getElementById('log').textContent = '分析完成。';
+    }
   } catch (e) {
     document.getElementById('log').textContent = `分析失败: ${e.message}`;
+  } finally {
+    if (btn) { btn.textContent = '分析'; btn.disabled = false; }
   }
 }
 
