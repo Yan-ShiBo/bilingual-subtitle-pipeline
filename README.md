@@ -2,6 +2,11 @@
 
 本项目用于在 Windows 本地生成双语 ASS 字幕，支持普通视频文件、蓝光文件夹、已有字幕文件、MKV/M2TS 内封字幕、PGS 图像字幕 OCR、Whisper 语音识别，以及 Ollama `qwen3:14b` 纠错翻译。
 
+## 界面预览
+
+![控制台界面](screenshot.jpg)
+
+
 ## 目录结构
 
 ```text
