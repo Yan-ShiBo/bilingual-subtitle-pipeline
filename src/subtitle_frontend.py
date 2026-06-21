@@ -109,10 +109,11 @@ def infer_single_file_names(input_path: Path, video_path: Path, fallback: Dict[s
 
     system_prompt = "You extract clean movie and episode names from release filenames."
     prompt = f"""
-Extract clean movie or episode names from the video filename and its parent folder.
+Extract clean movie or episode names from the selected path and the video filename.
 
+Selected name: {input_path.name}
 Filename: {video_path.name}
-Parent folder: {video_path.parent.name}
+Parent folder of video: {video_path.parent.name}
 
 Return ONLY a JSON object:
 {{
@@ -123,7 +124,7 @@ Return ONLY a JSON object:
 
 Rules:
 1. Remove all release-specific noise: tags, codecs, resolution (2160p, 1080p, UHD, etc.), source (Remux, BluRay, Web-dl, etc.), HDR/DV/HDR10, audio channels, release groups, and subtitles info.
-2. If Chinese title text is present in the Parent Folder or Filename, PRESERVE it. Combine the Chinese title and English title if both exist (e.g., "某种物质 The Substance").
+2. If Chinese title text is present in the Selected Name, Parent Folder or Filename, PRESERVE it. Combine the Chinese title and English title if both exist (e.g., "某种物质 The Substance").
 3. For standalone movies:
    - Set "series_name" to the clean movie title (with the year, e.g. "某种物质 The Substance 2024" or "The Substance 2024").
    - Set "movie_name" to the same clean movie title.
