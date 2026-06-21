@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+
+outputs/
+test_outputs*/
+
+*.wav
+*.srt
+*.ass
+*.json
+*.checkpoint.json
+
+*.mkv
+*.mp4
+*.avi
+*.mov

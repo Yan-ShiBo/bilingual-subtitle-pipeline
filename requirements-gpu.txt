@@ -1,0 +1,6 @@
+paddleocr
+opencc-python-reimplemented
+imageio-ffmpeg
+tqdm
+requests
+pgsrip
