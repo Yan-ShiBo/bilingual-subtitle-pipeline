@@ -18,6 +18,7 @@ RUNTIME_DIR = PROJECT_ROOT / "runtime"
 LOG_DIR = RUNTIME_DIR / "logs"
 DEFAULT_OUTPUT_ROOT = MOVIE_ROOT / ("1 " + "\u5b57\u5e55")
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m2ts", ".ts", ".mov", ".wmv"}
+SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt"}
 RUNS: Dict[int, subprocess.Popen] = {}
 
 
@@ -73,6 +74,61 @@ def resolve_video_path(input_path: Path) -> Path:
     if input_path.is_file() and input_path.suffix.lower() in VIDEO_EXTENSIONS:
         return input_path
     raise FileNotFoundError(f"Unsupported video input: {input_path}")
+
+
+def list_sidecar_subtitles(selected_path: Path, video_path: Path) -> List[Dict[str, Any]]:
+    roots = [video_path.parent]
+    if selected_path.is_dir() and selected_path not in roots:
+        roots.append(selected_path)
+    paths: Dict[Path, int] = {}
+    for root in roots:
+        for ext in SUBTITLE_EXTENSIONS:
+            direct = video_path.with_suffix(ext)
+            if direct.exists():
+                paths[direct] = max(paths.get(direct, 0), 100)
+            for candidate in root.glob(f"*{ext}"):
+                score = 10
+                lower = candidate.stem.lower()
+                if lower == video_path.stem.lower():
+                    score += 100
+                if video_path.stem.lower() in lower or lower in video_path.stem.lower():
+                    score += 50
+                if any(token in lower for token in ("en", "eng", "english")):
+                    score += 10
+                paths[candidate] = max(paths.get(candidate, 0), score)
+    return [
+        {
+            "path": str(path),
+            "name": path.name,
+            "extension": path.suffix.lower(),
+            "size_kb": round(path.stat().st_size / 1024, 1),
+            "score": score,
+        }
+        for path, score in sorted(paths.items(), key=lambda item: (item[1], item[0].name.lower()), reverse=True)
+    ]
+
+
+def list_embedded_subtitles(video_path: Path) -> List[Dict[str, Any]]:
+    try:
+        from subtitle_pipeline import find_ffmpeg, probe_streams, stream_score
+
+        ffmpeg = find_ffmpeg(None)
+        streams = [stream for stream in probe_streams(video_path, ffmpeg) if stream.is_subtitle]
+        return [
+            {
+                "index": stream.index,
+                "label": f"0:{stream.index} {stream.lang or '-'} {stream.codec} {stream.title}".strip(),
+                "language": stream.lang,
+                "codec": stream.codec,
+                "title": stream.title,
+                "is_image": stream.is_pgs,
+                "is_text": stream.is_text_subtitle,
+                "score": stream_score(stream),
+            }
+            for stream in streams
+        ]
+    except Exception as exc:
+        return [{"error": str(exc)}]
 
 
 def default_names(input_path: Path, video_path: Path) -> Dict[str, str]:
@@ -154,6 +210,15 @@ def analyze_input(payload: Dict[str, Any]) -> Dict[str, Any]:
     movie_name = payload.get("movie_name") or names["movie_name"]
 
     info = checkpoint_info(output_root, series_name, movie_name)
+    sidecars = list_sidecar_subtitles(selected, video)
+    embedded = list_embedded_subtitles(video)
+    embedded_tracks = [item for item in embedded if "error" not in item]
+    if sidecars:
+        auto_source = "sidecar"
+    elif embedded_tracks:
+        auto_source = "embedded"
+    else:
+        auto_source = "audio"
     info.update(
         {
             "selected_path": str(selected),
@@ -165,6 +230,11 @@ def analyze_input(payload: Dict[str, Any]) -> Dict[str, Any]:
             "movie_name": movie_name,
             "default_series_name": names["series_name"],
             "default_movie_name": names["movie_name"],
+            "has_sidecar_subtitles": bool(sidecars),
+            "has_embedded_subtitles": bool(embedded_tracks),
+            "sidecar_subtitles": sidecars,
+            "embedded_subtitles": embedded,
+            "auto_source": auto_source,
         }
     )
     return info
@@ -220,7 +290,12 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
     series_name = payload["series_name"]
     movie_name = payload["movie_name"]
     restart = bool(payload.get("restart"))
-    source_mode = payload.get("source_mode") or "audio"
+    source_mode = payload.get("source_mode") or "auto"
+    sidecar_path = payload.get("sidecar_path") or ""
+    subtitle_stream = payload.get("subtitle_stream")
+    source_language = payload.get("source_language") or "auto"
+    asr_language = payload.get("asr_language") or "en"
+    subtitle_ocr_lang = payload.get("subtitle_ocr_lang") or "auto"
     batch_size = int(payload.get("batch_size") or 5)
     context_lines = int(payload.get("context_lines") or 30)
     max_words = int(payload.get("max_words") or 14)
@@ -250,6 +325,12 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
         series_name,
         "--movie-name",
         movie_name,
+        "--source-language",
+        source_language,
+        "--asr-language",
+        asr_language,
+        "--subtitle-ocr-lang",
+        subtitle_ocr_lang,
         "--llm-model",
         payload.get("llm_model") or "qwen3:14b",
         "--batch-size",
@@ -263,6 +344,10 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
         "--max-duration",
         str(max_duration),
     ]
+    if sidecar_path:
+        args.extend(["--subtitle-file", sidecar_path])
+    if subtitle_stream not in (None, ""):
+        args.extend(["--subtitle-stream", str(subtitle_stream)])
 
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
@@ -397,12 +482,60 @@ def html_page() -> str:
         <label>片名/集名</label>
         <input id="movieName">
       </div>
-      <div class="span-2">
+      <div class="span-4">
         <label>字幕来源</label>
         <select id="sourceMode">
-          <option value="audio" selected>Whisper 音频识别</option>
-          <option value="auto">自动：优先英文字幕</option>
-          <option value="srt">只使用同名 SRT</option>
+          <option value="auto" selected>自动：已有字幕 → 内封字幕 → 音频识别</option>
+          <option value="sidecar">手动：已有字幕文件</option>
+          <option value="embedded">手动：视频内封字幕</option>
+          <option value="audio">手动：Whisper 音频识别</option>
+        </select>
+      </div>
+      <div class="span-4">
+        <label>已有字幕文件</label>
+        <select id="sidecarPath"><option value="">自动选择</option></select>
+      </div>
+      <div class="span-4">
+        <label>视频内封字幕轨</label>
+        <select id="subtitleStream"><option value="">自动选择</option></select>
+      </div>
+      <div class="span-2">
+        <label>源字幕语言</label>
+        <select id="sourceLanguage">
+          <option value="auto" selected>自动</option>
+          <option value="en">English</option>
+          <option value="ja">Japanese</option>
+          <option value="ko">Korean</option>
+          <option value="fr">French</option>
+          <option value="de">German</option>
+          <option value="es">Spanish</option>
+          <option value="zh">中文</option>
+        </select>
+      </div>
+      <div class="span-2">
+        <label>音频识别语言</label>
+        <select id="asrLanguage">
+          <option value="en" selected>English</option>
+          <option value="auto">自动检测</option>
+          <option value="ja">Japanese</option>
+          <option value="ko">Korean</option>
+          <option value="fr">French</option>
+          <option value="de">German</option>
+          <option value="es">Spanish</option>
+          <option value="zh">中文</option>
+        </select>
+      </div>
+      <div class="span-2">
+        <label>图像字幕 OCR 语言</label>
+        <select id="subtitleOcrLang">
+          <option value="auto" selected>自动</option>
+          <option value="en">English</option>
+          <option value="ch">简体中文</option>
+          <option value="chinese_cht">繁体中文</option>
+          <option value="japan">Japanese</option>
+          <option value="korean">Korean</option>
+          <option value="fr">French</option>
+          <option value="german">German</option>
         </select>
       </div>
       <div class="span-2">
@@ -436,6 +569,9 @@ def html_page() -> str:
       <div class="stat"><span class="muted">总字幕单元</span><b id="totalCount">未知</b></div>
       <div class="stat"><span class="muted">已完成</span><b id="completedCount">0</b></div>
       <div class="stat"><span class="muted">进程</span><b id="runningState">未运行</b></div>
+      <div class="stat"><span class="muted">已有字幕</span><b id="sidecarState">未知</b></div>
+      <div class="stat"><span class="muted">内封字幕</span><b id="embeddedState">未知</b></div>
+      <div class="stat"><span class="muted">自动来源</span><b id="autoSourceState">-</b></div>
     </div>
     <p class="muted" id="paths"></p>
     <div class="inline">
@@ -490,6 +626,11 @@ function payload() {
     series_name: document.getElementById('seriesName').value,
     movie_name: document.getElementById('movieName').value,
     source_mode: document.getElementById('sourceMode').value,
+    sidecar_path: document.getElementById('sidecarPath').value,
+    subtitle_stream: document.getElementById('subtitleStream').value,
+    source_language: document.getElementById('sourceLanguage').value,
+    asr_language: document.getElementById('asrLanguage').value,
+    subtitle_ocr_lang: document.getElementById('subtitleOcrLang').value,
     batch_size: Number(document.getElementById('batchSize').value || 5),
     context_lines: Number(document.getElementById('contextLines').value || 30),
     max_words: Number(document.getElementById('maxWords').value || 14),
@@ -524,12 +665,22 @@ async function refreshStatus() {
 }
 
 function render(data) {
+  if (data.sidecar_subtitles) updateSidecarOptions(data.sidecar_subtitles);
+  if (data.embedded_subtitles) updateEmbeddedOptions(data.embedded_subtitles);
+
   document.getElementById('videoSize').textContent = data.video_size_gb ? `${data.video_size_gb} GB` : '-';
   document.getElementById('totalCount').textContent = data.total_count ?? '未知';
   document.getElementById('completedCount').textContent = data.completed_count ?? 0;
   document.getElementById('runningState').textContent = data.running ? '运行中' : '未运行';
+  document.getElementById('sidecarState').textContent = data.has_sidecar_subtitles === undefined ? '未知' : (data.has_sidecar_subtitles ? `${(data.sidecar_subtitles || []).length} 个` : '无');
+  const embeddedItems = (data.embedded_subtitles || []).filter(item => !item.error);
+  document.getElementById('embeddedState').textContent = data.has_embedded_subtitles === undefined ? '未知' : (data.has_embedded_subtitles ? `${embeddedItems.length} 条轨道` : '无');
+  document.getElementById('autoSourceState').textContent = sourceLabel(data.auto_source || '-');
   document.getElementById('paths').textContent = [
     data.video_path ? `主视频：${data.video_path}` : '',
+    data.auto_source ? `自动判断：${sourceLabel(data.auto_source)}` : '',
+    data.sidecar_subtitles ? `已有字幕：${subtitleListLabel(data.sidecar_subtitles)}` : '',
+    data.embedded_subtitles ? `内封字幕：${subtitleListLabel(data.embedded_subtitles)}` : '',
     data.output_dir ? `输出：${data.output_dir}` : '',
     data.checkpoint_path ? `checkpoint：${data.checkpoint_path}` : ''
   ].filter(Boolean).join('  |  ');
@@ -539,6 +690,40 @@ function render(data) {
     return `<tr><td>${escapeHtml(item.id)}</td><td>${escapeHtml(time)}</td><td>${escapeHtml(item.en || item.text || '')}</td><td>${escapeHtml(item.zh || '')}</td></tr>`;
   }).join('');
   document.getElementById('preview').innerHTML = rows || '<tr><td colspan="4" class="muted">暂无 checkpoint 内容</td></tr>';
+}
+
+function updateSidecarOptions(items) {
+  const select = document.getElementById('sidecarPath');
+  const current = select.value;
+  select.innerHTML = '<option value="">自动选择</option>' + (items || []).map(item => {
+    const label = `${item.name || item.path} (${item.extension || '字幕'}, ${item.size_kb ?? '?'} KB)`;
+    return `<option value="${escapeHtml(item.path || '')}">${escapeHtml(label)}</option>`;
+  }).join('');
+  if ([...select.options].some(option => option.value === current)) select.value = current;
+}
+
+function updateEmbeddedOptions(items) {
+  const select = document.getElementById('subtitleStream');
+  const current = select.value;
+  const rows = (items || []).filter(item => !item.error).map(item => {
+    const kind = item.is_image ? '图像' : (item.is_text ? '文本' : '字幕');
+    const label = `${item.label || item.index} | ${kind} | ${item.language || 'und'} | ${item.title || ''}`.trim();
+    return `<option value="${escapeHtml(item.index)}">${escapeHtml(label)}</option>`;
+  }).join('');
+  select.innerHTML = '<option value="">自动选择</option>' + rows;
+  if ([...select.options].some(option => option.value === current)) select.value = current;
+}
+
+function sourceLabel(value) {
+  return ({auto: '自动', sidecar: '已有字幕', srt: '已有字幕', embedded: '内封字幕', audio: '音频识别'})[value] || value;
+}
+
+function subtitleListLabel(items) {
+  if (!items || !items.length) return '无';
+  const errors = items.filter(item => item.error).map(item => item.error);
+  const valid = items.filter(item => !item.error);
+  if (valid.length) return valid.slice(0, 4).map(item => item.name || item.label || item.path || item.index).join('；') + (valid.length > 4 ? ` 等 ${valid.length} 个` : '');
+  return errors.length ? `读取失败：${errors[0]}` : '无';
 }
 
 function escapeHtml(value) {

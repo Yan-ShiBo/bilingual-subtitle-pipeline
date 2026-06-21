@@ -14,6 +14,7 @@ from openai import OpenAI
 
 Segment = Dict[str, Any]
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m2ts", ".ts", ".mov", ".wmv"}
+SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt"}
 
 
 def configure_output_encoding() -> None:
@@ -89,7 +90,7 @@ def extract_audio(video_path: Path, temp_audio_path: Path) -> None:
     print("Audio extraction complete.")
 
 
-def transcribe_audio(audio_path: Path) -> List[Segment]:
+def transcribe_audio(audio_path: Path, language: Optional[str] = "en") -> List[Segment]:
     print("Loading faster-whisper large-v3 model with FP16...")
     model = WhisperModel(
         "large-v3",
@@ -98,10 +99,11 @@ def transcribe_audio(audio_path: Path) -> List[Segment]:
     )
 
     print("Transcribing audio with word timestamps...")
+    requested_language = None if not language or language == "auto" else language
     segments, info = model.transcribe(
         str(audio_path),
         beam_size=5,
-        language="en",
+        language=requested_language,
         word_timestamps=True,
         vad_filter=True,
         vad_parameters={
@@ -283,20 +285,189 @@ def parse_srt_file(srt_path: Path) -> List[Segment]:
     return segments
 
 
-def find_sidecar_srt(video_path: Path) -> Optional[Path]:
-    direct = video_path.with_suffix(".srt")
-    if direct.exists():
-        return direct
+def ass_time_to_seconds(value: str) -> float:
+    match = re.match(r"(\d+):(\d\d):(\d\d)[.](\d\d)", value.strip())
+    if not match:
+        raise ValueError(f"Bad ASS time: {value}")
+    hours, minutes, seconds, centis = match.groups()
+    return int(hours) * 3600 + int(minutes) * 60 + int(seconds) + int(centis) / 100
 
-    stem = video_path.stem.lower()
-    candidates = sorted(video_path.parent.glob("*.srt"))
+
+def strip_ass_tags(text: str) -> str:
+    text = re.sub(r"\{[^}]*\}", "", text)
+    text = text.replace(r"\N", " ").replace(r"\n", " ").replace(r"\h", " ")
+    return clean_subtitle_text(text)
+
+
+def parse_ass_file(path: Path) -> List[Segment]:
+    print(f"Using sidecar ASS/SSA timing: {path}")
+    segments: List[Segment] = []
+    text = read_text_with_fallback(path)
+    for line in text.splitlines():
+        if not line.startswith("Dialogue:"):
+            continue
+        parts = line.split(",", 9)
+        if len(parts) < 10:
+            continue
+        try:
+            start = ass_time_to_seconds(parts[1])
+            end = ass_time_to_seconds(parts[2])
+        except ValueError:
+            continue
+        body = strip_ass_tags(parts[9])
+        if not body or end <= start:
+            continue
+        segments.append({"id": len(segments), "start": start, "end": end, "text": body})
+    return segments
+
+
+def parse_vtt_file(path: Path) -> List[Segment]:
+    print(f"Using sidecar WebVTT timing: {path}")
+    text = read_text_with_fallback(path).replace("\r\n", "\n").replace("\r", "\n")
+    blocks = re.split(r"\n\s*\n", text.strip())
+    segments: List[Segment] = []
+
+    def vtt_time_to_seconds(value: str) -> float:
+        value = value.strip().replace(",", ".")
+        fields = value.split(":")
+        if len(fields) == 2:
+            minutes, rest = fields
+            hours = 0
+        else:
+            hours, minutes, rest = fields[-3:]
+        seconds, millis = (rest.split(".") + ["0"])[:2]
+        return int(hours) * 3600 + int(minutes) * 60 + int(seconds) + int(millis[:3].ljust(3, "0")) / 1000
+
+    for block in blocks:
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        time_index = next((idx for idx, line in enumerate(lines) if "-->" in line), -1)
+        if time_index < 0:
+            continue
+        match = re.search(r"([0-9:.]+)\s*-->\s*([0-9:.]+)", lines[time_index])
+        if not match:
+            continue
+        body = clean_subtitle_text(" ".join(lines[time_index + 1 :]))
+        if not body:
+            continue
+        start = vtt_time_to_seconds(match.group(1))
+        end = vtt_time_to_seconds(match.group(2))
+        if end > start:
+            segments.append({"id": len(segments), "start": start, "end": end, "text": body})
+    return segments
+
+
+def parse_subtitle_file(path: Path) -> List[Segment]:
+    suffix = path.suffix.lower()
+    if suffix == ".srt":
+        return parse_srt_file(path)
+    if suffix in {".ass", ".ssa"}:
+        return parse_ass_file(path)
+    if suffix == ".vtt":
+        return parse_vtt_file(path)
+    raise ValueError(f"Unsupported sidecar subtitle format: {path.suffix}")
+
+
+def find_sidecar_subtitles(video_path: Path, selected_path: Optional[Path] = None) -> List[Path]:
+    candidates: List[Path] = []
+    roots = [video_path.parent]
+    if selected_path and selected_path.is_dir() and selected_path not in roots:
+        roots.append(selected_path)
+    direct_stems = {video_path.stem.lower()}
+    for ext in SUBTITLE_EXTENSIONS:
+        direct = video_path.with_suffix(ext)
+        if direct.exists():
+            candidates.append(direct)
+
+    for root in roots:
+        candidates.extend(sorted(root.glob("*.srt")))
+        for ext in sorted(SUBTITLE_EXTENSIONS - {".srt"}):
+            candidates.extend(sorted(root.glob(f"*{ext}")))
+
+    scored: List[tuple[int, str, Path]] = []
     for candidate in candidates:
-        if candidate.stem.lower() == stem:
-            return candidate
-    for candidate in candidates:
-        if "1of8" in stem and "1of8" in candidate.stem.lower():
-            return candidate
-    return None
+        stem = candidate.stem.lower()
+        score = 0
+        if stem in direct_stems:
+            score += 100
+        if video_path.stem.lower() in stem or stem in video_path.stem.lower():
+            score += 50
+        if any(token in stem for token in ("en", "eng", "english")):
+            score += 10
+        scored.append((score, candidate.name.lower(), candidate))
+    unique = {}
+    for score, name, path in scored:
+        if path not in unique or score > unique[path][0]:
+            unique[path] = (score, name, path)
+    return [item[2] for item in sorted(unique.values(), key=lambda item: (item[0], item[1]), reverse=True)]
+
+
+def find_sidecar_subtitle(video_path: Path, selected_path: Optional[Path] = None) -> Optional[Path]:
+    subtitles = find_sidecar_subtitles(video_path, selected_path)
+    return subtitles[0] if subtitles else None
+
+
+def choose_ocr_lang(language: str) -> str:
+    lang = (language or "").lower()
+    if lang in {"zh", "zho", "chi", "chs", "zh-cn", "zh-hans", "cmn"}:
+        return "ch"
+    if lang in {"cht", "zh-tw", "zh-hant"}:
+        return "chinese_cht"
+    if lang in {"ja", "jpn", "japanese"}:
+        return "japan"
+    if lang in {"ko", "kor", "korean"}:
+        return "korean"
+    if lang in {"fr", "fra", "fre", "french"}:
+        return "fr"
+    if lang in {"de", "deu", "ger", "german"}:
+        return "german"
+    return "en"
+
+
+def load_embedded_subtitle_events(
+    video_path: Path,
+    stream_index: Optional[int],
+    source_language: str,
+    out_dir: Path,
+    args: argparse.Namespace,
+) -> List[Segment]:
+    from subtitle_pipeline import find_ffmpeg, get_stream_events, probe_streams, stream_score
+
+    ffmpeg = find_ffmpeg(None)
+    streams = [stream for stream in probe_streams(video_path, ffmpeg) if stream.is_subtitle]
+    if not streams:
+        raise RuntimeError("No embedded subtitle stream was found.")
+
+    if stream_index is not None:
+        matches = [stream for stream in streams if stream.index == stream_index]
+        if not matches:
+            raise RuntimeError(f"Embedded subtitle stream 0:{stream_index} was not found.")
+        stream = matches[0]
+    else:
+        requested = (source_language or "").lower()
+        preferred = [
+            stream
+            for stream in streams
+            if requested and (stream.lang.lower() == requested or requested in stream.title.lower())
+        ]
+        pool = preferred or streams
+        pool.sort(key=stream_score, reverse=True)
+        stream = pool[0]
+
+    language_hint = source_language if source_language and source_language != "auto" else stream.lang
+    ocr_lang = args.subtitle_ocr_lang
+    if not ocr_lang or ocr_lang == "auto":
+        ocr_lang = choose_ocr_lang(language_hint)
+
+    print(f"Using embedded subtitle stream 0:{stream.index} {stream.lang or '-'} {stream.codec} {stream.title}")
+    events = get_stream_events(video_path, stream, ffmpeg, out_dir / "embedded" / f"stream_{stream.index:02d}", ocr_lang, args)
+    segments = [
+        {"id": idx, "start": event.start, "end": event.end, "text": event.text, "source_language": stream.lang or source_language}
+        for idx, event in enumerate(events)
+        if event.text.strip()
+    ]
+    if not segments:
+        raise RuntimeError(f"Embedded subtitle stream 0:{stream.index} did not produce usable subtitle events.")
+    return segments
 
 
 def join_words(words: List[Dict[str, Any]]) -> str:
@@ -462,9 +633,11 @@ def translate_and_correct_segments(
     llm_model: str,
     batch_size: int,
     context_lines: int,
+    source_language: str,
     checkpoint_path: Optional[Path] = None,
 ) -> List[Segment]:
     print("Starting sentence-level LLM correction and translation...")
+    language_label = "the source language" if not source_language or source_language == "auto" else source_language
     system_prompt = (
         "You are a professional subtitle editor and Chinese translator. "
         "Keep timing granularity fixed: never merge, split, reorder, omit, or add subtitle items."
@@ -498,6 +671,7 @@ You will correct and translate only the TARGET LINE(S).
 
 Use the previous and following context to understand names, pronouns, topic continuity, and terminology.
 Do not translate the context sections. They are reference only.
+The source subtitle/audio language is: {language_label}.
 
 === PREVIOUS CONTEXT, REFERENCE ONLY ===
 {before_text}
@@ -512,7 +686,7 @@ Return a raw JSON list with exactly {len(batch)} objects.
 Each object must correspond to one TARGET line and keep the same local index.
 Schema:
 [
-  {{"index": 0, "corrected_english": "...", "chinese_translation": "..."}}
+  {{"index": 0, "corrected_text": "...", "chinese_translation": "..."}}
 ]
 
 Rules:
@@ -521,7 +695,8 @@ Rules:
 - Do not split one line into multiple objects.
 - Do not output previous or following context lines.
 - Do not add explanations, markdown, notes, or extra keys.
-- Correct obvious ASR/OCR errors in English before translating.
+- Correct obvious ASR/OCR/subtitle errors in the source text before translating.
+- Keep corrected_text in the original source language.
 - Translate into natural Simplified Chinese.
 """
 
@@ -541,7 +716,14 @@ Rules:
             batch_processed: List[Segment] = []
             for j, segment in enumerate(batch):
                 item = lookup.get(j, {})
-                corrected = clean_subtitle_text(str(item.get("corrected_english") or segment["text"]))
+                corrected = clean_subtitle_text(
+                    str(
+                        item.get("corrected_text")
+                        or item.get("corrected_source")
+                        or item.get("corrected_english")
+                        or segment["text"]
+                    )
+                )
                 translated = clean_subtitle_text(str(item.get("chinese_translation") or ""))
                 batch_processed.append(
                     {
@@ -674,10 +856,20 @@ def default_output_root() -> Path:
 
 def main() -> None:
     configure_output_encoding()
-    parser = argparse.ArgumentParser(description="Transcribe or import English subtitles and translate to ASS.")
+    parser = argparse.ArgumentParser(description="Transcribe, import, OCR, correct, and translate subtitles to ASS.")
     parser.add_argument("--video", type=str, required=True, help="Path to the video file or Blu-ray folder")
-    parser.add_argument("--source", choices=["auto", "srt", "audio"], default="audio", help="Subtitle source")
-    parser.add_argument("--srt", type=str, help="Explicit English SRT path")
+    parser.add_argument("--source", choices=["auto", "sidecar", "srt", "embedded", "audio"], default="auto", help="Subtitle source")
+    parser.add_argument("--srt", type=str, help="Explicit sidecar SRT path. Kept for compatibility.")
+    parser.add_argument("--subtitle-file", type=str, help="Explicit sidecar subtitle path: srt, ass, ssa, or vtt.")
+    parser.add_argument("--subtitle-stream", type=int, help="Embedded subtitle stream index, e.g. 2 for 0:2.")
+    parser.add_argument("--source-language", default="auto", help="Source subtitle language for correction/translation context.")
+    parser.add_argument("--asr-language", default="en", help="Whisper language code, or auto for detection.")
+    parser.add_argument("--subtitle-ocr-lang", default="auto", help="PaddleOCR language for image subtitles, or auto.")
+    parser.add_argument("--device", default="gpu:0", help="OCR device for embedded image subtitles.")
+    parser.add_argument("--ocr-scale", type=float, default=2.0)
+    parser.add_argument("--crop-pad", type=int, default=8)
+    parser.add_argument("--limit", type=int, default=0, help="Debug limit for PGS images per stream.")
+    parser.add_argument("--fast-ocr", action="store_true", help="Allow faster OCR settings instead of best-quality defaults.")
     parser.add_argument("--output-root", type=str, help="Output root. Defaults to sibling '1 字幕' folder.")
     parser.add_argument("--series-name", type=str, help="Override output series folder name")
     parser.add_argument("--movie-name", type=str, help="Override output movie/episode file name")
@@ -707,19 +899,49 @@ def main() -> None:
     checkpoint_path = out_dir / f"{movie_name}.segments.checkpoint.json"
     source_segments_path = out_dir / f"{movie_name}.segments.source.json"
 
-    srt_path = Path(args.srt) if args.srt else None
-    if args.source in ("auto", "srt") and not srt_path:
-        srt_path = find_sidecar_srt(video_path)
+    sidecar_path = Path(args.subtitle_file or args.srt) if (args.subtitle_file or args.srt) else None
+    if args.source in ("auto", "sidecar", "srt") and not sidecar_path:
+        sidecar_path = find_sidecar_subtitle(video_path, input_path)
 
     temp_audio = video_path.with_suffix(".wav")
     try:
-        if args.source != "audio" and srt_path and srt_path.exists():
-            source_segments = parse_srt_file(srt_path)
-        elif args.source == "srt":
-            raise FileNotFoundError("SRT source requested, but no SRT file was found.")
+        actual_source = args.source
+        source_language = args.source_language
+        if args.source in ("auto", "sidecar", "srt") and sidecar_path and sidecar_path.exists():
+            actual_source = "sidecar"
+            source_segments = parse_subtitle_file(sidecar_path)
+            if source_language == "auto":
+                source_language = "subtitle"
+        elif args.source in ("sidecar", "srt"):
+            raise FileNotFoundError("Sidecar subtitle source requested, but no subtitle file was found.")
+        elif args.source in ("auto", "embedded"):
+            try:
+                actual_source = "embedded"
+                source_segments = load_embedded_subtitle_events(
+                    video_path,
+                    stream_index=args.subtitle_stream,
+                    source_language=args.source_language,
+                    out_dir=out_dir,
+                    args=args,
+                )
+                if source_language == "auto":
+                    source_language = source_segments[0].get("source_language") or "embedded subtitle"
+            except Exception:
+                if args.source == "embedded":
+                    raise
+                actual_source = "audio"
+                extract_audio(video_path, temp_audio)
+                source_segments = transcribe_audio(temp_audio, language=args.asr_language)
+                if source_language == "auto":
+                    source_language = args.asr_language
         else:
+            actual_source = "audio"
             extract_audio(video_path, temp_audio)
-            source_segments = transcribe_audio(temp_audio)
+            source_segments = transcribe_audio(temp_audio, language=args.asr_language)
+            if source_language == "auto":
+                source_language = args.asr_language
+
+        print(f"Actual subtitle source: {actual_source}")
 
         subtitle_segments = split_segments_for_subtitles(
             source_segments,
@@ -740,6 +962,7 @@ def main() -> None:
             llm_model=args.llm_model,
             batch_size=args.batch_size,
             context_lines=args.context_lines,
+            source_language=source_language,
             checkpoint_path=checkpoint_path,
         )
 
