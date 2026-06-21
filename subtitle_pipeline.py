@@ -1092,27 +1092,97 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             )
 
 
-def ollama_translate_events(events: list[SubtitleEvent], model: str, cache_path: Path) -> list[SubtitleEvent]:
+def parse_json_list_response(text: str) -> list[dict]:
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S | re.I).strip()
+    if text.startswith("```json"):
+        text = text.replace("```json", "", 1).strip()
+    if text.startswith("```"):
+        text = text.replace("```", "", 1).strip()
+    if text.endswith("```"):
+        text = text[:-3].strip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("[")
+        end = text.rfind("]")
+        if start < 0 or end <= start:
+            raise
+        data = json.loads(text[start : end + 1])
+    if not isinstance(data, list):
+        raise ValueError("LLM response is not a JSON list")
+    return data
+
+
+def ollama_translate_events(
+    events: list[SubtitleEvent],
+    model: str,
+    cache_path: Path,
+    batch_size: int = 5,
+    context_lines: int = 30,
+) -> tuple[list[SubtitleEvent], list[SubtitleEvent]]:
     try:
         import requests
     except Exception as exc:
         raise RuntimeError("requests is required for Ollama translation.") from exc
-    done: list[SubtitleEvent] = []
+    done_en: list[SubtitleEvent] = []
+    done_zh: list[SubtitleEvent] = []
     if cache_path.exists():
         raw = json.loads(cache_path.read_text(encoding="utf-8"))
-        done = [SubtitleEvent(float(x["start"]), float(x["end"]), str(x["text"])) for x in raw]
-    full_context = "\n".join(f"{idx + 1}. {e.text}" for idx, e in enumerate(events))
+        for idx, item in enumerate(raw):
+            source = events[idx]
+            start = float(item.get("start", source.start))
+            end = float(item.get("end", source.end))
+            en_text = str(item.get("en", item.get("corrected_english", source.text)))
+            zh_text = str(item.get("zh", item.get("text", "")))
+            done_en.append(SubtitleEvent(start, end, clean_text(en_text)))
+            done_zh.append(SubtitleEvent(start, end, clean_text(zh_text)))
     session = requests.Session()
-    for idx in range(len(done), len(events)):
-        event = events[idx]
-        prompt = (
-            "You are translating movie subtitles into natural Simplified Chinese.\n"
-            "Use the full English subtitle context for names, pronouns, and plot continuity.\n"
-            "Translate only the current subtitle. Keep it concise and subtitle-friendly.\n"
-            "Return only the Simplified Chinese translation, no notes.\n\n"
-            f"Full English context:\n{full_context}\n\n"
-            f"Current subtitle #{idx + 1}:\n{event.text}"
-        )
+
+    start_index = len(done_zh)
+    start_index -= start_index % batch_size
+    done_en = done_en[:start_index]
+    done_zh = done_zh[:start_index]
+
+    for idx in range(start_index, len(events), batch_size):
+        batch = events[idx : idx + batch_size]
+        before_start = max(0, idx - context_lines)
+        after_end = min(len(events), idx + len(batch) + context_lines)
+        before_text = "\n".join(f"[{i}] {events[i].text}" for i in range(before_start, idx))
+        batch_text = "\n".join(f"[{j}] {event.text}" for j, event in enumerate(batch))
+        after_text = "\n".join(f"[{i}] {events[i].text}" for i in range(idx + len(batch), after_end))
+
+        prompt = f"""
+You will correct and translate only the TARGET LINE(S).
+
+Use the previous and following context to understand names, pronouns, topic continuity, and terminology.
+Do not translate the context sections. They are reference only.
+No timing labels are provided. Do not invent, change, or discuss timing labels.
+
+=== PREVIOUS CONTEXT, REFERENCE ONLY ===
+{before_text}
+
+=== TARGET LINE(S) TO OUTPUT ===
+{batch_text}
+
+=== FOLLOWING CONTEXT, REFERENCE ONLY ===
+{after_text}
+
+Return a raw JSON list with exactly {len(batch)} objects.
+Each object must correspond to one TARGET line and keep the same local index.
+Schema:
+[
+  {{"index": 0, "corrected_english": "...", "chinese_translation": "..."}}
+]
+
+Rules:
+- One input line must produce one output object.
+- Do not merge two lines.
+- Do not split one line into multiple objects.
+- Do not output previous or following context lines.
+- Do not add explanations, markdown, notes, or extra keys.
+- Correct obvious OCR/ASR errors in English before translating.
+- Translate into natural Simplified Chinese.
+"""
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
@@ -1125,15 +1195,46 @@ def ollama_translate_events(events: list[SubtitleEvent], model: str, cache_path:
         response.raise_for_status()
         data = response.json()
         text = data.get("message", {}).get("content", "")
-        text = re.sub(r"<think>.*?</think>", "", text, flags=re.S | re.I).strip()
-        done.append(SubtitleEvent(event.start, event.end, clean_text(text)))
+        items = parse_json_list_response(text)
+        lookup = {}
+        for item in items:
+            if isinstance(item, dict) and "index" in item:
+                try:
+                    lookup[int(item["index"])] = item
+                except (TypeError, ValueError):
+                    pass
+
+        batch_en: list[SubtitleEvent] = []
+        batch_zh: list[SubtitleEvent] = []
+        for local_idx, event in enumerate(batch):
+            item = lookup.get(local_idx, {})
+            corrected = clean_text(str(item.get("corrected_english") or event.text))
+            translated = clean_text(str(item.get("chinese_translation") or corrected))
+            batch_en.append(SubtitleEvent(event.start, event.end, corrected))
+            batch_zh.append(SubtitleEvent(event.start, event.end, translated))
+
+        for source, corrected, translated in zip(batch, batch_en, batch_zh):
+            if source.start != corrected.start or source.end != corrected.end:
+                raise ValueError("English timing changed during translation batch")
+            if source.start != translated.start or source.end != translated.end:
+                raise ValueError("Chinese timing changed during translation batch")
+
+        done_en.extend(batch_en)
+        done_zh.extend(batch_zh)
         cache_path.write_text(
-            json.dumps([e.__dict__ for e in done], ensure_ascii=False, indent=2),
+            json.dumps(
+                [
+                    {"start": en.start, "end": en.end, "en": en.text, "zh": zh.text}
+                    for en, zh in zip(done_en, done_zh)
+                ],
+                ensure_ascii=False,
+                indent=2,
+            ),
             encoding="utf-8",
         )
-        log(f"Translated {idx + 1}/{len(events)}")
+        log(f"Translated {len(done_zh)}/{len(events)}")
         time.sleep(0.05)
-    return done
+    return done_en, done_zh
 
 
 def print_streams(streams: list[StreamInfo]) -> None:
@@ -1159,6 +1260,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=0, help="Debug limit for PGS images per stream.")
     parser.add_argument("--fast-ocr", action="store_true", help="Allow faster OCR settings instead of best-quality defaults.")
     parser.add_argument("--list-streams", action="store_true")
+    parser.add_argument("--batch-size", type=int, default=5, help="LLM batch size in subtitle sentence units.")
+    parser.add_argument("--context-lines", type=int, default=30, help="Reference this many subtitle lines before and after each target batch.")
     return parser
 
 
@@ -1204,7 +1307,16 @@ def main() -> int:
         log(f"Simplified Chinese SRT: {zh_srt} ({len(zh_events)} lines)")
     else:
         zh_cache = base_dir / "ollama_zh_cache.json"
-        zh_events = ollama_translate_events(en_events, args.model, zh_cache)
+        en_events, zh_events = ollama_translate_events(
+            en_events,
+            args.model,
+            zh_cache,
+            batch_size=args.batch_size,
+            context_lines=args.context_lines,
+        )
+        corrected_en_srt = base_dir / f"{safe_stem(video)}.en.corrected.srt"
+        write_srt(en_events, corrected_en_srt)
+        log(f"Corrected English SRT: {corrected_en_srt} ({len(en_events)} lines)")
         zh_srt = base_dir / f"{safe_stem(video)}.zh-Hans.ollama.srt"
         write_srt(zh_events, zh_srt)
         log(f"Ollama Chinese SRT: {zh_srt} ({len(zh_events)} lines)")
