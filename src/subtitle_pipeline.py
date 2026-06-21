@@ -734,6 +734,8 @@ class PaddleOcrEngine:
                 "PaddleOCR could not be imported. Run setup_gpu_ocr.ps1 first, or check Python package conflicts."
             ) from exc
         self.lang = lang
+        if device.startswith("cuda"):
+            device = device.replace("cuda", "gpu")
         self.device = device
         self.paddle = paddle
         try:

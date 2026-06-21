@@ -926,7 +926,10 @@ def main() -> None:
                 )
                 if source_language == "auto":
                     source_language = source_segments[0].get("source_language") or "embedded subtitle"
-            except Exception:
+            except Exception as exc:
+                print(f"Failed to load embedded subtitles: {exc}", file=sys.stderr)
+                import traceback
+                traceback.print_exc()
                 if args.source == "embedded":
                     raise
                 actual_source = "audio"
