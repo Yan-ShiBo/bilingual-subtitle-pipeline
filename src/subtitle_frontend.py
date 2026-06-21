@@ -1008,6 +1008,36 @@ function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 }
 
+const INPUT_IDS = ['path', 'outputRoot', 'seriesName', 'movieName', 'sourceMode', 'sidecarPath', 'subtitleStream', 'sourceLanguage', 'asrLanguage', 'subtitleOcrLang', 'batchSize', 'contextLines', 'maxWords', 'maxChars', 'maxDuration'];
+
+function saveFormState() {
+  const data = {};
+  INPUT_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) data[id] = el.value;
+  });
+  localStorage.setItem('subtitleFormState', JSON.stringify(data));
+}
+
+function restoreFormState() {
+  try {
+    const data = JSON.parse(localStorage.getItem('subtitleFormState'));
+    if (data) {
+      INPUT_IDS.forEach(id => {
+        const el = document.getElementById(id);
+        if (el && data[id] !== undefined) el.value = data[id];
+      });
+      if (data.seriesName && data.movieName) {
+        refreshStatus().catch(() => {});
+      }
+    }
+  } catch (e) {}
+}
+
+document.addEventListener('DOMContentLoaded', restoreFormState);
+document.addEventListener('input', saveFormState);
+document.addEventListener('change', saveFormState);
+
 setInterval(() => { if (state.pid) refreshStatus().catch(() => {}); }, 5000);
 </script>
 </body>
