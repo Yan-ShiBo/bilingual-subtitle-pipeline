@@ -20,7 +20,7 @@ LOG_DIR = RUNTIME_DIR / "logs"
 DEFAULT_OUTPUT_ROOT = MOVIE_ROOT / ("1 " + "\u5b57\u5e55")
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m2ts", ".ts", ".mov", ".wmv"}
 SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt"}
-RUNS: Dict[int, subprocess.Popen] = {}
+RUNS: Dict[int, Dict[str, Any]] = {}
 NAME_CACHE: Dict[str, Dict[str, str]] = {}
 
 
@@ -485,6 +485,7 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"
     stdout = log_path.open("w", encoding="utf-8")
     stderr = err_path.open("w", encoding="utf-8")
     try:
@@ -492,7 +493,11 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
     finally:
         stdout.close()
         stderr.close()
-    RUNS[process.pid] = process
+    RUNS[process.pid] = {
+        "process": process,
+        "series_name": series_name,
+        "movie_name": movie_name
+    }
 
     return {
         "pid": process.pid,
@@ -506,7 +511,8 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
 def stop_process_tree(pid: int) -> bool:
     if pid <= 0:
         return False
-    process = RUNS.get(pid)
+    info = RUNS.get(pid)
+    process = info["process"] if info else None
     if not process:
         return False
     if process.poll() is not None:
@@ -569,9 +575,9 @@ def infer_stage_info(stdout_text: str, running: bool) -> tuple[str, int]:
             return "语音识别中", 1
         if "Extracting audio from" in line:
             return "抽取音频中", 0
-        if "Running OCR" in line:
+        if "Running OCR" in line or "OCR source images:" in line:
             return "OCR图像识别中", 1
-        if "Extracting PGS image" in line or "Extracting subtitles from" in line or "Using embedded subtitle stream" in line:
+        if "Extracting PGS image" in line or "Extracting PGS stream" in line or "Rendering PGS images" in line or "Extracting subtitles from" in line or "Using embedded subtitle stream" in line:
             return "抽取字幕中", 0
         if "Using sidecar" in line:
             return "读取字幕文件中", 0
@@ -584,7 +590,16 @@ def run_status(payload: Dict[str, Any]) -> Dict[str, Any]:
     series_name = payload["series_name"]
     movie_name = payload["movie_name"]
     out_dir = output_dir(output_root, series_name, movie_name)
-    process = RUNS.get(pid)
+    if pid == 0:
+        for p_pid, info in RUNS.items():
+            if info["series_name"] == series_name and info["movie_name"] == movie_name:
+                proc = info["process"]
+                if proc.poll() is None:
+                    pid = p_pid
+                    break
+
+    info_proc = RUNS.get(pid)
+    process = info_proc["process"] if info_proc else None
     running = process.poll() is None if process else process_is_running(pid)
     log_path, err_path = frontend_log_paths(series_name, movie_name)
 
@@ -895,6 +910,9 @@ async function refreshStatus() {
   const base = payload();
   base.pid = state.pid;
   const data = await api('/api/status', base);
+  if (data.pid && data.running && state.pid === 0) {
+      state.pid = data.pid;
+  }
   render(data);
   document.getElementById('log').textContent = [data.stdout_tail || '', data.stderr_tail || ''].filter(Boolean).join('\n\n--- stderr ---\n');
 }
@@ -929,7 +947,7 @@ function render(data) {
     if (stageIndex === -1) {
         stepEl.className = 'stage-step pending';
         if (i === 0) stepEl.querySelector('.step-text').textContent = '提取源';
-        if (i === 1) stepEl.querySelector('.step-text').textContent = '内容识别';
+        if (i === 1) stepEl.querySelector('.step-text').textContent = '字幕识别';
         if (i === 2) stepEl.querySelector('.step-text').textContent = '翻译与校对';
         if (i === 3) stepEl.querySelector('.step-text').textContent = '完成';
     } else {
@@ -938,7 +956,7 @@ function render(data) {
           stepEl.querySelector('.step-text').textContent = data.stage;
         } else {
           if (i === 0) stepEl.querySelector('.step-text').textContent = '提取源';
-          if (i === 1) stepEl.querySelector('.step-text').textContent = '内容识别';
+          if (i === 1) stepEl.querySelector('.step-text').textContent = '字幕识别';
           if (i === 2) stepEl.querySelector('.step-text').textContent = '翻译与校对';
           if (i === 3) stepEl.querySelector('.step-text').textContent = '完成';
         }
