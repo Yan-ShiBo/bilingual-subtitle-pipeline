@@ -201,7 +201,7 @@ def probe_streams(video: Path, ffmpeg: str) -> list[StreamInfo]:
     proc = run([ffmpeg, "-hide_banner", "-i", str(video)], check=False, timeout=90)
     streams: list[StreamInfo] = []
     current: StreamInfo | None = None
-    stream_re = re.compile(r"^\s*Stream #0:(\d+)(?:\(([^)]*)\))?:\s*([^:]+):\s*([^,\n]+)")
+    stream_re = re.compile(r"^\s*Stream #0:(\d+)(?:\(([^)]*)\))?(?:\[[^\]]+\])?:\s*([^:]+):\s*([^,\n]+)")
     metadata_re = re.compile(r"^\s*([A-Za-z0-9_]+)\s*:\s*(.*)$")
     in_metadata = False
     for line in proc.stdout.splitlines():
