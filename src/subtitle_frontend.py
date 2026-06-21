@@ -109,7 +109,7 @@ def infer_single_file_names(input_path: Path, video_path: Path, fallback: Dict[s
 
     system_prompt = "You extract clean movie and episode names from release filenames."
     prompt = f"""
-Extract clean names from this single video filename.
+Extract clean movie or episode names from the video filename and its parent folder.
 
 Filename: {video_path.name}
 Parent folder: {video_path.parent.name}
@@ -122,16 +122,19 @@ Return ONLY a JSON object:
 }}
 
 Rules:
-- Remove release tags, codecs, resolution, HDR/DV, audio formats, remux/web-dl/blu-ray tags, language lists, and release group names.
-- Preserve the real title and year when present, for example "Ready Player One 2018".
-- If this is a standalone movie, set series_name to the same clean movie title, not the full release filename.
-- If this is an episode or series file, set series_name to the show name and movie_name to the episode name/number.
-- Preserve useful Chinese title text when present.
+1. Remove all release-specific noise: tags, codecs, resolution (2160p, 1080p, UHD, etc.), source (Remux, BluRay, Web-dl, etc.), HDR/DV/HDR10, audio channels, release groups, and subtitles info.
+2. If Chinese title text is present in the Parent Folder or Filename, PRESERVE it. Combine the Chinese title and English title if both exist (e.g., "某种物质 The Substance").
+3. For standalone movies:
+   - Set "series_name" to the clean movie title (with the year, e.g. "某种物质 The Substance 2024" or "The Substance 2024").
+   - Set "movie_name" to the same clean movie title.
+4. For TV episodes:
+   - Set "series_name" to the clean show name (e.g. "Game of Thrones").
+   - Set "movie_name" to the episode identifier/name (e.g. "S01E01" or "Episode 1").
 """
     try:
         data = call_ollama_json(prompt, system_prompt)
         movie_name = clean_output_name(data.get("movie_name"), fallback["movie_name"])
-        series_name = clean_output_name(data.get("series_name"), movie_name)
+        series_name = clean_output_name(data.get("series_name"), fallback["series_name"])
         result = {
             "series_name": series_name,
             "movie_name": movie_name,
@@ -244,15 +247,13 @@ def list_embedded_subtitles(video_path: Path) -> List[Dict[str, Any]]:
 
 
 def default_names(input_path: Path, video_path: Path) -> Dict[str, str]:
+    fallback_movie = clean_name(video_path.name)
     if input_path.is_dir():
-        series_name = clean_name(input_path.name)
-        movie_name = clean_name(video_path.name)
-        return {"series_name": series_name, "movie_name": movie_name, "name_source": "folder heuristic"}
+        fallback_series = clean_name(input_path.name)
     else:
-        movie_name = clean_name(video_path.name)
-        series_name = movie_name
-        fallback = {"series_name": series_name, "movie_name": movie_name}
-        return infer_single_file_names(input_path, video_path, fallback)
+        fallback_series = fallback_movie
+    fallback = {"series_name": fallback_series, "movie_name": fallback_movie}
+    return infer_single_file_names(input_path, video_path, fallback)
 
 
 def output_dir(output_root: Path, series_name: str, movie_name: str) -> Path:
