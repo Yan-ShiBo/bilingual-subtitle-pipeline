@@ -12,7 +12,10 @@ from urllib.parse import urlparse
 
 
 APP_DIR = Path(__file__).resolve().parent
-MOVIE_ROOT = APP_DIR.parent
+PROJECT_ROOT = APP_DIR.parent
+MOVIE_ROOT = PROJECT_ROOT.parent
+RUNTIME_DIR = PROJECT_ROOT / "runtime"
+LOG_DIR = RUNTIME_DIR / "logs"
 DEFAULT_OUTPUT_ROOT = MOVIE_ROOT / ("1 " + "\u5b57\u5e55")
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m2ts", ".ts", ".mov", ".wmv"}
 RUNS: Dict[int, subprocess.Popen] = {}
@@ -30,6 +33,17 @@ def clean_name(name: str) -> str:
     name = re.sub(r"\b(1080p|2160p|BluRay|REMUX|WEB-DL|HDR10|DV|HEVC|AVC|DTS|Atmos|TrueHD|x265|x264)\b", " ", name, flags=re.I)
     name = normalize_space(name)
     return name or "Unknown"
+
+
+def safe_file_part(name: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
+    return value or "subtitle"
+
+
+def frontend_log_paths(series_name: str, movie_name: str) -> tuple[Path, Path]:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    base = f"{safe_file_part(series_name)}__{safe_file_part(movie_name)}"
+    return LOG_DIR / f"{base}.stdout.log", LOG_DIR / f"{base}.stderr.log"
 
 
 def find_main_video_in_folder(folder_path: Path) -> Path:
@@ -218,8 +232,7 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
     if restart:
         remove_resume_files(out_dir, movie_name)
 
-    log_path = out_dir / f"{movie_name}.frontend.stdout.log"
-    err_path = out_dir / f"{movie_name}.frontend.stderr.log"
+    log_path, err_path = frontend_log_paths(series_name, movie_name)
     for path in (log_path, err_path):
         if path.exists():
             path.unlink()
@@ -251,9 +264,16 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
         str(max_duration),
     ]
 
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
     stdout = log_path.open("w", encoding="utf-8")
     stderr = err_path.open("w", encoding="utf-8")
-    process = subprocess.Popen(args, cwd=str(APP_DIR), stdout=stdout, stderr=stderr)
+    try:
+        process = subprocess.Popen(args, cwd=str(PROJECT_ROOT), stdout=stdout, stderr=stderr, env=env)
+    finally:
+        stdout.close()
+        stderr.close()
     RUNS[process.pid] = process
 
     return {
@@ -280,14 +300,15 @@ def run_status(payload: Dict[str, Any]) -> Dict[str, Any]:
     out_dir = output_dir(output_root, series_name, movie_name)
     process = RUNS.get(pid)
     running = process.poll() is None if process else process_is_running(pid)
+    log_path, err_path = frontend_log_paths(series_name, movie_name)
 
     info = checkpoint_info(output_root, series_name, movie_name)
     info.update(
         {
             "pid": pid,
             "running": running,
-            "stdout_tail": tail_text(out_dir / f"{movie_name}.frontend.stdout.log"),
-            "stderr_tail": tail_text(out_dir / f"{movie_name}.frontend.stderr.log"),
+            "stdout_tail": tail_text(log_path),
+            "stderr_tail": tail_text(err_path),
             "checked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
     )

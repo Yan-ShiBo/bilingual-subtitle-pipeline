@@ -11,7 +11,9 @@ if %ERRORLEVEL% EQU 0 (
 )
 
 start "" "%URL%"
-python "%~dp0subtitle_frontend.py" --host 127.0.0.1 --port 8765
+set PYTHONIOENCODING=utf-8
+set PYTHONUTF8=1
+python "%~dp0src\subtitle_frontend.py" --host 127.0.0.1 --port 8765
 
 echo.
 echo Frontend stopped. Press any key to close this window.

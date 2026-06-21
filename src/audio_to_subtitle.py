@@ -4,6 +4,7 @@ import math
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -13,6 +14,14 @@ from openai import OpenAI
 
 Segment = Dict[str, Any]
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m2ts", ".ts", ".mov", ".wmv"}
+
+
+def configure_output_encoding() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 
 def get_ffmpeg_path() -> str:
@@ -660,10 +669,11 @@ def print_timing_report(segments: List[Segment]) -> None:
 
 
 def default_output_root() -> Path:
-    return Path(__file__).resolve().parent.parent / ("1 " + "\u5b57\u5e55")
+    return Path(__file__).resolve().parents[2] / ("1 " + "\u5b57\u5e55")
 
 
 def main() -> None:
+    configure_output_encoding()
     parser = argparse.ArgumentParser(description="Transcribe or import English subtitles and translate to ASS.")
     parser.add_argument("--video", type=str, required=True, help="Path to the video file or Blu-ray folder")
     parser.add_argument("--source", choices=["auto", "srt", "audio"], default="audio", help="Subtitle source")

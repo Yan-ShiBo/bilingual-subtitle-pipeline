@@ -20,6 +20,14 @@ from typing import Any, Iterable
 from PIL import Image, ImageFilter
 
 
+def configure_output_encoding() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 TEXT_CODECS = {
     "ass",
     "ssa",
@@ -1251,7 +1259,7 @@ def safe_stem(path: Path) -> str:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Extract/OCR/translate MKV subtitles and write bilingual ASS.")
     parser.add_argument("--video", required=True, type=Path)
-    parser.add_argument("--output", type=Path, default=Path("outputs"))
+    parser.add_argument("--output", type=Path, default=Path(__file__).resolve().parents[1] / "runtime" / "scratch" / "outputs")
     parser.add_argument("--ffmpeg")
     parser.add_argument("--device", default="gpu:0")
     parser.add_argument("--model", default="qwen3:14b")
@@ -1266,6 +1274,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    configure_output_encoding()
     args = build_arg_parser().parse_args()
     video = args.video.resolve()
     if not video.exists():
