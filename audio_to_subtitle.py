@@ -427,6 +427,19 @@ def split_segments_for_subtitles(
     return output
 
 
+def apply_timing_sanity_rules(segments: List[Segment], max_duration: float = 6.0) -> List[Segment]:
+    output: List[Segment] = []
+    for segment in segments:
+        item = segment.copy()
+        duration = float(item["end"]) - float(item["start"])
+        word_count = len(str(item.get("text", "")).split())
+        if duration > max_duration and word_count <= 4:
+            item["end"] = float(item["start"]) + max_duration
+        item["id"] = len(output)
+        output.append(item)
+    return output
+
+
 def build_context_text(segments: List[Segment], start: int, end: int, context_lines: int) -> Tuple[str, str]:
     before_start = max(0, start - context_lines)
     after_end = min(len(segments), end + context_lines)
@@ -704,6 +717,7 @@ def main() -> None:
             max_chars=args.max_chars,
             max_duration=args.max_duration,
         )
+        subtitle_segments = apply_timing_sanity_rules(subtitle_segments, max_duration=args.max_duration)
         source_segments_path.parent.mkdir(parents=True, exist_ok=True)
         source_segments_path.write_text(
             json.dumps(subtitle_segments, ensure_ascii=False, indent=2),
