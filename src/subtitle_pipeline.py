@@ -116,7 +116,10 @@ def configure_windows_cuda_dll_paths() -> None:
         roots.append(site.getusersitepackages())
     except Exception:
         pass
+    
     dll_dirs: list[Path] = []
+    
+    # 1. Add nvidia python package DLL paths
     for root in roots:
         nvidia_root = Path(root) / "nvidia"
         if not nvidia_root.exists():
@@ -126,15 +129,47 @@ def configure_windows_cuda_dll_paths() -> None:
             for child in candidate.iterdir():
                 if child.is_dir():
                     dll_dirs.append(child)
+                    
+    # 2. Add system CUDA paths from environment variables
+    for env_name, env_val in os.environ.items():
+        if env_name.startswith("CUDA_PATH"):
+            cuda_bin = Path(env_val) / "bin"
+            if cuda_bin.exists():
+                dll_dirs.append(cuda_bin)
+                
+    # 3. Add default system CUDA paths if not in env but exist
+    default_cuda_root = Path(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA")
+    if default_cuda_root.exists():
+        try:
+            for version_dir in default_cuda_root.iterdir():
+                if version_dir.is_dir():
+                    cuda_bin = version_dir / "bin"
+                    if cuda_bin.exists():
+                        dll_dirs.append(cuda_bin)
+        except Exception:
+            pass
+
     existing_path = os.environ.get("PATH", "")
+    added_paths = set()
     for directory in dll_dirs:
-        text = str(directory)
+        try:
+            resolved = directory.resolve()
+            text = str(resolved)
+        except Exception:
+            text = str(directory)
+            
+        if text in added_paths:
+            continue
+        added_paths.add(text)
+        
         if text not in existing_path:
             os.environ["PATH"] = text + os.pathsep + os.environ.get("PATH", "")
         try:
             os.add_dll_directory(text)
         except Exception:
             pass
+
+
 
 
 def suppress_paddlex_optional_langchain_imports() -> None:

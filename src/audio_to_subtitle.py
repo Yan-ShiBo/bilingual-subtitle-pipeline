@@ -8,7 +8,6 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from faster_whisper import WhisperModel
 from openai import OpenAI
 
 
@@ -92,6 +91,7 @@ def extract_audio(video_path: Path, temp_audio_path: Path) -> None:
 
 def transcribe_audio(audio_path: Path, language: Optional[str] = "en") -> List[Segment]:
     print("Loading faster-whisper large-v3 model with FP16...")
+    from faster_whisper import WhisperModel
     model = WhisperModel(
         "large-v3",
         device="cuda",
