@@ -385,7 +385,7 @@ def choose_folder() -> str:
     return path
 
 
-def remove_resume_files(out_dir: Path, movie_name: str) -> None:
+def remove_resume_files(out_dir: Path, movie_name: str, video_path: Optional[Path] = None) -> None:
     names = [
         f"{movie_name}.segments.checkpoint.json",
         f"{movie_name}.segments.source.json",
@@ -397,6 +397,19 @@ def remove_resume_files(out_dir: Path, movie_name: str) -> None:
         path = out_dir / name
         if path.exists():
             path.unlink()
+            
+    import shutil
+    embedded_dir = out_dir / "embedded"
+    if embedded_dir.exists():
+        shutil.rmtree(embedded_dir, ignore_errors=True)
+        
+    if video_path:
+        temp_audio = video_path.with_suffix(".wav")
+        if temp_audio.exists():
+            try:
+                temp_audio.unlink()
+            except OSError:
+                pass
 
 
 def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -404,8 +417,8 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
     output_root = Path(payload.get("output_root") or DEFAULT_OUTPUT_ROOT)
     series_name = payload.get("series_name") or ""
     movie_name = payload.get("movie_name") or ""
+    video = resolve_video_path(selected)
     if not series_name or not movie_name:
-        video = resolve_video_path(selected)
         names = default_names(selected, video)
         series_name = series_name or names["series_name"]
         movie_name = movie_name or names["movie_name"]
@@ -425,7 +438,7 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
     out_dir = output_dir(output_root, series_name, movie_name)
     out_dir.mkdir(parents=True, exist_ok=True)
     if restart:
-        remove_resume_files(out_dir, movie_name)
+        remove_resume_files(out_dir, movie_name, video)
 
     log_path, err_path = frontend_log_paths(series_name, movie_name)
     for path in (log_path, err_path):
@@ -542,6 +555,29 @@ def tail_text(path: Path, max_chars: int = 8000) -> str:
     return data[-max_chars:]
 
 
+def infer_stage_info(stdout_text: str, running: bool) -> tuple[str, int]:
+    if not running and "Success! Subtitles saved" in stdout_text:
+        return "完成", 3
+    if not running:
+        return "未运行", -1
+    
+    lines = stdout_text.strip().split("\n")
+    for line in reversed(lines):
+        if "Starting sentence-level LLM" in line or "Processing segments" in line:
+            return "LLM翻译校对中", 2
+        if "Transcribing audio" in line or "Loading faster-whisper" in line:
+            return "语音识别中", 1
+        if "Extracting audio from" in line:
+            return "抽取音频中", 0
+        if "Running OCR" in line:
+            return "OCR图像识别中", 1
+        if "Extracting PGS image" in line or "Extracting subtitles from" in line or "Using embedded subtitle stream" in line:
+            return "抽取字幕中", 0
+        if "Using sidecar" in line:
+            return "读取字幕文件中", 0
+    return "启动中", 0
+
+
 def run_status(payload: Dict[str, Any]) -> Dict[str, Any]:
     pid = int(payload.get("pid") or 0)
     output_root = Path(payload.get("output_root") or DEFAULT_OUTPUT_ROOT)
@@ -553,11 +589,15 @@ def run_status(payload: Dict[str, Any]) -> Dict[str, Any]:
     log_path, err_path = frontend_log_paths(series_name, movie_name)
 
     info = checkpoint_info(output_root, series_name, movie_name)
+    stdout_tail = tail_text(log_path)
+    stage_text, stage_index = infer_stage_info(stdout_tail, running)
     info.update(
         {
             "pid": pid,
             "running": running,
-            "stdout_tail": tail_text(log_path),
+            "stage": stage_text,
+            "stage_index": stage_index,
+            "stdout_tail": stdout_tail,
             "stderr_tail": tail_text(err_path),
             "checked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
@@ -614,6 +654,15 @@ def html_page() -> str:
     .radio { display: flex; gap: 16px; height: 38px; align-items: center; }
     .radio label { margin: 0; color: #20242a; }
     .radio input { width: auto; height: auto; margin-right: 6px; }
+    .stage-container { display: flex; align-items: center; justify-content: space-between; padding: 16px 24px; background: white; border: 1px solid #dde1e7; border-radius: 8px; margin-bottom: 16px; }
+    .stage-step { display: flex; align-items: center; gap: 8px; font-weight: 600; color: #4f5a66; }
+    .stage-step.completed { color: #1f242b; }
+    .stage-step.active { color: #1f242b; }
+    .dot { width: 14px; height: 14px; border-radius: 50%; background: #cfd6e4; transition: all 0.3s; }
+    .stage-step.completed .dot { background: #2da44e; }
+    .stage-step.active .dot { background: #bf8700; box-shadow: 0 0 6px rgba(191,135,0,0.6); }
+    .stage-step.pending .dot { background: #da3633; }
+    .stage-line { flex: 1; height: 2px; background: #dde1e7; margin: 0 16px; }
     @media (max-width: 800px) {
       main { padding: 14px; }
       .grid { grid-template-columns: 1fr; }
@@ -750,6 +799,16 @@ def html_page() -> str:
     </div>
   </section>
 
+  <div class="stage-container" id="stageContainer">
+    <div class="stage-step" id="step-0"><span class="dot"></span><span class="step-text">提取源</span></div>
+    <div class="stage-line"></div>
+    <div class="stage-step" id="step-1"><span class="dot"></span><span class="step-text">内容识别</span></div>
+    <div class="stage-line"></div>
+    <div class="stage-step" id="step-2"><span class="dot"></span><span class="step-text">翻译与校对</span></div>
+    <div class="stage-line"></div>
+    <div class="stage-step" id="step-3"><span class="dot"></span><span class="step-text">完成</span></div>
+  </div>
+
   <section>
     <h2>Checkpoint 预览</h2>
     <table>
@@ -861,6 +920,30 @@ function render(data) {
     data.output_dir ? `输出：${data.output_dir}` : '',
     data.checkpoint_path ? `checkpoint：${data.checkpoint_path}` : ''
   ].filter(Boolean).join('  |  ');
+
+  const stageIndex = data.stage_index ?? -1;
+  const isCompleted = stageIndex === 3;
+  for (let i = 0; i <= 3; i++) {
+    const stepEl = document.getElementById(`step-${i}`);
+    if (!stepEl) continue;
+    if (stageIndex === -1) {
+        stepEl.className = 'stage-step pending';
+        if (i === 0) stepEl.querySelector('.step-text').textContent = '提取源';
+        if (i === 1) stepEl.querySelector('.step-text').textContent = '内容识别';
+        if (i === 2) stepEl.querySelector('.step-text').textContent = '翻译与校对';
+        if (i === 3) stepEl.querySelector('.step-text').textContent = '完成';
+    } else {
+        stepEl.className = 'stage-step ' + (isCompleted || i < stageIndex ? 'completed' : (i === stageIndex ? 'active' : 'pending'));
+        if (i === stageIndex && data.stage) {
+          stepEl.querySelector('.step-text').textContent = data.stage;
+        } else {
+          if (i === 0) stepEl.querySelector('.step-text').textContent = '提取源';
+          if (i === 1) stepEl.querySelector('.step-text').textContent = '内容识别';
+          if (i === 2) stepEl.querySelector('.step-text').textContent = '翻译与校对';
+          if (i === 3) stepEl.querySelector('.step-text').textContent = '完成';
+        }
+    }
+  }
 
   const rows = (data.preview || []).map(item => {
     const time = `${item.start ?? ''} -> ${item.end ?? ''}`;
