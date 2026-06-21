@@ -880,30 +880,42 @@ function payload() {
 }
 
 async function analyze() {
-  const data = await api('/api/analyze', payload());
-  state.lastAnalysis = data;
-  document.getElementById('seriesName').value = data.series_name;
-  document.getElementById('movieName').value = data.movie_name;
-  render(data);
+  try {
+    const data = await api('/api/analyze', payload());
+    state.lastAnalysis = data;
+    document.getElementById('seriesName').value = data.series_name;
+    document.getElementById('movieName').value = data.movie_name;
+    render(data);
+  } catch (e) {
+    document.getElementById('log').textContent = `分析失败: ${e.message}`;
+  }
 }
 
 async function startRun() {
-  const base = payload();
-  base.restart = document.querySelector('input[name="runMode"]:checked').value === 'restart';
-  const data = await api('/api/start', base);
-  state.pid = data.pid;
-  document.getElementById('log').textContent = `已启动 PID ${data.pid}\n${data.command}`;
-  setTimeout(refreshStatus, 1500);
+  try {
+    const base = payload();
+    base.restart = document.querySelector('input[name="runMode"]:checked').value === 'restart';
+    const data = await api('/api/start', base);
+    state.pid = data.pid;
+    document.getElementById('log').textContent = `已启动 PID ${data.pid}\n${data.command || ''}`;
+    setTimeout(refreshStatus, 1500);
+  } catch (e) {
+    document.getElementById('log').textContent = `启动失败: ${e.message}`;
+  }
 }
 
 async function stopRun() {
-  const base = payload();
-  base.pid = state.pid;
-  const data = await api('/api/stop', base);
-  render(data);
-  if (data.stopped) state.pid = 0;
-  const tail = [data.stdout_tail || '', data.stderr_tail || ''].filter(Boolean).join('\n\n--- stderr ---\n');
-  document.getElementById('log').textContent = `${data.message || '终止请求已发送'}\n${tail}`;
+  try {
+    const base = payload();
+    base.pid = state.pid;
+    const data = await api('/api/stop', base);
+    render(data);
+    if (data.stopped) state.pid = 0;
+    const tail = [data.stdout_tail || '', data.stderr_tail || ''].filter(Boolean).join('\n\n--- stderr ---\n');
+    document.getElementById('log').textContent = `${data.message || '终止请求已发送'}\n${tail}`;
+  } catch (e) {
+    document.getElementById('log').textContent = `终止失败: ${e.message}`;
+  }
 }
 
 async function refreshStatus() {
