@@ -9,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -20,6 +21,7 @@ DEFAULT_OUTPUT_ROOT = MOVIE_ROOT / ("1 " + "\u5b57\u5e55")
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m2ts", ".ts", ".mov", ".wmv"}
 SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt"}
 RUNS: Dict[int, subprocess.Popen] = {}
+NAME_CACHE: Dict[str, Dict[str, str]] = {}
 
 
 def normalize_space(text: str) -> str:
@@ -34,6 +36,116 @@ def clean_name(name: str) -> str:
     name = re.sub(r"\b(1080p|2160p|BluRay|REMUX|WEB-DL|HDR10|DV|HEVC|AVC|DTS|Atmos|TrueHD|x265|x264)\b", " ", name, flags=re.I)
     name = normalize_space(name)
     return name or "Unknown"
+
+
+def clean_output_name(name: str, fallback: str) -> str:
+    value = normalize_space(str(name or ""))
+    value = re.sub(r'[<>:"/\\|?*]+', " ", value)
+    value = normalize_space(value).strip(". ")
+    return value or fallback
+
+
+def strip_llm_noise(text: str) -> str:
+    text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S | re.I).strip()
+    if text.startswith("```json"):
+        text = text.replace("```json", "", 1).strip()
+    if text.startswith("```"):
+        text = text.replace("```", "", 1).strip()
+    if text.endswith("```"):
+        text = text[:-3].strip()
+    return text
+
+
+def parse_json_response(text: str) -> Any:
+    cleaned = strip_llm_noise(text)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        start_candidates = [pos for pos in (cleaned.find("["), cleaned.find("{")) if pos >= 0]
+        if not start_candidates:
+            raise
+        start = min(start_candidates)
+        end = max(cleaned.rfind("]"), cleaned.rfind("}"))
+        if end <= start:
+            raise
+        return json.loads(cleaned[start : end + 1])
+
+
+def call_ollama_json(prompt: str, system_prompt: str, model: str = "qwen3:14b", timeout: int = 45) -> Dict[str, Any]:
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ],
+        "stream": False,
+        "format": "json",
+        "think": False,
+        "keep_alive": -1,
+        "options": {"temperature": 0},
+    }
+    request = Request(
+        "http://127.0.0.1:11434/api/chat",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(request, timeout=timeout) as response:
+        body = json.loads(response.read().decode("utf-8"))
+    content = (body.get("message") or {}).get("content") or ""
+    data = parse_json_response(content)
+    if not isinstance(data, dict):
+        raise ValueError("Ollama did not return a JSON object")
+    return data
+
+
+def infer_single_file_names(input_path: Path, video_path: Path, fallback: Dict[str, str]) -> Dict[str, str]:
+    try:
+        cache_key = f"{video_path.resolve()}::{video_path.stat().st_mtime_ns}"
+    except OSError:
+        cache_key = str(video_path.resolve())
+    if cache_key in NAME_CACHE:
+        return NAME_CACHE[cache_key]
+
+    system_prompt = "You extract clean movie and episode names from release filenames."
+    prompt = f"""
+Extract clean names from this single video filename.
+
+Filename: {video_path.name}
+Parent folder: {video_path.parent.name}
+
+Return ONLY a JSON object:
+{{
+  "series_name": "...",
+  "movie_name": "...",
+  "kind": "movie" or "episode"
+}}
+
+Rules:
+- Remove release tags, codecs, resolution, HDR/DV, audio formats, remux/web-dl/blu-ray tags, language lists, and release group names.
+- Preserve the real title and year when present, for example "Ready Player One 2018".
+- If this is a standalone movie, set series_name to the same clean movie title, not the full release filename.
+- If this is an episode or series file, set series_name to the show name and movie_name to the episode name/number.
+- Preserve useful Chinese title text when present.
+"""
+    try:
+        data = call_ollama_json(prompt, system_prompt)
+        movie_name = clean_output_name(data.get("movie_name"), fallback["movie_name"])
+        series_name = clean_output_name(data.get("series_name"), movie_name)
+        result = {
+            "series_name": series_name,
+            "movie_name": movie_name,
+            "name_source": "ollama:qwen3:14b",
+        }
+    except Exception as exc:
+        result = {
+            "series_name": fallback["series_name"],
+            "movie_name": fallback["movie_name"],
+            "name_source": f"heuristic ({exc})",
+        }
+
+    NAME_CACHE[cache_key] = result
+    return result
 
 
 def safe_file_part(name: str) -> str:
@@ -135,10 +247,12 @@ def default_names(input_path: Path, video_path: Path) -> Dict[str, str]:
     if input_path.is_dir():
         series_name = clean_name(input_path.name)
         movie_name = clean_name(video_path.name)
+        return {"series_name": series_name, "movie_name": movie_name, "name_source": "folder heuristic"}
     else:
         movie_name = clean_name(video_path.name)
         series_name = movie_name
-    return {"series_name": series_name, "movie_name": movie_name}
+        fallback = {"series_name": series_name, "movie_name": movie_name}
+        return infer_single_file_names(input_path, video_path, fallback)
 
 
 def output_dir(output_root: Path, series_name: str, movie_name: str) -> Path:
@@ -230,6 +344,7 @@ def analyze_input(payload: Dict[str, Any]) -> Dict[str, Any]:
             "movie_name": movie_name,
             "default_series_name": names["series_name"],
             "default_movie_name": names["movie_name"],
+            "name_source": names.get("name_source", "heuristic"),
             "has_sidecar_subtitles": bool(sidecars),
             "has_embedded_subtitles": bool(embedded_tracks),
             "sidecar_subtitles": sidecars,
@@ -287,8 +402,13 @@ def remove_resume_files(out_dir: Path, movie_name: str) -> None:
 def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
     selected = Path(payload["path"]).expanduser()
     output_root = Path(payload.get("output_root") or DEFAULT_OUTPUT_ROOT)
-    series_name = payload["series_name"]
-    movie_name = payload["movie_name"]
+    series_name = payload.get("series_name") or ""
+    movie_name = payload.get("movie_name") or ""
+    if not series_name or not movie_name:
+        video = resolve_video_path(selected)
+        names = default_names(selected, video)
+        series_name = series_name or names["series_name"]
+        movie_name = movie_name or names["movie_name"]
     restart = bool(payload.get("restart"))
     source_mode = payload.get("source_mode") or "auto"
     sidecar_path = payload.get("sidecar_path") or ""
@@ -368,6 +488,51 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
         "output_dir": str(out_dir),
         "command": " ".join(args),
     }
+
+
+def stop_process_tree(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    process = RUNS.get(pid)
+    if not process:
+        return False
+    if process.poll() is not None:
+        RUNS.pop(pid, None)
+        return False
+
+    if os.name == "nt":
+        result = subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        RUNS.pop(pid, None)
+        return result.returncode == 0
+
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=10)
+    RUNS.pop(pid, None)
+    return True
+
+
+def stop_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
+    pid = int(payload.get("pid") or 0)
+    stopped = stop_process_tree(pid)
+    status = run_status(payload)
+    status.update(
+        {
+            "pid": pid,
+            "running": False if stopped else status.get("running", False),
+            "stopped": stopped,
+            "message": "任务已终止" if stopped else "没有找到正在运行的前端任务",
+        }
+    )
+    return status
 
 
 def tail_text(path: Path, max_chars: int = 8000) -> str:
@@ -580,6 +745,7 @@ def html_page() -> str:
         <label><input type="radio" name="runMode" value="restart">从头开始</label>
       </div>
       <button onclick="startRun()">运行程序</button>
+      <button class="danger" onclick="stopRun()">终止运行</button>
       <button class="secondary" onclick="refreshStatus()">刷新状态</button>
     </div>
   </section>
@@ -656,6 +822,16 @@ async function startRun() {
   setTimeout(refreshStatus, 1500);
 }
 
+async function stopRun() {
+  const base = payload();
+  base.pid = state.pid;
+  const data = await api('/api/stop', base);
+  render(data);
+  if (data.stopped) state.pid = 0;
+  const tail = [data.stdout_tail || '', data.stderr_tail || ''].filter(Boolean).join('\n\n--- stderr ---\n');
+  document.getElementById('log').textContent = `${data.message || '终止请求已发送'}\n${tail}`;
+}
+
 async function refreshStatus() {
   const base = payload();
   base.pid = state.pid;
@@ -678,6 +854,7 @@ function render(data) {
   document.getElementById('autoSourceState').textContent = sourceLabel(data.auto_source || '-');
   document.getElementById('paths').textContent = [
     data.video_path ? `主视频：${data.video_path}` : '',
+    data.name_source ? `片名识别：${data.name_source}` : '',
     data.auto_source ? `自动判断：${sourceLabel(data.auto_source)}` : '',
     data.sidecar_subtitles ? `已有字幕：${subtitleListLabel(data.sidecar_subtitles)}` : '',
     data.embedded_subtitles ? `内封字幕：${subtitleListLabel(data.embedded_subtitles)}` : '',
@@ -754,6 +931,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(analyze_input(self.read_json_body()))
             elif self.path == "/api/start":
                 self.send_json(start_processing(self.read_json_body()))
+            elif self.path == "/api/stop":
+                self.send_json(stop_processing(self.read_json_body()))
             elif self.path == "/api/status":
                 self.send_json(run_status(self.read_json_body()))
             else:
