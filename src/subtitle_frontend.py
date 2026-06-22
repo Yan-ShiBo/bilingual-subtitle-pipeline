@@ -859,6 +859,8 @@ def html_page() -> str:
 </main>
 
 <script>
+const FORM_STORAGE_KEY = 'subtitleFormState';
+const ANALYSIS_STORAGE_KEY = 'subtitleLastAnalysis';
 const state = { pid: 0, lastAnalysis: null, analyzing: false };
 document.getElementById('outputRoot').value = String.raw`__DEFAULT_OUTPUT_ROOT__`;
 
@@ -896,7 +898,7 @@ async function selectFolder() {
 function setSelectedPath(path) {
   const input = document.getElementById('path');
   if (input.value !== path) {
-    state.lastAnalysis = null;
+    clearLastAnalysis();
     state.pid = 0;
     document.getElementById('seriesName').value = '';
     document.getElementById('movieName').value = '';
@@ -931,7 +933,7 @@ async function analyze() {
     base.series_name = '';
     base.movie_name = '';
     const data = await api('/api/analyze', base);
-    state.lastAnalysis = data;
+    setLastAnalysis(data);
     document.getElementById('seriesName').value = data.series_name;
     document.getElementById('movieName').value = data.movie_name;
     render(data);
@@ -955,7 +957,7 @@ async function startRun() {
     state.pid = data.pid;
     const merged = mergeWithAnalysis({...data, running: true, stage: '启动中', stage_index: 0});
     render(merged);
-    state.lastAnalysis = merged;
+    setLastAnalysis(merged);
     document.getElementById('log').textContent = `已启动 PID ${data.pid}\n${data.command || ''}`;
     setTimeout(refreshStatus, 1500);
   } catch (e) {
@@ -970,7 +972,7 @@ async function stopRun() {
     const data = await api('/api/stop', base);
     const merged = mergeWithAnalysis(data);
     render(merged);
-    state.lastAnalysis = merged;
+    setLastAnalysis(merged);
     if (data.stopped) state.pid = 0;
     const tail = [data.stdout_tail || '', data.stderr_tail || ''].filter(Boolean).join('\n\n--- stderr ---\n');
     document.getElementById('log').textContent = `${data.message || '终止请求已发送'}\n${tail}`;
@@ -988,7 +990,7 @@ async function refreshStatus() {
   }
   const merged = mergeWithAnalysis(data);
   render(merged);
-  state.lastAnalysis = merged;
+  setLastAnalysis(merged);
   if (!merged.running) state.pid = 0;
   document.getElementById('log').textContent = [data.stdout_tail || '', data.stderr_tail || ''].filter(Boolean).join('\n\n--- stderr ---\n');
 }
@@ -1010,19 +1012,54 @@ function setAnalyzeBusy(isBusy) {
 }
 
 function mergeWithAnalysis(data) {
-  if (!state.lastAnalysis || !analysisMatchesCurrentPath()) return data;
-  const merged = {...state.lastAnalysis};
+  const analysis = getMatchingAnalysis();
+  if (!analysis) return data;
+  const merged = {...analysis};
   Object.entries(data || {}).forEach(([key, value]) => {
     if (value !== undefined) merged[key] = value;
   });
   return merged;
 }
 
-function analysisMatchesCurrentPath() {
+function setLastAnalysis(data) {
+  state.lastAnalysis = data;
+  try {
+    const persisted = {...data};
+    delete persisted.stdout_tail;
+    delete persisted.stderr_tail;
+    localStorage.setItem(ANALYSIS_STORAGE_KEY, JSON.stringify(persisted));
+  } catch (e) {}
+}
+
+function clearLastAnalysis() {
+  state.lastAnalysis = null;
+  try { localStorage.removeItem(ANALYSIS_STORAGE_KEY); } catch (e) {}
+}
+
+function getMatchingAnalysis() {
+  if (state.lastAnalysis && analysisMatchesCurrentPath(state.lastAnalysis)) return state.lastAnalysis;
+  try {
+    const stored = JSON.parse(localStorage.getItem(ANALYSIS_STORAGE_KEY));
+    if (stored && analysisMatchesCurrentPath(stored)) {
+      state.lastAnalysis = stored;
+      return stored;
+    }
+  } catch (e) {}
+  return null;
+}
+
+function analysisMatchesCurrentPath(analysis) {
   const current = document.getElementById('path').value;
-  const selected = state.lastAnalysis?.selected_path;
-  const video = state.lastAnalysis?.video_path;
-  return !current || !selected || current === selected || current === video;
+  const selected = analysis?.selected_path;
+  const video = analysis?.video_path;
+  const normalizedCurrent = normalizePathForCompare(current);
+  return !normalizedCurrent
+    || normalizePathForCompare(selected) === normalizedCurrent
+    || normalizePathForCompare(video) === normalizedCurrent;
+}
+
+function normalizePathForCompare(value) {
+  return String(value || '').replace(/\//g, '\\').replace(/\\+$/g, '').toLowerCase();
 }
 
 function render(data) {
@@ -1119,22 +1156,27 @@ function escapeHtml(value) {
 const INPUT_IDS = ['path', 'outputRoot', 'seriesName', 'movieName', 'sourceMode', 'sidecarPath', 'subtitleStream', 'sourceLanguage', 'asrLanguage', 'subtitleOcrLang', 'batchSize', 'contextLines', 'maxWords', 'maxChars', 'maxDuration'];
 
 function saveFormState() {
+  if (state.lastAnalysis && !analysisMatchesCurrentPath(state.lastAnalysis)) {
+    clearLastAnalysis();
+  }
   const data = {};
   INPUT_IDS.forEach(id => {
     const el = document.getElementById(id);
     if (el) data[id] = el.value;
   });
-  localStorage.setItem('subtitleFormState', JSON.stringify(data));
+  localStorage.setItem(FORM_STORAGE_KEY, JSON.stringify(data));
 }
 
 function restoreFormState() {
   try {
-    const data = JSON.parse(localStorage.getItem('subtitleFormState'));
+    const data = JSON.parse(localStorage.getItem(FORM_STORAGE_KEY));
     if (data) {
       INPUT_IDS.forEach(id => {
         const el = document.getElementById(id);
         if (el && data[id] !== undefined) el.value = data[id];
       });
+      const analysis = getMatchingAnalysis();
+      if (analysis) render(analysis);
       if (data.seriesName && data.movieName) {
         refreshStatus().catch(() => {});
       }
