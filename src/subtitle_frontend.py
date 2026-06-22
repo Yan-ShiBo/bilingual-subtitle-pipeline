@@ -33,13 +33,29 @@ def clean_name(name: str) -> str:
     name = re.sub(r"\[[^\]]+\]", " ", name)
     name = re.sub(r"\(([^)]*)\)", r" \1 ", name)
     name = name.replace(".", " ").replace("_", " ")
-    name = re.sub(r"\b(1080p|2160p|BluRay|REMUX|WEB-DL|HDR10|DV|HEVC|AVC|DTS|Atmos|TrueHD|x265|x264)\b", " ", name, flags=re.I)
+    name = strip_release_tags(name)
     name = normalize_space(name)
     return name or "Unknown"
 
 
+def strip_release_tags(name: str) -> str:
+    value = re.sub(r"\[[^\]]+\]", " ", name or "")
+    value = re.sub(r"\(([^)]*)\)", r" \1 ", value)
+    value = value.replace(".", " ").replace("_", " ")
+    tag_pattern = (
+        r"\b(2160p|1080p|720p|480p|uhd|bluray|blu-ray|bdrip|remux|web[- ]?dl|webrip|"
+        r"hdr10\+?|hdr|dv|dovi|dolby|vision|hevc|h265|x265|avc|h264|x264|"
+        r"truehd|atmos|dts(?:-hd)?|ma|aac|flac|ddp?|eac3|ac3)\b"
+    )
+    value = re.sub(tag_pattern + r".*$", " ", value, flags=re.I)
+    value = re.sub(tag_pattern, " ", value, flags=re.I)
+    value = re.sub(r"\b\d[ .]?\d\b.*$", " ", value)
+    value = re.sub(r"\s+-\s*[A-Za-z0-9]+$", " ", value)
+    return normalize_space(value)
+
+
 def clean_output_name(name: str, fallback: str) -> str:
-    value = normalize_space(str(name or ""))
+    value = strip_release_tags(str(name or ""))
     value = re.sub(r'[<>:"/\\|?*]+', " ", value)
     value = normalize_space(value).strip(". ")
     return value or fallback
@@ -136,6 +152,8 @@ Rules:
         data = call_ollama_json(prompt, system_prompt)
         movie_name = clean_output_name(data.get("movie_name"), fallback["movie_name"])
         series_name = clean_output_name(data.get("series_name"), fallback["series_name"])
+        if str(data.get("kind") or "").lower() == "movie":
+            series_name = movie_name
         result = {
             "series_name": series_name,
             "movie_name": movie_name,
@@ -322,8 +340,8 @@ def analyze_input(payload: Dict[str, Any]) -> Dict[str, Any]:
     video = resolve_video_path(selected)
     output_root = Path(payload.get("output_root") or DEFAULT_OUTPUT_ROOT)
     names = default_names(selected, video)
-    series_name = payload.get("series_name") or names["series_name"]
-    movie_name = payload.get("movie_name") or names["movie_name"]
+    series_name = names["series_name"]
+    movie_name = names["movie_name"]
 
     info = checkpoint_info(output_root, series_name, movie_name)
     sidecars = list_sidecar_subtitles(selected, video)
@@ -841,7 +859,7 @@ def html_page() -> str:
 </main>
 
 <script>
-const state = { pid: 0, lastAnalysis: null };
+const state = { pid: 0, lastAnalysis: null, analyzing: false };
 document.getElementById('outputRoot').value = String.raw`__DEFAULT_OUTPUT_ROOT__`;
 
 async function api(path, body = {}) {
@@ -855,7 +873,7 @@ async function selectFile() {
   try {
     const data = await api('/api/select-file');
     if (data.path) {
-      document.getElementById('path').value = data.path;
+      setSelectedPath(data.path);
       saveFormState();
     }
   } catch (e) {
@@ -867,12 +885,23 @@ async function selectFolder() {
   try {
     const data = await api('/api/select-folder');
     if (data.path) {
-      document.getElementById('path').value = data.path;
+      setSelectedPath(data.path);
       saveFormState();
     }
   } catch (e) {
     document.getElementById('log').textContent = `选择文件夹失败: ${e.message}`;
   }
+}
+
+function setSelectedPath(path) {
+  const input = document.getElementById('path');
+  if (input.value !== path) {
+    state.lastAnalysis = null;
+    state.pid = 0;
+    document.getElementById('seriesName').value = '';
+    document.getElementById('movieName').value = '';
+  }
+  input.value = path;
 }
 
 function payload() {
@@ -896,10 +925,12 @@ function payload() {
 }
 
 async function analyze() {
-  const btn = document.getElementById('analyzeBtn');
-  if (btn) { btn.textContent = '分析中...'; btn.disabled = true; }
+  setAnalyzeBusy(true);
   try {
-    const data = await api('/api/analyze', payload());
+    const base = payload();
+    base.series_name = '';
+    base.movie_name = '';
+    const data = await api('/api/analyze', base);
     state.lastAnalysis = data;
     document.getElementById('seriesName').value = data.series_name;
     document.getElementById('movieName').value = data.movie_name;
@@ -912,7 +943,7 @@ async function analyze() {
   } catch (e) {
     document.getElementById('log').textContent = `分析失败: ${e.message}`;
   } finally {
-    if (btn) { btn.textContent = '分析'; btn.disabled = false; }
+    setAnalyzeBusy(false);
   }
 }
 
@@ -922,6 +953,9 @@ async function startRun() {
     base.restart = document.querySelector('input[name="runMode"]:checked').value === 'restart';
     const data = await api('/api/start', base);
     state.pid = data.pid;
+    const merged = mergeWithAnalysis({...data, running: true, stage: '启动中', stage_index: 0});
+    render(merged);
+    state.lastAnalysis = merged;
     document.getElementById('log').textContent = `已启动 PID ${data.pid}\n${data.command || ''}`;
     setTimeout(refreshStatus, 1500);
   } catch (e) {
@@ -934,7 +968,9 @@ async function stopRun() {
     const base = payload();
     base.pid = state.pid;
     const data = await api('/api/stop', base);
-    render(data);
+    const merged = mergeWithAnalysis(data);
+    render(merged);
+    state.lastAnalysis = merged;
     if (data.stopped) state.pid = 0;
     const tail = [data.stdout_tail || '', data.stderr_tail || ''].filter(Boolean).join('\n\n--- stderr ---\n');
     document.getElementById('log').textContent = `${data.message || '终止请求已发送'}\n${tail}`;
@@ -950,8 +986,43 @@ async function refreshStatus() {
   if (data.pid && data.running && state.pid === 0) {
       state.pid = data.pid;
   }
-  render(data);
+  const merged = mergeWithAnalysis(data);
+  render(merged);
+  state.lastAnalysis = merged;
+  if (!merged.running) state.pid = 0;
   document.getElementById('log').textContent = [data.stdout_tail || '', data.stderr_tail || ''].filter(Boolean).join('\n\n--- stderr ---\n');
+}
+
+function setAnalyzeBusy(isBusy) {
+  state.analyzing = isBusy;
+  const btn = document.getElementById('analyzeBtn');
+  if (btn) {
+    btn.textContent = isBusy ? '分析中...' : '分析';
+    btn.disabled = isBusy;
+  }
+  if (isBusy) {
+    document.getElementById('runningState').textContent = '分析中';
+    document.getElementById('sidecarState').textContent = '分析中';
+    document.getElementById('embeddedState').textContent = '分析中';
+    document.getElementById('autoSourceState').textContent = '分析中';
+    document.getElementById('paths').textContent = '正在识别片名、扫描字幕来源并读取 checkpoint...';
+  }
+}
+
+function mergeWithAnalysis(data) {
+  if (!state.lastAnalysis || !analysisMatchesCurrentPath()) return data;
+  const merged = {...state.lastAnalysis};
+  Object.entries(data || {}).forEach(([key, value]) => {
+    if (value !== undefined) merged[key] = value;
+  });
+  return merged;
+}
+
+function analysisMatchesCurrentPath() {
+  const current = document.getElementById('path').value;
+  const selected = state.lastAnalysis?.selected_path;
+  const video = state.lastAnalysis?.video_path;
+  return !current || !selected || current === selected || current === video;
 }
 
 function render(data) {
