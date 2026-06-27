@@ -11,6 +11,11 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+try:
+    from ssh_tunnel import tunnel_manager
+except ImportError:
+    tunnel_manager = None
+
 
 APP_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = APP_DIR.parent
@@ -88,6 +93,13 @@ def parse_json_response(text: str) -> Any:
 
 
 def call_ollama_json(prompt: str, system_prompt: str, model: str = "qwen3:14b", timeout: int = 45) -> Dict[str, Any]:
+    base_url = "http://127.0.0.1:11434"
+    if model.startswith("remote:"):
+        parts = model.split(":", 2)
+        if len(parts) == 3:
+            base_url = "http://127.0.0.1:11435"
+            model = parts[2]
+            
     payload = {
         "model": model,
         "messages": [
@@ -101,7 +113,7 @@ def call_ollama_json(prompt: str, system_prompt: str, model: str = "qwen3:14b", 
         "options": {"temperature": 0},
     }
     request = Request(
-        "http://127.0.0.1:11434/api/chat",
+        f"{base_url}/api/chat",
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -115,11 +127,16 @@ def call_ollama_json(prompt: str, system_prompt: str, model: str = "qwen3:14b", 
     return data
 
 
-def infer_single_file_names(input_path: Path, video_path: Path, fallback: Dict[str, str]) -> Dict[str, str]:
+def infer_single_file_names(
+    input_path: Path,
+    video_path: Path,
+    fallback: Dict[str, str],
+    llm_model: str = "qwen3:14b",
+) -> Dict[str, str]:
     try:
-        cache_key = f"{video_path.resolve()}::{video_path.stat().st_mtime_ns}"
+        cache_key = f"{video_path.resolve()}::{video_path.stat().st_mtime_ns}::{llm_model}"
     except OSError:
-        cache_key = str(video_path.resolve())
+        cache_key = f"{video_path.resolve()}::{llm_model}"
     if cache_key in NAME_CACHE:
         return NAME_CACHE[cache_key]
 
@@ -149,7 +166,7 @@ Rules:
    - Set "movie_name" to the episode identifier/name (e.g. "S01E01" or "Episode 1").
 """
     try:
-        data = call_ollama_json(prompt, system_prompt)
+        data = call_ollama_json(prompt, system_prompt, model=llm_model)
         movie_name = clean_output_name(data.get("movie_name"), fallback["movie_name"])
         series_name = clean_output_name(data.get("series_name"), fallback["series_name"])
         if str(data.get("kind") or "").lower() == "movie":
@@ -157,7 +174,7 @@ Rules:
         result = {
             "series_name": series_name,
             "movie_name": movie_name,
-            "name_source": "ollama:qwen3:14b",
+            "name_source": f"ollama:{llm_model}",
         }
     except Exception as exc:
         result = {
@@ -265,14 +282,34 @@ def list_embedded_subtitles(video_path: Path) -> List[Dict[str, Any]]:
         return [{"error": str(exc)}]
 
 
-def default_names(input_path: Path, video_path: Path) -> Dict[str, str]:
+def list_embedded_audio(video_path: Path) -> List[Dict[str, Any]]:
+    try:
+        from subtitle_pipeline import find_ffmpeg, probe_streams
+
+        ffmpeg = find_ffmpeg(None)
+        streams = [stream for stream in probe_streams(video_path, ffmpeg) if stream.is_audio]
+        return [
+            {
+                "index": stream.index,
+                "label": f"0:{stream.index} {stream.lang or '-'} {stream.codec} {stream.title}".strip(),
+                "language": stream.lang,
+                "codec": stream.codec,
+                "title": stream.title,
+            }
+            for stream in streams
+        ]
+    except Exception as exc:
+        return [{"error": str(exc)}]
+
+
+def default_names(input_path: Path, video_path: Path, llm_model: str = "qwen3:14b") -> Dict[str, str]:
     fallback_movie = clean_name(video_path.name)
     if input_path.is_dir():
         fallback_series = clean_name(input_path.name)
     else:
         fallback_series = fallback_movie
     fallback = {"series_name": fallback_series, "movie_name": fallback_movie}
-    return infer_single_file_names(input_path, video_path, fallback)
+    return infer_single_file_names(input_path, video_path, fallback, llm_model)
 
 
 def output_dir(output_root: Path, series_name: str, movie_name: str) -> Path:
@@ -339,14 +376,17 @@ def analyze_input(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     video = resolve_video_path(selected)
     output_root = Path(payload.get("output_root") or DEFAULT_OUTPUT_ROOT)
-    names = default_names(selected, video)
+    llm_model = payload.get("llm_model") or "qwen3:14b"
+    names = default_names(selected, video, llm_model)
     series_name = names["series_name"]
     movie_name = names["movie_name"]
 
     info = checkpoint_info(output_root, series_name, movie_name)
     sidecars = list_sidecar_subtitles(selected, video)
     embedded = list_embedded_subtitles(video)
+    embedded_audio = list_embedded_audio(video)
     embedded_tracks = [item for item in embedded if "error" not in item]
+    audio_tracks = [item for item in embedded_audio if "error" not in item]
     if sidecars:
         auto_source = "sidecar"
     elif embedded_tracks:
@@ -367,8 +407,10 @@ def analyze_input(payload: Dict[str, Any]) -> Dict[str, Any]:
             "name_source": names.get("name_source", "heuristic"),
             "has_sidecar_subtitles": bool(sidecars),
             "has_embedded_subtitles": bool(embedded_tracks),
+            "has_embedded_audio": bool(audio_tracks),
             "sidecar_subtitles": sidecars,
             "embedded_subtitles": embedded,
+            "embedded_audio": embedded_audio,
             "auto_source": auto_source,
         }
     )
@@ -437,15 +479,17 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
     output_root = Path(payload.get("output_root") or DEFAULT_OUTPUT_ROOT)
     series_name = payload.get("series_name") or ""
     movie_name = payload.get("movie_name") or ""
+    llm_model = payload.get("llm_model") or "qwen3:14b"
     video = resolve_video_path(selected)
     if not series_name or not movie_name:
-        names = default_names(selected, video)
+        names = default_names(selected, video, llm_model)
         series_name = series_name or names["series_name"]
         movie_name = movie_name or names["movie_name"]
     restart = bool(payload.get("restart"))
-    source_mode = payload.get("source_mode") or "auto"
-    sidecar_path = payload.get("sidecar_path") or ""
+    source_mode = payload.get("source") or "auto"
+    sidecar_path = payload.get("subtitle_file")
     subtitle_stream = payload.get("subtitle_stream")
+    audio_stream = payload.get("audio_stream")
     source_language = payload.get("source_language") or "auto"
     asr_language = payload.get("asr_language") or "en"
     subtitle_ocr_lang = payload.get("subtitle_ocr_lang") or "auto"
@@ -485,7 +529,7 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
         "--subtitle-ocr-lang",
         subtitle_ocr_lang,
         "--llm-model",
-        payload.get("llm_model") or "qwen3:14b",
+        llm_model,
         "--batch-size",
         str(batch_size),
         "--context-lines",
@@ -501,6 +545,8 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
         args.extend(["--subtitle-file", sidecar_path])
     if subtitle_stream not in (None, ""):
         args.extend(["--subtitle-stream", str(subtitle_stream)])
+    if audio_stream not in (None, ""):
+        args.extend(["--audio-stream", str(audio_stream)])
 
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
@@ -704,9 +750,28 @@ def html_page() -> str:
       .span-2, .span-3, .span-4, .span-6, .span-8, .span-12 { grid-column: span 1; }
       .stats { grid-template-columns: 1fr 1fr; }
     }
+    .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); align-items: center; justify-content: center; z-index: 1000; }
+    .modal { background: white; padding: 24px; border-radius: 8px; width: 100%; max-width: 400px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
+    .modal h2 { margin-top: 0; }
+    .modal .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
   </style>
 </head>
 <body>
+<div class="modal-overlay" id="remoteModal">
+  <div class="modal">
+    <h2>远程服务器设置</h2>
+    <label>连接名称</label><input id="remoteName" value="Lab Server" style="margin-bottom:12px">
+    <label>主机 IP</label><input id="remoteHost" placeholder="例如 192.168.1.10" style="margin-bottom:12px">
+    <label>SSH 端口</label><input id="remotePort" type="number" value="22" style="margin-bottom:12px">
+    <label>用户名</label><input id="remoteUser" value="root" style="margin-bottom:12px">
+    <label>密码</label><input id="remotePass" type="password" style="margin-bottom:12px">
+    <div id="remoteError" style="color:#b42318; font-size:13px; margin-bottom:8px;"></div>
+    <div class="actions">
+      <button class="secondary" onclick="closeRemoteModal()">取消</button>
+      <button onclick="connectRemoteServer()" id="remoteConnectBtn">连接</button>
+    </div>
+  </div>
+</div>
 <main>
   <h1>字幕识别翻译控制台</h1>
 
@@ -733,24 +798,28 @@ def html_page() -> str:
       </div>
       <div class="span-4">
         <label>字幕来源</label>
-        <select id="sourceMode">
+        <select id="source">
           <option value="auto" selected>自动：已有字幕 → 内封字幕 → 音频识别</option>
           <option value="sidecar">手动：已有字幕文件</option>
           <option value="embedded">手动：视频内封字幕</option>
           <option value="audio">手动：Whisper 音频识别</option>
         </select>
       </div>
-      <div class="span-4">
+      <div class="span-4" id="sidecarPathGroup">
         <label>已有字幕文件</label>
         <select id="sidecarPath"><option value="">自动选择</option></select>
       </div>
-      <div class="span-4">
+      <div class="span-4" id="subtitleStreamGroup">
         <label>视频内封字幕轨</label>
         <select id="subtitleStream"><option value="">自动选择</option></select>
       </div>
+      <div class="span-4" id="audioStreamGroup">
+        <label>音频轨道</label>
+        <select id="audioStream"><option value="">自动选择</option></select>
+      </div>
       <div class="span-2">
         <label>源字幕语言</label>
-        <select id="sourceLanguage">
+        <select id="source_language">
           <option value="auto" selected>自动</option>
           <option value="en">English</option>
           <option value="ja">Japanese</option>
@@ -787,8 +856,17 @@ def html_page() -> str:
           <option value="german">German</option>
         </select>
       </div>
-      <div class="span-2">
-        <label>每组字幕单元</label>
+      <div class="span-3">
+        <label>大语言模型</label>
+        <div style="display:flex; gap:8px;">
+            <select id="llmModel">
+              <option value="qwen3:14b">[Local] qwen3:14b</option>
+            </select>
+            <button class="secondary" style="padding: 0 8px;" onclick="openRemoteModal()" title="设置远程 Ollama 服务器">⚙️</button>
+        </div>
+      </div>
+      <div class="span-1">
+        <label>每组字幕</label>
         <input id="batchSize" type="number" value="5" min="1" max="20">
       </div>
       <div class="span-2">
@@ -912,12 +990,14 @@ function payload() {
     output_root: document.getElementById('outputRoot').value,
     series_name: document.getElementById('seriesName').value,
     movie_name: document.getElementById('movieName').value,
-    source_mode: document.getElementById('sourceMode').value,
-    sidecar_path: document.getElementById('sidecarPath').value,
+    source: document.getElementById('source').value,
+    subtitle_file: document.getElementById('sidecarPath').value,
     subtitle_stream: document.getElementById('subtitleStream').value,
-    source_language: document.getElementById('sourceLanguage').value,
+    audio_stream: document.getElementById('audioStream').value,
+    source_language: document.getElementById('source_language').value,
     asr_language: document.getElementById('asrLanguage').value,
     subtitle_ocr_lang: document.getElementById('subtitleOcrLang').value,
+    llm_model: document.getElementById('llmModel').value,
     batch_size: Number(document.getElementById('batchSize').value || 5),
     context_lines: Number(document.getElementById('contextLines').value || 30),
     max_words: Number(document.getElementById('maxWords').value || 14),
@@ -1065,6 +1145,7 @@ function normalizePathForCompare(value) {
 function render(data) {
   if (data.sidecar_subtitles) updateSidecarOptions(data.sidecar_subtitles);
   if (data.embedded_subtitles) updateEmbeddedOptions(data.embedded_subtitles);
+  if (data.embedded_audio) updateAudioOptions(data.embedded_audio);
 
   document.getElementById('videoSize').textContent = data.video_size_gb ? `${data.video_size_gb} GB` : '-';
   document.getElementById('totalCount').textContent = data.total_count ?? '未知';
@@ -1137,6 +1218,18 @@ function updateEmbeddedOptions(items) {
   if ([...select.options].some(option => option.value === current)) select.value = current;
 }
 
+function updateAudioOptions(items) {
+  const select = document.getElementById('audioStream');
+  const current = select.value;
+  const rows = (items || []).filter(item => !item.error).map(item => {
+    let scoreInfo = item.language ? `[${item.language}]` : "";
+    const label = `0:${item.index} ${item.codec} ${scoreInfo} ${item.title || ''}`.trim();
+    return `<option value="${escapeHtml(item.index)}">${escapeHtml(label)}</option>`;
+  }).join('');
+  select.innerHTML = '<option value="">自动选择</option>' + rows;
+  if ([...select.options].some(option => option.value === current)) select.value = current;
+}
+
 function sourceLabel(value) {
   return ({auto: '自动', sidecar: '已有字幕', srt: '已有字幕', embedded: '内封字幕', audio: '音频识别'})[value] || value;
 }
@@ -1153,7 +1246,92 @@ function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 }
 
-const INPUT_IDS = ['path', 'outputRoot', 'seriesName', 'movieName', 'sourceMode', 'sidecarPath', 'subtitleStream', 'sourceLanguage', 'asrLanguage', 'subtitleOcrLang', 'batchSize', 'contextLines', 'maxWords', 'maxChars', 'maxDuration'];
+const INPUT_IDS = ['path', 'outputRoot', 'seriesName', 'movieName', 'source', 'sidecarPath', 'subtitleStream', 'audioStream', 'source_language', 'asrLanguage', 'subtitleOcrLang', 'llmModel', 'batchSize', 'contextLines', 'maxWords', 'maxChars', 'maxDuration'];
+
+const REMOTE_STORAGE_KEY = 'sub_remote_config';
+
+function openRemoteModal() {
+  document.getElementById('remoteError').textContent = '';
+  document.getElementById('remoteModal').style.display = 'flex';
+  const conf = JSON.parse(localStorage.getItem(REMOTE_STORAGE_KEY) || '{}');
+  if (conf.host) document.getElementById('remoteHost').value = conf.host;
+  if (conf.port) document.getElementById('remotePort').value = conf.port;
+  if (conf.user) document.getElementById('remoteUser').value = conf.user;
+  if (conf.name) document.getElementById('remoteName').value = conf.name;
+}
+
+function closeRemoteModal() {
+  document.getElementById('remoteModal').style.display = 'none';
+}
+
+async function connectRemoteServer() {
+  const btn = document.getElementById('remoteConnectBtn');
+  btn.textContent = '连接中...';
+  btn.disabled = true;
+  document.getElementById('remoteError').textContent = '';
+  
+  const payload = {
+    host: document.getElementById('remoteHost').value,
+    port: document.getElementById('remotePort').value,
+    user: document.getElementById('remoteUser').value,
+    password: document.getElementById('remotePass').value,
+    name: document.getElementById('remoteName').value || 'Remote'
+  };
+  
+  try {
+    const res = await fetch('/api/remote/connect', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json();
+    if (res.ok && data.status === 'connected') {
+      localStorage.setItem(REMOTE_STORAGE_KEY, JSON.stringify({
+        host: payload.host, port: payload.port, user: payload.user, name: payload.name
+      }));
+      updateLlmModels(data.models, payload.name);
+      closeRemoteModal();
+    } else {
+      document.getElementById('remoteError').textContent = data.error || '连接失败';
+    }
+  } catch(e) {
+    document.getElementById('remoteError').textContent = String(e);
+  } finally {
+    btn.textContent = '连接';
+    btn.disabled = false;
+  }
+}
+
+function updateLlmModels(remoteModels, remoteName) {
+  const select = document.getElementById('llmModel');
+  let current = select.value;
+  try {
+    const saved = JSON.parse(localStorage.getItem(FORM_STORAGE_KEY) || '{}');
+    if (saved.llmModel) current = saved.llmModel;
+  } catch (e) {}
+  let html = `<option value="qwen3:14b">[Local] qwen3:14b</option>`;
+  if (remoteModels && remoteModels.length) {
+    remoteModels.forEach(m => {
+      html += `<option value="remote:${remoteName}:${m}">[Remote: ${remoteName}] ${m}</option>`;
+    });
+  }
+  select.innerHTML = html;
+  if ([...select.options].some(o => o.value === current)) {
+    select.value = current;
+  }
+}
+
+async function checkRemoteStatus() {
+  try {
+    const res = await fetch('/api/remote/status', {method: 'POST'});
+    if (res.ok) {
+      const data = await res.json();
+      if (data.connected && data.models) {
+        updateLlmModels(data.models, data.name);
+      }
+    }
+  } catch(e) {}
+}
 
 function saveFormState() {
   if (state.lastAnalysis && !analysisMatchesCurrentPath(state.lastAnalysis)) {
@@ -1184,7 +1362,10 @@ function restoreFormState() {
   } catch (e) {}
 }
 
-document.addEventListener('DOMContentLoaded', restoreFormState);
+document.addEventListener('DOMContentLoaded', () => {
+  restoreFormState();
+  checkRemoteStatus();
+});
 document.addEventListener('input', saveFormState);
 document.addEventListener('change', saveFormState);
 
@@ -1216,6 +1397,31 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(stop_processing(self.read_json_body()))
             elif self.path == "/api/status":
                 self.send_json(run_status(self.read_json_body()))
+            elif self.path == "/api/remote/connect":
+                if not tunnel_manager:
+                    self.send_json({"error": "paramiko not installed or ssh_tunnel not found"}, status=500)
+                    return
+                body = self.read_json_body()
+                success = tunnel_manager.connect(
+                    body.get("host", ""),
+                    int(body.get("port", 22)),
+                    body.get("user", ""),
+                    body.get("password", ""),
+                    body.get("name", "remote")
+                )
+                if success:
+                    models = tunnel_manager.fetch_models()
+                    self.send_json({"status": "connected", "models": models})
+                else:
+                    self.send_json({"error": tunnel_manager.last_error}, status=400)
+            elif self.path == "/api/remote/status":
+                if not tunnel_manager:
+                    self.send_json({"connected": False, "error": "Not installed"})
+                    return
+                st = tunnel_manager.status()
+                if st["connected"]:
+                    st["models"] = tunnel_manager.fetch_models()
+                self.send_json(st)
             else:
                 self.send_json({"error": "Not found"}, status=404)
         except Exception as exc:

@@ -28,6 +28,13 @@ def configure_output_encoding() -> None:
             pass
 
 
+def write_json_atomic(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
+
+
 TEXT_CODECS = {
     "ass",
     "ssa",
@@ -51,6 +58,10 @@ class StreamInfo:
     @property
     def is_subtitle(self) -> bool:
         return self.kind.lower() == "subtitle"
+
+    @property
+    def is_audio(self) -> bool:
+        return self.kind.lower() == "audio"
 
     @property
     def is_pgs(self) -> bool:
@@ -913,14 +924,8 @@ def ocr_pgs_events(
         event = SubtitleEvent(item.start, item.end, text)
         out.append(event)
         if idx % 20 == 0:
-            cache_path.write_text(
-                json.dumps([e.__dict__ for e in out], ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-    cache_path.write_text(
-        json.dumps([e.__dict__ for e in out], ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+            write_json_atomic(cache_path, [e.__dict__ for e in out])
+    write_json_atomic(cache_path, [e.__dict__ for e in out])
     return out
 
 
@@ -965,21 +970,17 @@ def read_or_ocr_pgs_events(
     else:
         log(f"Rendering PGS images from {sup_path.name}")
         image_events = parse_pgs_to_images(sup_path, image_dir, scale=scale, pad=pad, limit=limit)
-        image_events_path.write_text(
-            json.dumps(
-                [
-                    {
-                        "start": e.start,
-                        "end": e.end,
-                        "image_path": str(e.image_path),
-                        "image_hash": e.image_hash,
-                    }
-                    for e in image_events
-                ],
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
+        write_json_atomic(
+            image_events_path,
+            [
+                {
+                    "start": e.start,
+                    "end": e.end,
+                    "image_path": str(e.image_path),
+                    "image_hash": e.image_hash,
+                }
+                for e in image_events
+            ],
         )
     log(f"OCR source images: {len(image_events)}")
     return ocr_pgs_events(image_events, ocr_lang, device, ocr_cache_path, prefer_accuracy)
@@ -1164,6 +1165,7 @@ def ollama_translate_events(
     cache_path: Path,
     batch_size: int = 5,
     context_lines: int = 30,
+    base_url: str = "http://127.0.0.1:11434",
 ) -> tuple[list[SubtitleEvent], list[SubtitleEvent]]:
     try:
         import requests
@@ -1236,7 +1238,7 @@ Rules:
             "keep_alive": -1,
             "options": {"temperature": 0.1},
         }
-        response = session.post("http://127.0.0.1:11434/api/chat", json=payload, timeout=600)
+        response = session.post(f"{base_url.rstrip('/')}/api/chat", json=payload, timeout=600)
         response.raise_for_status()
         data = response.json()
         text = data.get("message", {}).get("content", "")
@@ -1266,16 +1268,12 @@ Rules:
 
         done_en.extend(batch_en)
         done_zh.extend(batch_zh)
-        cache_path.write_text(
-            json.dumps(
-                [
-                    {"start": en.start, "end": en.end, "en": en.text, "zh": zh.text}
-                    for en, zh in zip(done_en, done_zh)
-                ],
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
+        write_json_atomic(
+            cache_path,
+            [
+                {"start": en.start, "end": en.end, "en": en.text, "zh": zh.text}
+                for en, zh in zip(done_en, done_zh)
+            ],
         )
         log(f"Translated {len(done_zh)}/{len(events)}")
         time.sleep(0.05)
@@ -1353,12 +1351,21 @@ def main() -> int:
         log(f"Simplified Chinese SRT: {zh_srt} ({len(zh_events)} lines)")
     else:
         zh_cache = base_dir / "ollama_zh_cache.json"
+        model_name = args.model
+        base_url = "http://127.0.0.1:11434"
+        if model_name.startswith("remote:"):
+            parts = model_name.split(":", 2)
+            if len(parts) == 3:
+                base_url = "http://127.0.0.1:11435"
+                model_name = parts[2]
+
         en_events, zh_events = ollama_translate_events(
             en_events,
-            args.model,
+            model_name,
             zh_cache,
             batch_size=args.batch_size,
             context_lines=args.context_lines,
+            base_url=base_url,
         )
         corrected_en_srt = base_dir / f"{safe_stem(video)}.en.corrected.srt"
         write_srt(en_events, corrected_en_srt)

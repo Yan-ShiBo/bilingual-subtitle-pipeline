@@ -24,6 +24,13 @@ def configure_output_encoding() -> None:
             pass
 
 
+def write_json_atomic(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
+
+
 def get_ffmpeg_path() -> str:
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg:
@@ -68,7 +75,7 @@ def resolve_video_path(input_path: Path) -> Path:
     return input_path
 
 
-def extract_audio(video_path: Path, temp_audio_path: Path) -> None:
+def extract_audio(video_path: Path, temp_audio_path: Path, audio_stream: Optional[int] = None) -> None:
     print(f"Extracting audio from {video_path.name}...")
     ffmpeg = get_ffmpeg_path()
     cmd = [
@@ -77,6 +84,10 @@ def extract_audio(video_path: Path, temp_audio_path: Path) -> None:
         "-i",
         str(video_path),
         "-vn",
+    ]
+    if audio_stream is not None:
+        cmd.extend(["-map", f"0:{audio_stream}"])
+    cmd.extend([
         "-acodec",
         "pcm_s16le",
         "-ar",
@@ -84,7 +95,7 @@ def extract_audio(video_path: Path, temp_audio_path: Path) -> None:
         "-ac",
         "1",
         str(temp_audio_path),
-    ]
+    ])
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print("Audio extraction complete.")
 
@@ -146,8 +157,15 @@ def transcribe_audio(audio_path: Path, language: Optional[str] = "en") -> List[S
 
 
 def call_llm(prompt: str, system_prompt: str = "", model: str = "qwen3:14b") -> str:
+    base_url = "http://localhost:11434/v1"
+    if model.startswith("remote:"):
+        parts = model.split(":", 2)
+        if len(parts) == 3:
+            base_url = "http://localhost:11435/v1"
+            model = parts[2]
+
     client = OpenAI(
-        base_url="http://localhost:11434/v1",
+        base_url=base_url,
         api_key="ollama",
     )
 
@@ -743,11 +761,7 @@ Rules:
         processed_segments.extend(batch_processed)
 
         if checkpoint_path:
-            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-            checkpoint_path.write_text(
-                json.dumps(processed_segments, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            write_json_atomic(checkpoint_path, processed_segments)
 
     return processed_segments
 
@@ -862,6 +876,7 @@ def main() -> None:
     parser.add_argument("--srt", type=str, help="Explicit sidecar SRT path. Kept for compatibility.")
     parser.add_argument("--subtitle-file", type=str, help="Explicit sidecar subtitle path: srt, ass, ssa, or vtt.")
     parser.add_argument("--subtitle-stream", type=int, help="Embedded subtitle stream index, e.g. 2 for 0:2.")
+    parser.add_argument("--audio-stream", type=int, help="Audio stream index, e.g. 1 for 0:1.")
     parser.add_argument("--source-language", default="auto", help="Source subtitle language for correction/translation context.")
     parser.add_argument("--asr-language", default="en", help="Whisper language code, or auto for detection.")
     parser.add_argument("--subtitle-ocr-lang", default="auto", help="PaddleOCR language for image subtitles, or auto.")
@@ -927,19 +942,18 @@ def main() -> None:
                 if source_language == "auto":
                     source_language = source_segments[0].get("source_language") or "embedded subtitle"
             except Exception as exc:
-                print(f"Failed to load embedded subtitles: {exc}", file=sys.stderr)
-                import traceback
-                traceback.print_exc()
                 if args.source == "embedded":
+                    print(f"Failed to load embedded subtitles: {exc}", file=sys.stderr)
                     raise
+                print(f"No embedded subtitles available ({exc}). Falling back to audio extraction...")
                 actual_source = "audio"
-                extract_audio(video_path, temp_audio)
+                extract_audio(video_path, temp_audio, audio_stream=args.audio_stream)
                 source_segments = transcribe_audio(temp_audio, language=args.asr_language)
                 if source_language == "auto":
                     source_language = args.asr_language
         else:
             actual_source = "audio"
-            extract_audio(video_path, temp_audio)
+            extract_audio(video_path, temp_audio, audio_stream=args.audio_stream)
             source_segments = transcribe_audio(temp_audio, language=args.asr_language)
             if source_language == "auto":
                 source_language = args.asr_language
@@ -953,11 +967,7 @@ def main() -> None:
             max_duration=args.max_duration,
         )
         subtitle_segments = apply_timing_sanity_rules(subtitle_segments, max_duration=args.max_duration)
-        source_segments_path.parent.mkdir(parents=True, exist_ok=True)
-        source_segments_path.write_text(
-            json.dumps(subtitle_segments, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        write_json_atomic(source_segments_path, subtitle_segments)
         print_timing_report(subtitle_segments)
 
         processed_segments = translate_and_correct_segments(

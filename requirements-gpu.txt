@@ -4,3 +4,4 @@ imageio-ffmpeg
 tqdm
 requests
 pgsrip
+paramiko
