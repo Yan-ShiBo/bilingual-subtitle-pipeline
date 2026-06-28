@@ -349,9 +349,11 @@ def checkpoint_info(output_root: Path, series_name: str, movie_name: str) -> Dic
             items = read_json(checkpoint)
             if isinstance(items, list):
                 info["completed_count"] = len(items)
-                if items:
-                    info["last_item"] = summarize_segment(items[-1])
-                    info["preview"] = [summarize_segment(item) for item in items[-10:]]
+                visible_items = [item for item in items if item.get("display", True) is not False]
+                info["visible_count"] = len(visible_items)
+                if visible_items:
+                    info["last_item"] = summarize_segment(visible_items[-1])
+                    info["preview"] = [summarize_segment(item) for item in visible_items[-10:]]
         except Exception as exc:
             info["checkpoint_error"] = str(exc)
 
@@ -361,11 +363,12 @@ def checkpoint_info(output_root: Path, series_name: str, movie_name: str) -> Dic
 def summarize_segment(item: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "id": item.get("id"),
-        "start": item.get("start"),
-        "end": item.get("end"),
+        "start": item.get("display_start", item.get("start")),
+        "end": item.get("display_end", item.get("end")),
         "text": item.get("text"),
         "en": item.get("en"),
         "zh": item.get("zh"),
+        "display": item.get("display", True),
     }
 
 

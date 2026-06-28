@@ -31,6 +31,41 @@ def write_json_atomic(path: Path, data: Any) -> None:
     tmp_path.replace(path)
 
 
+def load_cached_source_segments(path: Path) -> List[Segment]:
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, list):
+        raise ValueError("cached source segments must be a JSON list")
+
+    segments: List[Segment] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ValueError(f"cached source segment {index} is not an object")
+        if "start" not in item or "end" not in item or "text" not in item:
+            raise ValueError(f"cached source segment {index} is missing start/end/text")
+        start = float(item["start"])
+        end = float(item["end"])
+        text = clean_subtitle_text(str(item.get("text") or ""))
+        if end <= start:
+            raise ValueError(f"cached source segment {index} has invalid timing")
+        if not text:
+            continue
+        segments.append({**item, "id": len(segments), "start": start, "end": end, "text": text})
+
+    if not segments:
+        raise ValueError("cached source segments are empty")
+    return segments
+
+
+def infer_source_language_from_segments(segments: List[Segment], fallback: str) -> str:
+    if fallback and fallback != "auto":
+        return fallback
+    for segment in segments:
+        language = segment.get("source_language")
+        if language:
+            return str(language)
+    return "cached source"
+
+
 def get_ffmpeg_path() -> str:
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg:
@@ -641,9 +676,88 @@ def apply_timing_sanity_rules(segments: List[Segment], max_duration: float = 6.0
 def build_context_text(segments: List[Segment], start: int, end: int, context_lines: int) -> Tuple[str, str]:
     before_start = max(0, start - context_lines)
     after_end = min(len(segments), end + context_lines)
-    before = "\n".join(f"[{index}] {segments[index]['text']}" for index in range(before_start, start))
-    after = "\n".join(f"[{index}] {segments[index]['text']}" for index in range(end, after_end))
+    before = "\n".join(format_prompt_segment(index, segments[index]) for index in range(before_start, start))
+    after = "\n".join(format_prompt_segment(index, segments[index]) for index in range(end, after_end))
     return before, after
+
+
+def format_prompt_segment(index: int, segment: Segment) -> str:
+    return f"[{index}] {float(segment['start']):.2f}->{float(segment['end']):.2f} {segment['text']}"
+
+
+def parse_display_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() not in {"false", "0", "no", "hidden", "hide", "omit", "skip"}
+    return True
+
+
+def parse_display_time(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def apply_display_timing(
+    segment: Segment,
+    item: Dict[str, Any],
+    context_start: float,
+    context_end: float,
+) -> Segment:
+    output = dict(segment)
+    display = parse_display_flag(item.get("display", item.get("show", item.get("keep", True))))
+    output["display"] = display
+    if not display:
+        output.pop("display_start", None)
+        output.pop("display_end", None)
+        return output
+
+    display_start = parse_display_time(item.get("display_start"))
+    display_end = parse_display_time(item.get("display_end"))
+    if display_start is None:
+        display_start = parse_display_time(item.get("start"))
+    if display_end is None:
+        display_end = parse_display_time(item.get("end"))
+
+    if display_start is None:
+        display_start = float(segment["start"])
+    if display_end is None:
+        display_end = float(segment["end"])
+
+    display_start = max(context_start, min(context_end, display_start))
+    display_end = max(context_start, min(context_end, display_end))
+    if display_end <= display_start:
+        display_start = float(segment["start"])
+        display_end = float(segment["end"])
+
+    if abs(display_start - float(segment["start"])) > 0.02:
+        output["display_start"] = display_start
+    else:
+        output.pop("display_start", None)
+    if abs(display_end - float(segment["end"])) > 0.02:
+        output["display_end"] = display_end
+    else:
+        output.pop("display_end", None)
+    return output
+
+
+def extend_display_over_hidden_segments(segments: List[Segment], max_gap: float = 2.0) -> None:
+    last_visible: Optional[Segment] = None
+    for segment in segments:
+        if segment.get("display", True) is False:
+            if last_visible is not None:
+                visible_end = float(last_visible.get("display_end", last_visible["end"]))
+                gap = float(segment["start"]) - visible_end
+                if gap <= max_gap:
+                    last_visible["display_end"] = max(visible_end, float(segment["end"]))
+            continue
+        last_visible = segment
 
 
 def translate_and_correct_segments(
@@ -658,7 +772,7 @@ def translate_and_correct_segments(
     language_label = "the source language" if not source_language or source_language == "auto" else source_language
     system_prompt = (
         "You are a professional subtitle editor and Chinese translator. "
-        "Keep timing granularity fixed: never merge, split, reorder, omit, or add subtitle items."
+        "Repair ASR/OCR errors, repeated hallucinated fragments, and duplicate subtitle loops while preserving source timing anchors."
     )
 
     processed_segments: List[Segment] = []
@@ -682,7 +796,11 @@ def translate_and_correct_segments(
         print(f"Processing segments {i + 1} to {i + len(batch)} of {len(segments)}...")
 
         before_text, after_text = build_context_text(segments, i, i + len(batch), context_lines)
-        batch_text = "\n".join(f"[{j}] {segment['text']}" for j, segment in enumerate(batch))
+        batch_text = "\n".join(format_prompt_segment(j, segment) for j, segment in enumerate(batch))
+        context_start_index = max(0, i - context_lines)
+        context_end_index = min(len(segments), i + len(batch) + context_lines)
+        context_start = float(segments[context_start_index]["start"])
+        context_end = float(segments[context_end_index - 1]["end"])
 
         prompt = f"""
 You will correct and translate only the TARGET LINE(S).
@@ -704,13 +822,23 @@ Return a raw JSON list with exactly {len(batch)} objects.
 Each object must correspond to one TARGET line and keep the same local index.
 Schema:
 [
-  {{"index": 0, "corrected_text": "...", "chinese_translation": "..."}}
+  {{
+    "index": 0,
+    "corrected_text": "...",
+    "chinese_translation": "...",
+    "display": true,
+    "display_start": 12.34,
+    "display_end": 15.67
+  }}
 ]
 
 Rules:
-- One input line must produce one output object.
-- Do not merge two lines.
-- Do not split one line into multiple objects.
+- One input line must still produce one output object for checkpointing.
+- If adjacent TARGET lines are ASR repetitions or overlapping fragments of the same spoken sentence, keep the best complete subtitle on one object and set redundant objects to "display": false.
+- For the kept object, use corrected_text and chinese_translation for the complete sentence, and set display_start/display_end to cover the full spoken span when it is clear from TARGET or nearby context.
+- display_start/display_end must be seconds and must stay within this context window: {context_start:.2f} to {context_end:.2f}.
+- If a TARGET line only repeats or continues a sentence already clearly represented in PREVIOUS CONTEXT, set "display": false.
+- If two TARGET lines are genuine consecutive new information, keep both visible.
 - Do not output previous or following context lines.
 - Do not add explanations, markdown, notes, or extra keys.
 - Correct obvious ASR/OCR/subtitle errors in the source text before translating.
@@ -744,21 +872,27 @@ Rules:
                 )
                 translated = clean_subtitle_text(str(item.get("chinese_translation") or ""))
                 batch_processed.append(
-                    {
-                        **segment,
-                        "en": corrected,
-                        "zh": translated or corrected,
-                    }
+                    apply_display_timing(
+                        {
+                            **segment,
+                            "en": corrected,
+                            "zh": translated or corrected,
+                        },
+                        item,
+                        context_start,
+                        context_end,
+                    )
                 )
         except Exception as exc:
             print(f"Warning: failed to process batch via LLM ({exc}). Falling back to original text.")
             batch_processed = [
-                {**segment, "en": segment["text"], "zh": segment["text"]}
+                {**segment, "en": segment["text"], "zh": segment["text"], "display": True}
                 for segment in batch
             ]
 
         validate_timing_preserved(batch, batch_processed, i)
         processed_segments.extend(batch_processed)
+        extend_display_over_hidden_segments(processed_segments)
 
         if checkpoint_path:
             write_json_atomic(checkpoint_path, processed_segments)
@@ -769,6 +903,9 @@ Rules:
 def checkpoint_matches_segments(cached: List[Segment], segments: List[Segment]) -> bool:
     for index, cached_segment in enumerate(cached):
         current = segments[index]
+        if "display" not in cached_segment:
+            print("Ignoring checkpoint because it lacks duplicate-cleanup display metadata.")
+            return False
         same_start = abs(float(cached_segment["start"]) - float(current["start"])) <= 0.02
         same_end = abs(float(cached_segment["end"]) - float(current["end"])) <= 0.02
         same_text = clean_subtitle_text(str(cached_segment.get("text", ""))) == clean_subtitle_text(str(current.get("text", "")))
@@ -830,10 +967,18 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     with out_path.open("w", encoding="utf-8") as handle:
         handle.write(header)
         for segment in segments:
-            start = seconds_to_ass_time(float(segment["start"]))
-            end = seconds_to_ass_time(float(segment["end"]))
+            if segment.get("display", True) is False:
+                continue
+            start = seconds_to_ass_time(float(segment.get("display_start", segment["start"])))
+            end = seconds_to_ass_time(float(segment.get("display_end", segment["end"])))
             en_text = escape_ass_text(segment.get("en", segment["text"]))
             zh_text = escape_ass_text(segment.get("zh", ""))
+            if mode == "en" and not en_text:
+                continue
+            if mode == "zh" and not zh_text:
+                continue
+            if mode == "bilingual" and not (en_text or zh_text):
+                continue
 
             if mode == "en":
                 handle.write(f"Dialogue: 0,{start},{end},English,,0,0,0,,{en_text}\n")
@@ -922,52 +1067,63 @@ def main() -> None:
     try:
         actual_source = args.source
         source_language = args.source_language
-        if args.source in ("auto", "sidecar", "srt") and sidecar_path and sidecar_path.exists():
-            actual_source = "sidecar"
-            source_segments = parse_subtitle_file(sidecar_path)
-            if source_language == "auto":
-                source_language = "subtitle"
-        elif args.source in ("sidecar", "srt"):
-            raise FileNotFoundError("Sidecar subtitle source requested, but no subtitle file was found.")
-        elif args.source in ("auto", "embedded"):
+        subtitle_segments: Optional[List[Segment]] = None
+        if source_segments_path.exists():
             try:
-                actual_source = "embedded"
-                source_segments = load_embedded_subtitle_events(
-                    video_path,
-                    stream_index=args.subtitle_stream,
-                    source_language=args.source_language,
-                    out_dir=out_dir,
-                    args=args,
-                )
-                if source_language == "auto":
-                    source_language = source_segments[0].get("source_language") or "embedded subtitle"
+                subtitle_segments = load_cached_source_segments(source_segments_path)
+                actual_source = "cached source segments"
+                source_language = infer_source_language_from_segments(subtitle_segments, source_language)
+                print(f"Reusing cached source segments from {source_segments_path} ({len(subtitle_segments)} events).")
             except Exception as exc:
-                if args.source == "embedded":
-                    print(f"Failed to load embedded subtitles: {exc}", file=sys.stderr)
-                    raise
-                print(f"No embedded subtitles available ({exc}). Falling back to audio extraction...")
+                print(f"Ignoring unreadable source cache {source_segments_path}: {exc}")
+
+        if subtitle_segments is None:
+            if args.source in ("auto", "sidecar", "srt") and sidecar_path and sidecar_path.exists():
+                actual_source = "sidecar"
+                source_segments = parse_subtitle_file(sidecar_path)
+                if source_language == "auto":
+                    source_language = "subtitle"
+            elif args.source in ("sidecar", "srt"):
+                raise FileNotFoundError("Sidecar subtitle source requested, but no subtitle file was found.")
+            elif args.source in ("auto", "embedded"):
+                try:
+                    actual_source = "embedded"
+                    source_segments = load_embedded_subtitle_events(
+                        video_path,
+                        stream_index=args.subtitle_stream,
+                        source_language=args.source_language,
+                        out_dir=out_dir,
+                        args=args,
+                    )
+                    if source_language == "auto":
+                        source_language = source_segments[0].get("source_language") or "embedded subtitle"
+                except Exception as exc:
+                    if args.source == "embedded":
+                        print(f"Failed to load embedded subtitles: {exc}", file=sys.stderr)
+                        raise
+                    print(f"No embedded subtitles available ({exc}). Falling back to audio extraction...")
+                    actual_source = "audio"
+                    extract_audio(video_path, temp_audio, audio_stream=args.audio_stream)
+                    source_segments = transcribe_audio(temp_audio, language=args.asr_language)
+                    if source_language == "auto":
+                        source_language = args.asr_language
+            else:
                 actual_source = "audio"
                 extract_audio(video_path, temp_audio, audio_stream=args.audio_stream)
                 source_segments = transcribe_audio(temp_audio, language=args.asr_language)
                 if source_language == "auto":
                     source_language = args.asr_language
-        else:
-            actual_source = "audio"
-            extract_audio(video_path, temp_audio, audio_stream=args.audio_stream)
-            source_segments = transcribe_audio(temp_audio, language=args.asr_language)
-            if source_language == "auto":
-                source_language = args.asr_language
+
+            subtitle_segments = split_segments_for_subtitles(
+                source_segments,
+                max_words=args.max_words,
+                max_chars=args.max_chars,
+                max_duration=args.max_duration,
+            )
+            subtitle_segments = apply_timing_sanity_rules(subtitle_segments, max_duration=args.max_duration)
+            write_json_atomic(source_segments_path, subtitle_segments)
 
         print(f"Actual subtitle source: {actual_source}")
-
-        subtitle_segments = split_segments_for_subtitles(
-            source_segments,
-            max_words=args.max_words,
-            max_chars=args.max_chars,
-            max_duration=args.max_duration,
-        )
-        subtitle_segments = apply_timing_sanity_rules(subtitle_segments, max_duration=args.max_duration)
-        write_json_atomic(source_segments_path, subtitle_segments)
         print_timing_report(subtitle_segments)
 
         processed_segments = translate_and_correct_segments(
