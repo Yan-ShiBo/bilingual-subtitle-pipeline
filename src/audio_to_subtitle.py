@@ -544,10 +544,11 @@ def sidecar_candidates(
     video_path: Path,
     selected_path: Optional[Path],
     explicit_path: Optional[Path] = None,
+    explicit_zh_path: Optional[Path] = None,
+    explicit_en_path: Optional[Path] = None,
 ) -> List[Path]:
     candidates: List[Path] = []
-    if explicit_path:
-        candidates.append(explicit_path)
+    candidates.extend(path for path in (explicit_path, explicit_zh_path, explicit_en_path) if path)
     candidates.extend(find_sidecar_subtitles(video_path, selected_path))
 
     unique: List[Path] = []
@@ -623,13 +624,15 @@ def find_existing_sidecar_subtitle_segments(
     video_path: Path,
     selected_path: Optional[Path],
     explicit_path: Optional[Path] = None,
+    explicit_zh_path: Optional[Path] = None,
+    explicit_en_path: Optional[Path] = None,
 ) -> Optional[List[Segment]]:
-    candidates = sidecar_candidates(video_path, selected_path, explicit_path)
+    candidates = sidecar_candidates(video_path, selected_path, explicit_path, explicit_zh_path, explicit_en_path)
     if not candidates:
         return None
 
-    zh_path: Optional[Path] = None
-    en_path: Optional[Path] = None
+    zh_path: Optional[Path] = explicit_zh_path if explicit_zh_path and explicit_zh_path.exists() else None
+    en_path: Optional[Path] = explicit_en_path if explicit_en_path and explicit_en_path.exists() else None
     for candidate in candidates:
         language = classify_subtitle_path(candidate)
         if language == "zh" and zh_path is None:
@@ -694,6 +697,8 @@ def find_existing_embedded_subtitle_segments(
     video_path: Path,
     out_dir: Path,
     args: argparse.Namespace,
+    chinese_stream_index: Optional[int] = None,
+    english_stream_index: Optional[int] = None,
 ) -> Optional[List[Segment]]:
     from subtitle_pipeline import classify_chinese, find_ffmpeg, get_stream_events, probe_streams
 
@@ -711,6 +716,15 @@ def find_existing_embedded_subtitle_segments(
 
     zh_stream, zh_kind = choose_best_chinese_stream(streams)
     en_stream = choose_best_english_stream(streams)
+    if chinese_stream_index is not None:
+        matches = [stream for stream in streams if stream.index == chinese_stream_index]
+        if matches:
+            zh_stream = matches[0]
+            zh_kind = classify_chinese(zh_stream) or "zh"
+    if english_stream_index is not None:
+        matches = [stream for stream in streams if stream.index == english_stream_index]
+        if matches:
+            en_stream = matches[0]
     if selected is not None:
         selected_zh_kind = classify_chinese(selected)
         if selected_zh_kind:
@@ -1184,6 +1198,7 @@ Rules:
 - Correct obvious ASR/OCR/subtitle errors in the source text before translating.
 - Keep corrected_text in the original source language.
 - Translate into natural Simplified Chinese.
+- Keep personal names and recurring terminology consistent across the context. Do not translate a name in one line and leave the same name untranslated in another unless the context clearly requires it.
 """
 
         try:
@@ -1291,8 +1306,9 @@ def proofread_existing_chinese_segments(
         prompt = f"""
 You will proofread only the TARGET LINE(S).
 
-The subtitles already contain Chinese. Do not perform a new translation pass.
-Proofread existing English and Chinese text. English may also be OCR output and may contain recognition errors.
+These subtitles may already contain Chinese. Proofread existing English and Chinese text.
+English may also be OCR output and may contain recognition errors.
+Do not retranslate a non-empty Chinese line. Translate from English only when the Chinese line is empty or misses information that exists only in English.
 
 === PREVIOUS CONTEXT, REFERENCE ONLY ===
 {before_text}
@@ -1321,8 +1337,11 @@ Rules:
 - One input line must still produce one output object for checkpointing.
 - Correct obvious English and Chinese OCR/subtitle recognition errors.
 - Convert Traditional Chinese to natural Simplified Chinese.
-- Do not invent missing content. If a Chinese line is already good, keep it.
+- If corrected_chinese is already non-empty and complete, preserve its meaning and only proofread it. Do not replace it with a fresh translation.
+- Translate from English into corrected_chinese only when the original Chinese is empty or clearly lacks information present in the English line.
 - Keep corrected_english in natural English when an English source exists.
+- If English contains SDH/non-speech cues such as music, applause, laughter, or speaker labels and the Chinese line lacks that information, add only that missing cue in concise Simplified Chinese.
+- Keep names and recurring terminology consistent across the context. Do not translate a name in one line and leave the same name untranslated in another unless the context clearly requires it.
 - If adjacent TARGET lines are repeated, overlapping, or fragments of the same subtitle, keep the best complete subtitle on one object and set redundant objects to "display": false.
 - For the kept object, set display_start/display_end to cover the full subtitle span when it is clear from TARGET or nearby context.
 - display_start/display_end must be seconds and must stay within this context window: {context_start:.2f} to {context_end:.2f}.
@@ -1531,7 +1550,12 @@ def main() -> None:
     parser.add_argument("--source", choices=["auto", "sidecar", "srt", "embedded", "audio"], default="auto", help="Subtitle source")
     parser.add_argument("--srt", type=str, help="Explicit sidecar SRT path. Kept for compatibility.")
     parser.add_argument("--subtitle-file", type=str, help="Explicit sidecar subtitle path: srt, ass, ssa, or vtt.")
+    parser.add_argument("--chinese-subtitle-file", type=str, help="Explicit Chinese sidecar subtitle path for bilingual merge.")
+    parser.add_argument("--english-subtitle-file", type=str, help="Explicit English sidecar subtitle path for bilingual merge.")
     parser.add_argument("--subtitle-stream", type=int, help="Embedded subtitle stream index, e.g. 2 for 0:2.")
+    parser.add_argument("--chinese-subtitle-stream", type=int, help="Embedded Chinese subtitle stream index for bilingual merge.")
+    parser.add_argument("--english-subtitle-stream", type=int, help="Embedded English subtitle stream index for bilingual merge.")
+    parser.add_argument("--merge-existing-subtitles", choices=["yes", "no"], default="yes", help="Merge existing Chinese and English subtitles before proofreading.")
     parser.add_argument("--audio-stream", type=int, help="Audio stream index, e.g. 1 for 0:1.")
     parser.add_argument("--source-language", default="auto", help="Source subtitle language for correction/translation context.")
     parser.add_argument("--asr-language", default="en", help="Whisper language code, or auto for detection.")
@@ -1571,6 +1595,9 @@ def main() -> None:
     source_segments_path = out_dir / f"{movie_name}.segments.source.json"
 
     sidecar_path = Path(args.subtitle_file or args.srt) if (args.subtitle_file or args.srt) else None
+    chinese_sidecar_path = Path(args.chinese_subtitle_file) if args.chinese_subtitle_file else None
+    english_sidecar_path = Path(args.english_subtitle_file) if args.english_subtitle_file else None
+    merge_existing_subtitles = args.merge_existing_subtitles == "yes"
     if args.source in ("auto", "sidecar", "srt") and not sidecar_path:
         sidecar_path = find_sidecar_subtitle(video_path, input_path)
 
@@ -1590,19 +1617,27 @@ def main() -> None:
 
         if subtitle_segments is None:
             existing_segments: Optional[List[Segment]] = None
-            if args.source in ("auto", "sidecar", "srt"):
+            if merge_existing_subtitles and args.source in ("auto", "sidecar", "srt"):
                 existing_segments = find_existing_sidecar_subtitle_segments(
                     video_path,
                     input_path,
                     explicit_path=sidecar_path if (args.subtitle_file or args.srt) else None,
+                    explicit_zh_path=chinese_sidecar_path,
+                    explicit_en_path=english_sidecar_path,
                 )
                 if existing_segments:
                     actual_source = "existing Chinese sidecar subtitles"
                     source_language = "existing Chinese subtitle"
 
-            if existing_segments is None and args.source in ("auto", "embedded"):
+            if existing_segments is None and merge_existing_subtitles and args.source in ("auto", "embedded"):
                 try:
-                    existing_segments = find_existing_embedded_subtitle_segments(video_path, out_dir, args)
+                    existing_segments = find_existing_embedded_subtitle_segments(
+                        video_path,
+                        out_dir,
+                        args,
+                        chinese_stream_index=args.chinese_subtitle_stream,
+                        english_stream_index=args.english_subtitle_stream,
+                    )
                     if existing_segments:
                         actual_source = "existing Chinese embedded subtitles"
                         source_language = "existing Chinese subtitle"

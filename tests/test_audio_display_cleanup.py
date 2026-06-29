@@ -290,6 +290,44 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertEqual(output[0]["display_end"], 3.0)
         self.assertFalse(output[1]["display"])
 
+    def test_existing_chinese_proofreading_fills_missing_chinese_cues_only(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 4.0,
+                "end": 5.0,
+                "text": "(MUSIC PLAYING)",
+                "en": "(MUSIC PLAYING)",
+                "zh": "",
+            }
+        ]
+
+        def call_llm(prompt, *_args, **_kwargs):
+            self.assertIn("Translate from English into corrected_chinese only when the original Chinese is empty", prompt)
+            self.assertIn("SDH/non-speech cues", prompt)
+            self.assertIn("Keep names and recurring terminology consistent", prompt)
+            return """
+            [
+              {
+                "index": 0,
+                "corrected_english": "(MUSIC PLAYING)",
+                "corrected_chinese": "\u64ad\u653e\u97f3\u4e50",
+                "display": true
+              }
+            ]
+            """
+
+        with patch.object(audio_to_subtitle, "call_llm", side_effect=call_llm):
+            output = proofread_existing_chinese_segments(
+                source,
+                llm_model="qwen3:30b",
+                batch_size=1,
+                context_lines=0,
+            )
+
+        self.assertEqual(output[0]["zh"], "\u64ad\u653e\u97f3\u4e50")
+        self.assertEqual(output[0]["en"], "(MUSIC PLAYING)")
+
 
 if __name__ == "__main__":
     unittest.main()

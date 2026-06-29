@@ -491,7 +491,12 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
     restart = bool(payload.get("restart"))
     source_mode = payload.get("source") or "auto"
     sidecar_path = payload.get("subtitle_file")
+    merge_existing_subtitles = bool(payload.get("merge_existing_subtitles", True))
+    chinese_sidecar_path = payload.get("chinese_subtitle_file")
+    english_sidecar_path = payload.get("english_subtitle_file")
     subtitle_stream = payload.get("subtitle_stream")
+    chinese_subtitle_stream = payload.get("chinese_subtitle_stream")
+    english_subtitle_stream = payload.get("english_subtitle_stream")
     audio_stream = payload.get("audio_stream")
     source_language = payload.get("source_language") or "auto"
     asr_language = payload.get("asr_language") or "en"
@@ -543,11 +548,21 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
         str(max_chars),
         "--max-duration",
         str(max_duration),
+        "--merge-existing-subtitles",
+        "yes" if merge_existing_subtitles else "no",
     ]
     if sidecar_path:
         args.extend(["--subtitle-file", sidecar_path])
+    if chinese_sidecar_path:
+        args.extend(["--chinese-subtitle-file", chinese_sidecar_path])
+    if english_sidecar_path:
+        args.extend(["--english-subtitle-file", english_sidecar_path])
     if subtitle_stream not in (None, ""):
         args.extend(["--subtitle-stream", str(subtitle_stream)])
+    if chinese_subtitle_stream not in (None, ""):
+        args.extend(["--chinese-subtitle-stream", str(chinese_subtitle_stream)])
+    if english_subtitle_stream not in (None, ""):
+        args.extend(["--english-subtitle-stream", str(english_subtitle_stream)])
     if audio_stream not in (None, ""):
         args.extend(["--audio-stream", str(audio_stream)])
 
@@ -809,13 +824,33 @@ def html_page() -> str:
           <option value="audio">手动：Whisper 音频识别</option>
         </select>
       </div>
+      <div class="span-4">
+        <label>中英字幕合并</label>
+        <label style="display:flex;align-items:center;gap:8px;height:38px"><input id="mergeExistingSubtitles" type="checkbox" checked>合并已有中文字幕和英文字幕</label>
+      </div>
       <div class="span-4" id="sidecarPathGroup">
         <label>已有字幕文件</label>
         <select id="sidecarPath"><option value="">自动选择</option></select>
       </div>
+      <div class="span-4" id="chineseSidecarPathGroup">
+        <label>中文字幕文件</label>
+        <select id="chineseSidecarPath"><option value="">自动选择</option></select>
+      </div>
+      <div class="span-4" id="englishSidecarPathGroup">
+        <label>英文字幕文件</label>
+        <select id="englishSidecarPath"><option value="">可选：自动选择</option></select>
+      </div>
       <div class="span-4" id="subtitleStreamGroup">
         <label>视频内封字幕轨</label>
         <select id="subtitleStream"><option value="">自动选择</option></select>
+      </div>
+      <div class="span-4" id="chineseSubtitleStreamGroup">
+        <label>内封中文字幕轨</label>
+        <select id="chineseSubtitleStream"><option value="">自动选择</option></select>
+      </div>
+      <div class="span-4" id="englishSubtitleStreamGroup">
+        <label>内封英文字幕轨</label>
+        <select id="englishSubtitleStream"><option value="">可选：自动选择</option></select>
       </div>
       <div class="span-4" id="audioStreamGroup">
         <label>音频轨道</label>
@@ -996,7 +1031,12 @@ function payload() {
     movie_name: document.getElementById('movieName').value,
     source: document.getElementById('source').value,
     subtitle_file: document.getElementById('sidecarPath').value,
+    merge_existing_subtitles: document.getElementById('mergeExistingSubtitles').checked,
+    chinese_subtitle_file: document.getElementById('chineseSidecarPath').value,
+    english_subtitle_file: document.getElementById('englishSidecarPath').value,
     subtitle_stream: document.getElementById('subtitleStream').value,
+    chinese_subtitle_stream: document.getElementById('chineseSubtitleStream').value,
+    english_subtitle_stream: document.getElementById('englishSubtitleStream').value,
     audio_stream: document.getElementById('audioStream').value,
     source_language: document.getElementById('source_language').value,
     asr_language: document.getElementById('asrLanguage').value,
@@ -1201,25 +1241,61 @@ function render(data) {
 }
 
 function updateSidecarOptions(items) {
-  const select = document.getElementById('sidecarPath');
-  const current = select.value;
-  select.innerHTML = '<option value="">自动选择</option>' + (items || []).map(item => {
+  const rows = (items || []).map(item => {
     const label = `${item.name || item.path} (${item.extension || '字幕'}, ${item.size_kb ?? '?'} KB)`;
     return `<option value="${escapeHtml(item.path || '')}">${escapeHtml(label)}</option>`;
   }).join('');
-  if ([...select.options].some(option => option.value === current)) select.value = current;
+  fillSubtitleSelect('sidecarPath', '自动选择', rows, null);
+  fillSubtitleSelect('chineseSidecarPath', '自动选择', rows, value => {
+    const item = (items || []).find(entry => entry.path === value);
+    return languageHint(item?.name || item?.path || '') === 'zh';
+  });
+  fillSubtitleSelect('englishSidecarPath', '可选：自动选择', rows, value => {
+    const item = (items || []).find(entry => entry.path === value);
+    return languageHint(item?.name || item?.path || '') === 'en';
+  });
 }
 
 function updateEmbeddedOptions(items) {
-  const select = document.getElementById('subtitleStream');
-  const current = select.value;
-  const rows = (items || []).filter(item => !item.error).map(item => {
+  const valid = (items || []).filter(item => !item.error);
+  const rows = valid.map(item => {
     const kind = item.is_image ? '图像' : (item.is_text ? '文本' : '字幕');
     const label = `${item.label || item.index} | ${kind} | ${item.language || 'und'} | ${item.title || ''}`.trim();
     return `<option value="${escapeHtml(item.index)}">${escapeHtml(label)}</option>`;
   }).join('');
-  select.innerHTML = '<option value="">自动选择</option>' + rows;
-  if ([...select.options].some(option => option.value === current)) select.value = current;
+  fillSubtitleSelect('subtitleStream', '自动选择', rows, null);
+  fillSubtitleSelect('chineseSubtitleStream', '自动选择', rows, value => {
+    const item = valid.find(entry => String(entry.index) === String(value));
+    return languageHint(`${item?.language || ''} ${item?.title || ''}`) === 'zh';
+  });
+  fillSubtitleSelect('englishSubtitleStream', '可选：自动选择', rows, value => {
+    const item = valid.find(entry => String(entry.index) === String(value));
+    return languageHint(`${item?.language || ''} ${item?.title || ''}`) === 'en';
+  });
+}
+
+function fillSubtitleSelect(id, placeholder, rows, prefer) {
+  const select = document.getElementById(id);
+  if (!select) return;
+  const current = select.value;
+  select.innerHTML = `<option value="">${escapeHtml(placeholder)}</option>` + rows;
+  const options = [...select.options];
+  if (current && options.some(option => option.value === current)) {
+    select.value = current;
+  } else if (prefer) {
+    const preferred = options.find(option => option.value && prefer(option.value));
+    if (preferred) select.value = preferred.value;
+  }
+}
+
+function languageHint(text) {
+  const lower = String(text || '').toLowerCase();
+  const parts = lower.split(/[^0-9a-zA-Z\u4e00-\u9fff]+/).filter(Boolean);
+  if (['zh-cn', 'zh-hans', 'zh-tw', 'zh-hant'].some(token => lower.includes(token))) return 'zh';
+  if (parts.some(part => ['zh', 'zho', 'chi', 'chs', 'cht', 'cmn', 'cn', 'sc', 'tc', 'zh-cn', 'zh-hans', 'zh-tw', 'zh-hant'].includes(part))) return 'zh';
+  if (/[中文简繁]/.test(lower) || lower.includes('chinese') || lower.includes('simplified') || lower.includes('traditional')) return 'zh';
+  if (parts.some(part => ['en', 'eng', 'english'].includes(part)) || lower.includes('english')) return 'en';
+  return '';
 }
 
 function updateAudioOptions(items) {
@@ -1250,7 +1326,13 @@ function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 }
 
-const INPUT_IDS = ['path', 'outputRoot', 'seriesName', 'movieName', 'source', 'sidecarPath', 'subtitleStream', 'audioStream', 'source_language', 'asrLanguage', 'subtitleOcrLang', 'llmModel', 'batchSize', 'contextLines', 'maxWords', 'maxChars', 'maxDuration'];
+const INPUT_IDS = [
+  'path', 'outputRoot', 'seriesName', 'movieName', 'source',
+  'mergeExistingSubtitles', 'sidecarPath', 'chineseSidecarPath', 'englishSidecarPath',
+  'subtitleStream', 'chineseSubtitleStream', 'englishSubtitleStream', 'audioStream',
+  'source_language', 'asrLanguage', 'subtitleOcrLang', 'llmModel',
+  'batchSize', 'contextLines', 'maxWords', 'maxChars', 'maxDuration'
+];
 
 const REMOTE_STORAGE_KEY = 'sub_remote_config';
 
@@ -1353,7 +1435,7 @@ function saveFormState() {
   const data = {};
   INPUT_IDS.forEach(id => {
     const el = document.getElementById(id);
-    if (el) data[id] = el.value;
+    if (el) data[id] = el.type === 'checkbox' ? el.checked : el.value;
   });
   localStorage.setItem(FORM_STORAGE_KEY, JSON.stringify(data));
 }
@@ -1364,7 +1446,10 @@ function restoreFormState() {
     if (data) {
       INPUT_IDS.forEach(id => {
         const el = document.getElementById(id);
-        if (el && data[id] !== undefined) el.value = data[id];
+        if (el && data[id] !== undefined) {
+          if (el.type === 'checkbox') el.checked = Boolean(data[id]);
+          else el.value = data[id];
+        }
       });
       const analysis = getMatchingAnalysis();
       if (analysis) render(analysis);
@@ -1450,6 +1535,7 @@ class Handler(BaseHTTPRequestHandler):
         data = content.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -1458,6 +1544,7 @@ class Handler(BaseHTTPRequestHandler):
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
