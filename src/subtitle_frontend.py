@@ -653,7 +653,9 @@ def infer_stage_info(stdout_text: str, running: bool) -> tuple[str, int]:
     
     lines = stdout_text.strip().split("\n")
     for line in reversed(lines):
-        if "Starting sentence-level LLM" in line or "Processing segments" in line:
+        if "Generating bilingual subtitles" in line:
+            return "合并中英文字幕中", 2
+        if "Starting sentence-level LLM" in line or "Processing segments" in line or "Starting LLM proofreading" in line or "Proofreading segments" in line:
             return "LLM翻译校对中", 2
         if "Transcribing audio" in line or "Loading faster-whisper" in line:
             return "语音识别中", 1

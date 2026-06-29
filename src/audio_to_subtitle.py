@@ -1114,6 +1114,149 @@ def extend_display_over_hidden_segments(segments: List[Segment], max_gap: float 
         last_visible = segment
 
 
+def is_language_valid(original_text: str, corrected: str, translated: str) -> bool:
+    orig_has_cjk = contains_cjk(original_text)
+    corr_has_cjk = contains_cjk(corrected)
+    trans_has_cjk = contains_cjk(translated)
+
+    # 英文不是英文：原始无中文字符，但修正后源文却包含了中文字符
+    if not orig_has_cjk and corr_has_cjk:
+        return False
+        
+    # 中文不是中文：译文无中文字符，但包含多个字母（说明可能是生硬复制了外文句子或根本没翻译）
+    if not trans_has_cjk and re.search(r'[a-zA-Z]{3,}', translated):
+        return False
+        
+    return True
+
+
+def retry_single_segment_llm(
+    segment: Segment,
+    before_text: str,
+    after_text: str,
+    context_start: float,
+    context_end: float,
+    system_prompt: str,
+    llm_model: str,
+    language_label: str,
+    is_proofread: bool = False
+) -> Dict[str, Any]:
+    print(f"检测到语言异常，正在重试单句: {segment.get('text', '')}")
+    if is_proofread:
+        batch_text = format_bilingual_prompt_segment(0, segment)
+        prompt = f"""
+You will proofread only the TARGET LINE(S).
+
+These subtitles may already contain Chinese. Proofread existing English and Chinese text.
+English may also be OCR output and may contain recognition errors.
+Do not retranslate a non-empty Chinese line. Translate from English only when the Chinese line is empty or misses information that exists only in English.
+
+=== PREVIOUS CONTEXT, REFERENCE ONLY ===
+{before_text}
+
+=== TARGET LINE(S) TO OUTPUT ===
+{batch_text}
+
+=== FOLLOWING CONTEXT, REFERENCE ONLY ===
+{after_text}
+
+Return a raw JSON list with exactly 1 objects.
+Each object must correspond to one TARGET line and keep the same local index.
+Schema:
+[
+  {{
+    "index": 0,
+    "corrected_english": "...",
+    "corrected_chinese": "...",
+    "display": true,
+    "display_start": 12.34,
+    "display_end": 15.67
+  }}
+]
+
+Rules:
+- One input line must still produce one output object for checkpointing.
+- Correct obvious English and Chinese OCR/subtitle recognition errors.
+- Convert Traditional Chinese to natural Simplified Chinese.
+- If corrected_chinese is already non-empty and complete, preserve its meaning and only proofread it. Do not replace it with a fresh translation.
+- Translate from English into corrected_chinese only when the original Chinese is empty or clearly lacks information present in the English line.
+- Keep corrected_english in natural English when an English source exists.
+- If English contains SDH/non-speech cues such as music, applause, laughter, or speaker labels and the Chinese line lacks that information, add only that missing cue in concise Simplified Chinese.
+- Keep names and recurring terminology consistent across the context. Do not translate a name in one line and leave the same name untranslated in another unless the context clearly requires it.
+- set display_start/display_end to cover the full subtitle span when it is clear from TARGET or nearby context.
+- display_start/display_end must be seconds and must stay within this context window: {context_start:.2f} to {context_end:.2f}.
+- Keep corrected_english empty only when no English source exists.
+- Do not output previous or following context lines.
+- Do not add explanations, markdown, notes, or extra keys.
+"""
+    else:
+        batch_text = format_prompt_segment(0, segment)
+        prompt = f"""
+You will correct and translate only the TARGET LINE(S).
+
+Use the previous and following context to understand names, pronouns, topic continuity, and terminology.
+Do not translate the context sections. They are reference only.
+The source subtitle/audio language is: {language_label}.
+
+=== PREVIOUS CONTEXT, REFERENCE ONLY ===
+{before_text}
+
+=== TARGET LINE(S) TO OUTPUT ===
+{batch_text}
+
+=== FOLLOWING CONTEXT, REFERENCE ONLY ===
+{after_text}
+
+Return a raw JSON list with exactly 1 objects.
+Each object must correspond to one TARGET line and keep the same local index.
+Schema:
+[
+  {{
+    "index": 0,
+    "corrected_text": "...",
+    "chinese_translation": "...",
+    "display": true,
+    "display_start": 12.34,
+    "display_end": 15.67
+  }}
+]
+
+Rules:
+- One input line must still produce one output object for checkpointing.
+- set display_start/display_end to cover the full spoken span when it is clear from TARGET or nearby context.
+- display_start/display_end must be seconds and must stay within this context window: {context_start:.2f} to {context_end:.2f}.
+- Do not output previous or following context lines.
+- Do not add explanations, markdown, notes, or extra keys.
+- Correct obvious ASR/OCR/subtitle errors in the source text before translating.
+- Keep corrected_text in the original source language.
+- Translate into natural Simplified Chinese.
+- Keep personal names and recurring terminology consistent across the context. Do not translate a name in one line and leave the same name untranslated in another unless the context clearly requires it.
+"""
+    
+    for attempt in range(3):
+        try:
+            data = parse_json_response(call_llm(prompt, system_prompt, llm_model))
+            if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+                item = data[0]
+                if is_proofread:
+                    orig_en = str(segment.get("en") or segment.get("text", ""))
+                    corrected = str(item.get("corrected_english") or orig_en)
+                    translated = str(item.get("corrected_chinese") or item.get("chinese_translation") or "")
+                    if is_language_valid(orig_en, corrected, translated):
+                        return item
+                else:
+                    corrected = str(item.get("corrected_text") or item.get("corrected_source") or segment.get("text", ""))
+                    translated = str(item.get("chinese_translation") or "")
+                    if is_language_valid(segment.get("text", ""), corrected, translated):
+                        return item
+            print(f"重试单句第 {attempt + 1} 次依然语言异常，继续重试...")
+        except Exception as exc:
+            print(f"重试单句请求异常: {exc}")
+    
+    print("3次重试均失败，将采用原始字幕。")
+    return {}
+
+
 def translate_and_correct_segments(
     segments: List[Segment],
     llm_model: str,
@@ -1217,15 +1360,40 @@ Rules:
             batch_processed: List[Segment] = []
             for j, segment in enumerate(batch):
                 item = lookup.get(j, {})
-                corrected = clean_subtitle_text(
-                    str(
-                        item.get("corrected_text")
-                        or item.get("corrected_source")
-                        or item.get("corrected_english")
-                        or segment["text"]
-                    )
+                corrected_val = str(
+                    item.get("corrected_text")
+                    or item.get("corrected_source")
+                    or item.get("corrected_english")
+                    or segment["text"]
                 )
-                translated = clean_subtitle_text(str(item.get("chinese_translation") or ""))
+                corrected = clean_subtitle_text(corrected_val)
+                translated_val = str(item.get("chinese_translation") or "")
+                translated = clean_subtitle_text(translated_val)
+                
+                if not is_language_valid(segment["text"], corrected, translated):
+                    retry_item = retry_single_segment_llm(
+                        segment, before_text, after_text, context_start, context_end,
+                        system_prompt, llm_model, language_label, is_proofread=False
+                    )
+                    if retry_item:
+                        item.update(retry_item)
+                        corrected_val = str(
+                            item.get("corrected_text")
+                            or item.get("corrected_source")
+                            or item.get("corrected_english")
+                            or segment["text"]
+                        )
+                        corrected = clean_subtitle_text(corrected_val)
+                        translated_val = str(item.get("chinese_translation") or "")
+                        translated = clean_subtitle_text(translated_val)
+                        
+                        if not is_language_valid(segment["text"], corrected, translated):
+                            corrected = clean_subtitle_text(segment["text"])
+                            translated = clean_subtitle_text(segment["text"])
+                    else:
+                        corrected = clean_subtitle_text(segment["text"])
+                        translated = clean_subtitle_text(segment["text"])
+
                 batch_processed.append(
                     apply_display_timing(
                         {
@@ -1367,19 +1535,40 @@ Rules:
             for j, segment in enumerate(batch):
                 item = lookup.get(j, {})
                 original_en, original_zh = original_en_zh(segment)
-                corrected_en = clean_subtitle_text(
-                    str(item.get("corrected_english") or item.get("en") or original_en)
+                corrected_en_val = str(item.get("corrected_english") or item.get("en") or original_en)
+                corrected_en = clean_subtitle_text(corrected_en_val)
+                corrected_zh_val = str(
+                    item.get("corrected_chinese")
+                    or item.get("chinese")
+                    or item.get("zh")
+                    or original_zh
                 )
-                corrected_zh = to_simplified_text(
-                    clean_subtitle_text(
-                        str(
+                corrected_zh = to_simplified_text(clean_subtitle_text(corrected_zh_val))
+                
+                if not is_language_valid(original_en, corrected_en, corrected_zh):
+                    retry_item = retry_single_segment_llm(
+                        segment, before_text, after_text, context_start, context_end,
+                        system_prompt, llm_model, "", is_proofread=True
+                    )
+                    if retry_item:
+                        item.update(retry_item)
+                        corrected_en_val = str(item.get("corrected_english") or item.get("en") or original_en)
+                        corrected_en = clean_subtitle_text(corrected_en_val)
+                        corrected_zh_val = str(
                             item.get("corrected_chinese")
                             or item.get("chinese")
                             or item.get("zh")
                             or original_zh
                         )
-                    )
-                )
+                        corrected_zh = to_simplified_text(clean_subtitle_text(corrected_zh_val))
+                        
+                        if not is_language_valid(original_en, corrected_en, corrected_zh):
+                            corrected_en = clean_subtitle_text(original_en)
+                            corrected_zh = to_simplified_text(clean_subtitle_text(original_zh))
+                    else:
+                        corrected_en = clean_subtitle_text(original_en)
+                        corrected_zh = to_simplified_text(clean_subtitle_text(original_zh))
+
                 batch_processed.append(
                     apply_display_timing(
                         {
@@ -1721,6 +1910,7 @@ def main() -> None:
         zh_ass = out_dir / f"{movie_name}.zh.ass"
         bi_ass = out_dir / f"{movie_name}.bilingual.ass"
 
+        print("Generating bilingual subtitles...")
         generate_ass(processed_segments, en_ass, "en")
         generate_ass(processed_segments, zh_ass, "zh")
         generate_ass(processed_segments, bi_ass, "bilingual")

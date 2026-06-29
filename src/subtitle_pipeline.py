@@ -1376,6 +1376,7 @@ def main() -> int:
 
     pairs = pair_events(en_events, zh_events)
     ass_path = base_dir / f"{safe_stem(video)}.bilingual.ass"
+    log("Generating bilingual subtitles...")
     write_bilingual_ass(pairs, ass_path)
     matched = sum(1 for en, zh in pairs if en and zh and zh.text.strip())
     zh_total = sum(1 for _, zh in pairs if zh and zh.text.strip())
