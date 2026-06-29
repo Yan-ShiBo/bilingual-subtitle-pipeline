@@ -768,6 +768,7 @@ def html_page() -> str:
     <label>SSH 端口</label><input id="remotePort" type="number" value="22" style="margin-bottom:12px">
     <label>用户名</label><input id="remoteUser" value="root" style="margin-bottom:12px">
     <label>密码</label><input id="remotePass" type="password" style="margin-bottom:12px">
+    <label style="display:flex;align-items:center;gap:8px;margin-bottom:12px"><input id="remoteRememberPassword" type="checkbox">保存密码到本机浏览器</label>
     <div id="remoteError" style="color:#b42318; font-size:13px; margin-bottom:8px;"></div>
     <div class="actions">
       <button class="secondary" onclick="closeRemoteModal()">取消</button>
@@ -1261,6 +1262,10 @@ function openRemoteModal() {
   if (conf.port) document.getElementById('remotePort').value = conf.port;
   if (conf.user) document.getElementById('remoteUser').value = conf.user;
   if (conf.name) document.getElementById('remoteName').value = conf.name;
+  if (conf.password) {
+    document.getElementById('remotePass').value = conf.password;
+    document.getElementById('remoteRememberPassword').checked = true;
+  }
 }
 
 function closeRemoteModal() {
@@ -1289,8 +1294,13 @@ async function connectRemoteServer() {
     });
     const data = await res.json();
     if (res.ok && data.status === 'connected') {
+      const rememberPassword = document.getElementById('remoteRememberPassword').checked;
       localStorage.setItem(REMOTE_STORAGE_KEY, JSON.stringify({
-        host: payload.host, port: payload.port, user: payload.user, name: payload.name
+        host: payload.host,
+        port: payload.port,
+        user: payload.user,
+        name: payload.name,
+        password: rememberPassword ? payload.password : ''
       }));
       updateLlmModels(data.models, payload.name);
       closeRemoteModal();

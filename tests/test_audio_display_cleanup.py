@@ -15,6 +15,7 @@ from audio_to_subtitle import (  # noqa: E402
     checkpoint_matches_segments,
     extend_display_over_hidden_segments,
     generate_ass,
+    proofread_existing_chinese_segments,
     translate_and_correct_segments,
 )
 
@@ -180,6 +181,114 @@ class DisplayCleanupTests(unittest.TestCase):
                 audio_to_subtitle.main()
 
             self.assertTrue((out_dir / "Episode.bilingual.ass").exists())
+
+    def test_main_uses_chinese_sidecar_without_translation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video = root / "movie.mp4"
+            video.write_bytes(b"placeholder")
+            en_srt = root / "movie.en.srt"
+            zh_srt = root / "movie.zh.srt"
+            en_srt.write_text(
+                "1\n00:00:01,000 --> 00:00:02,000\nHelo world\n\n",
+                encoding="utf-8",
+            )
+            zh_srt.write_text(
+                "1\n00:00:01,000 --> 00:00:02,000\n\u7e41\u9ad4\u5b57\u5e55\n\n",
+                encoding="utf-8",
+            )
+            output_root = root / "out"
+            out_dir = output_root / "Series" / "Episode"
+
+            def proofread(segments, **_):
+                return [
+                    {
+                        **segments[0],
+                        "text": "Hello world",
+                        "en": "Hello world",
+                        "zh": "\u7e41\u4f53\u5b57\u5e55",
+                        "display": True,
+                    }
+                ]
+
+            argv = [
+                "audio_to_subtitle.py",
+                "--video",
+                str(video),
+                "--source",
+                "auto",
+                "--output-root",
+                str(output_root),
+                "--series-name",
+                "Series",
+                "--movie-name",
+                "Episode",
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(audio_to_subtitle, "extract_audio", side_effect=AssertionError("extract_audio called")),
+                patch.object(audio_to_subtitle, "transcribe_audio", side_effect=AssertionError("transcribe_audio called")),
+                patch.object(audio_to_subtitle, "translate_and_correct_segments", side_effect=AssertionError("translate called")),
+                patch.object(audio_to_subtitle, "proofread_existing_chinese_segments", side_effect=proofread),
+            ):
+                audio_to_subtitle.main()
+
+            body = (out_dir / "Episode.bilingual.ass").read_text(encoding="utf-8")
+            source_cache = json.loads((out_dir / "Episode.segments.source.json").read_text(encoding="utf-8"))
+            self.assertIn("Hello world", body)
+            self.assertIn("\u7e41\u4f53\u5b57\u5e55", body)
+            self.assertEqual(source_cache[0]["zh"], "\u7e41\u4f53\u5b57\u5e55")
+
+    def test_existing_chinese_proofreading_corrects_english_and_hides_duplicates(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 1.0,
+                "end": 2.0,
+                "text": "Helo world",
+                "en": "Helo world",
+                "zh": "\u4f60\u597d\u4e16\u754c",
+            },
+            {
+                "id": 1,
+                "start": 2.0,
+                "end": 3.0,
+                "text": "Helo world",
+                "en": "Helo world",
+                "zh": "\u4f60\u597d\u4e16\u754c",
+            },
+        ]
+        llm_response = """
+        [
+          {
+            "index": 0,
+            "corrected_english": "Hello world",
+            "corrected_chinese": "\u4f60\u597d\u4e16\u754c",
+            "display": true,
+            "display_start": 1.0,
+            "display_end": 3.0
+          },
+          {
+            "index": 1,
+            "corrected_english": "",
+            "corrected_chinese": "",
+            "display": false
+          }
+        ]
+        """
+
+        with patch.object(audio_to_subtitle, "call_llm", return_value=llm_response):
+            output = proofread_existing_chinese_segments(
+                source,
+                llm_model="qwen3:30b",
+                batch_size=2,
+                context_lines=0,
+            )
+
+        self.assertEqual(output[0]["en"], "Hello world")
+        self.assertEqual(output[0]["zh"], "\u4f60\u597d\u4e16\u754c")
+        self.assertEqual(output[0]["display_end"], 3.0)
+        self.assertFalse(output[1]["display"])
 
 
 if __name__ == "__main__":

@@ -40,16 +40,21 @@ def load_cached_source_segments(path: Path) -> List[Segment]:
     for index, item in enumerate(raw):
         if not isinstance(item, dict):
             raise ValueError(f"cached source segment {index} is not an object")
-        if "start" not in item or "end" not in item or "text" not in item:
-            raise ValueError(f"cached source segment {index} is missing start/end/text")
+        if "start" not in item or "end" not in item or not any(key in item for key in ("text", "en", "zh")):
+            raise ValueError(f"cached source segment {index} is missing start/end/text/en/zh")
         start = float(item["start"])
         end = float(item["end"])
-        text = clean_subtitle_text(str(item.get("text") or ""))
+        text = clean_subtitle_text(str(item.get("text") or item.get("en") or item.get("zh") or ""))
         if end <= start:
             raise ValueError(f"cached source segment {index} has invalid timing")
         if not text:
             continue
-        segments.append({**item, "id": len(segments), "start": start, "end": end, "text": text})
+        normalized = {**item, "id": len(segments), "start": start, "end": end, "text": text}
+        if normalized.get("en") is not None:
+            normalized["en"] = clean_subtitle_text(str(normalized["en"]))
+        if normalized.get("zh") is not None:
+            normalized["zh"] = to_simplified_text(clean_subtitle_text(str(normalized["zh"])))
+        segments.append(normalized)
 
     if not segments:
         raise ValueError("cached source segments are empty")
@@ -276,6 +281,82 @@ def clean_subtitle_text(text: str) -> str:
     return normalize_space(text)
 
 
+CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+
+
+def contains_cjk(text: str) -> bool:
+    return bool(CJK_RE.search(text or ""))
+
+
+def classify_subtitle_text(text: str) -> str:
+    sample = text[:20_000]
+    cjk_count = len(CJK_RE.findall(sample))
+    latin_words = len(re.findall(r"\b[A-Za-z]{2,}\b", sample))
+    if cjk_count >= 5:
+        return "zh"
+    if latin_words >= 5:
+        return "en"
+    return ""
+
+
+def classify_subtitle_path(path: Path) -> str:
+    label = path.stem.lower()
+    zh_tokens = {
+        "zh",
+        "zho",
+        "chi",
+        "chs",
+        "cht",
+        "cmn",
+        "cn",
+        "sc",
+        "tc",
+        "zh-cn",
+        "zh-hans",
+        "zh-tw",
+        "zh-hant",
+        "chinese",
+        "简",
+        "简体",
+        "繁",
+        "繁体",
+        "中文",
+    }
+    en_tokens = {"en", "eng", "english", "英文"}
+    parts = set(re.split(r"[^0-9a-zA-Z\u4e00-\u9fff]+", label))
+    if parts & zh_tokens:
+        return "zh"
+    if parts & en_tokens:
+        return "en"
+    try:
+        return classify_subtitle_text(read_text_with_fallback(path))
+    except Exception:
+        return ""
+
+
+def to_simplified_text(text: str) -> str:
+    if not contains_cjk(text):
+        return text
+    try:
+        from opencc import OpenCC
+    except Exception:
+        return text
+    if not hasattr(to_simplified_text, "_converter"):
+        setattr(to_simplified_text, "_converter", OpenCC("t2s"))
+    return getattr(to_simplified_text, "_converter").convert(text)
+
+
+def to_simplified_segments(segments: List[Segment]) -> List[Segment]:
+    output: List[Segment] = []
+    for segment in segments:
+        item = dict(segment)
+        if item.get("zh"):
+            item["zh"] = to_simplified_text(str(item["zh"]))
+        item["text"] = to_simplified_text(str(item.get("text", "")))
+        output.append(item)
+    return output
+
+
 def read_text_with_fallback(path: Path) -> str:
     raw = path.read_bytes()
     for encoding in ("utf-8-sig", "utf-8", "gb18030", "latin-1"):
@@ -457,6 +538,247 @@ def find_sidecar_subtitles(video_path: Path, selected_path: Optional[Path] = Non
 def find_sidecar_subtitle(video_path: Path, selected_path: Optional[Path] = None) -> Optional[Path]:
     subtitles = find_sidecar_subtitles(video_path, selected_path)
     return subtitles[0] if subtitles else None
+
+
+def sidecar_candidates(
+    video_path: Path,
+    selected_path: Optional[Path],
+    explicit_path: Optional[Path] = None,
+) -> List[Path]:
+    candidates: List[Path] = []
+    if explicit_path:
+        candidates.append(explicit_path)
+    candidates.extend(find_sidecar_subtitles(video_path, selected_path))
+
+    unique: List[Path] = []
+    seen = set()
+    for candidate in candidates:
+        try:
+            key = candidate.resolve()
+        except OSError:
+            key = candidate
+        if key in seen or not candidate.exists():
+            continue
+        seen.add(key)
+        unique.append(candidate)
+    return unique
+
+
+def segments_to_events(segments: List[Segment], key: str = "text") -> List[Any]:
+    from subtitle_pipeline import SubtitleEvent
+
+    events = []
+    for segment in segments:
+        text = clean_subtitle_text(str(segment.get(key) or segment.get("text") or ""))
+        if not text:
+            continue
+        start = float(segment["start"])
+        end = float(segment["end"])
+        if end <= start:
+            continue
+        events.append(SubtitleEvent(start, end, text))
+    return events
+
+
+def merge_existing_subtitle_segments(
+    en_segments: Optional[List[Segment]],
+    zh_segments: List[Segment],
+    source_label: str,
+) -> List[Segment]:
+    from subtitle_pipeline import pair_events
+
+    zh_events = segments_to_events(to_simplified_segments(zh_segments))
+    en_events = segments_to_events(en_segments or [])
+    if not zh_events:
+        return []
+
+    pairs = pair_events(en_events, zh_events) if en_events else [(None, zh) for zh in zh_events]
+    merged: List[Segment] = []
+    for en_event, zh_event in pairs:
+        if not en_event and not zh_event:
+            continue
+        start = min(event.start for event in (en_event, zh_event) if event is not None)
+        end = max(event.end for event in (en_event, zh_event) if event is not None)
+        en_text = clean_subtitle_text(en_event.text) if en_event else ""
+        zh_text = to_simplified_text(clean_subtitle_text(zh_event.text)) if zh_event else ""
+        text = en_text or zh_text
+        if not text and not zh_text:
+            continue
+        merged.append(
+            {
+                "id": len(merged),
+                "start": start,
+                "end": end,
+                "text": text,
+                "en": en_text,
+                "zh": zh_text,
+                "source_language": source_label,
+                "display": True,
+            }
+        )
+    return merged
+
+
+def find_existing_sidecar_subtitle_segments(
+    video_path: Path,
+    selected_path: Optional[Path],
+    explicit_path: Optional[Path] = None,
+) -> Optional[List[Segment]]:
+    candidates = sidecar_candidates(video_path, selected_path, explicit_path)
+    if not candidates:
+        return None
+
+    zh_path: Optional[Path] = None
+    en_path: Optional[Path] = None
+    for candidate in candidates:
+        language = classify_subtitle_path(candidate)
+        if language == "zh" and zh_path is None:
+            zh_path = candidate
+        elif language == "en" and en_path is None:
+            en_path = candidate
+
+    if zh_path is None:
+        return None
+
+    print(f"Using existing Chinese sidecar subtitle: {zh_path}")
+    zh_segments = parse_subtitle_file(zh_path)
+    en_segments: Optional[List[Segment]] = None
+    if en_path and en_path != zh_path:
+        print(f"Merging existing English sidecar subtitle: {en_path}")
+        en_segments = parse_subtitle_file(en_path)
+
+    merged = merge_existing_subtitle_segments(en_segments, zh_segments, "existing Chinese sidecar subtitle")
+    return merged or None
+
+
+def is_english_subtitle_stream(stream: Any) -> bool:
+    label = f"{stream.lang} {stream.title}".lower()
+    return stream.lang in {"eng", "en"} or "english" in label
+
+
+def choose_best_chinese_stream(streams: List[Any]) -> Tuple[Optional[Any], Optional[str]]:
+    from subtitle_pipeline import classify_chinese, stream_score
+
+    ranked = []
+    for stream in streams:
+        zh_kind = classify_chinese(stream)
+        if not zh_kind:
+            continue
+        if zh_kind == "zh-Hans":
+            rank = 40
+        elif zh_kind == "zh-Hant":
+            rank = 30
+        elif zh_kind == "zh":
+            rank = 20
+        else:
+            rank = 10
+        ranked.append((rank, stream_score(stream), zh_kind, stream))
+    if not ranked:
+        return None, None
+    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    _, _, zh_kind, stream = ranked[0]
+    return stream, zh_kind
+
+
+def choose_best_english_stream(streams: List[Any]) -> Optional[Any]:
+    from subtitle_pipeline import stream_score
+
+    english = [stream for stream in streams if is_english_subtitle_stream(stream)]
+    if not english:
+        return None
+    english.sort(key=stream_score, reverse=True)
+    return english[0]
+
+
+def find_existing_embedded_subtitle_segments(
+    video_path: Path,
+    out_dir: Path,
+    args: argparse.Namespace,
+) -> Optional[List[Segment]]:
+    from subtitle_pipeline import classify_chinese, find_ffmpeg, get_stream_events, probe_streams
+
+    ffmpeg = find_ffmpeg(None)
+    streams = [stream for stream in probe_streams(video_path, ffmpeg) if stream.is_subtitle]
+    if not streams:
+        return None
+
+    selected = None
+    if args.subtitle_stream is not None:
+        matches = [stream for stream in streams if stream.index == args.subtitle_stream]
+        if not matches:
+            return None
+        selected = matches[0]
+
+    zh_stream, zh_kind = choose_best_chinese_stream(streams)
+    en_stream = choose_best_english_stream(streams)
+    if selected is not None:
+        selected_zh_kind = classify_chinese(selected)
+        if selected_zh_kind:
+            zh_stream, zh_kind = selected, selected_zh_kind
+        elif is_english_subtitle_stream(selected):
+            en_stream = selected
+
+    if zh_stream is None or zh_kind is None:
+        return None
+
+    ocr_lang = args.subtitle_ocr_lang
+    if not ocr_lang or ocr_lang == "auto":
+        ocr_lang = choose_ocr_lang("zh-hant" if zh_kind in {"zh-Hant", "zh-yue"} else "zh-hans")
+
+    print(
+        "Using existing Chinese embedded subtitle stream "
+        f"0:{zh_stream.index} {zh_stream.lang or '-'} {zh_stream.codec} {zh_stream.title}"
+    )
+    zh_events = get_stream_events(
+        video_path,
+        zh_stream,
+        ffmpeg,
+        out_dir / "embedded" / f"stream_{zh_stream.index:02d}",
+        ocr_lang,
+        args,
+    )
+    zh_segments = [
+        {
+            "id": idx,
+            "start": event.start,
+            "end": event.end,
+            "text": event.text,
+            "source_language": "existing Chinese embedded subtitle",
+        }
+        for idx, event in enumerate(zh_events)
+        if event.text.strip()
+    ]
+    if not zh_segments:
+        return None
+
+    en_segments: Optional[List[Segment]] = None
+    if en_stream and en_stream.index != zh_stream.index:
+        print(
+            "Merging existing English embedded subtitle stream "
+            f"0:{en_stream.index} {en_stream.lang or '-'} {en_stream.codec} {en_stream.title}"
+        )
+        en_events = get_stream_events(
+            video_path,
+            en_stream,
+            ffmpeg,
+            out_dir / "embedded" / f"stream_{en_stream.index:02d}",
+            "en",
+            args,
+        )
+        en_segments = [
+            {
+                "id": idx,
+                "start": event.start,
+                "end": event.end,
+                "text": event.text,
+                "source_language": "existing English embedded subtitle",
+            }
+            for idx, event in enumerate(en_events)
+            if event.text.strip()
+        ]
+
+    merged = merge_existing_subtitle_segments(en_segments, zh_segments, "existing Chinese embedded subtitle")
+    return merged or None
 
 
 def choose_ocr_lang(language: str) -> str:
@@ -685,6 +1007,24 @@ def format_prompt_segment(index: int, segment: Segment) -> str:
     return f"[{index}] {float(segment['start']):.2f}->{float(segment['end']):.2f} {segment['text']}"
 
 
+def format_bilingual_prompt_segment(index: int, segment: Segment) -> str:
+    text = str(segment.get("text", ""))
+    en_text = clean_subtitle_text(str(segment.get("en") or ("" if contains_cjk(text) else text)))
+    zh_text = to_simplified_text(clean_subtitle_text(str(segment.get("zh") or (text if contains_cjk(text) else ""))))
+    return (
+        f"[{index}] {float(segment['start']):.2f}->{float(segment['end']):.2f} "
+        f"EN: {en_text or '-'} | ZH: {zh_text or '-'}"
+    )
+
+
+def build_bilingual_context_text(segments: List[Segment], start: int, end: int, context_lines: int) -> Tuple[str, str]:
+    before_start = max(0, start - context_lines)
+    after_end = min(len(segments), end + context_lines)
+    before = "\n".join(format_bilingual_prompt_segment(index, segments[index]) for index in range(before_start, start))
+    after = "\n".join(format_bilingual_prompt_segment(index, segments[index]) for index in range(end, after_end))
+    return before, after
+
+
 def parse_display_flag(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -900,6 +1240,165 @@ Rules:
     return processed_segments
 
 
+def original_en_zh(segment: Segment) -> Tuple[str, str]:
+    text = clean_subtitle_text(str(segment.get("text", "")))
+    en_text = clean_subtitle_text(str(segment.get("en") or ("" if contains_cjk(text) else text)))
+    zh_text = to_simplified_text(clean_subtitle_text(str(segment.get("zh") or (text if contains_cjk(text) else ""))))
+    return en_text, zh_text
+
+
+def proofread_existing_chinese_segments(
+    segments: List[Segment],
+    llm_model: str,
+    batch_size: int,
+    context_lines: int,
+    checkpoint_path: Optional[Path] = None,
+) -> List[Segment]:
+    print("Starting LLM proofreading for existing Chinese subtitles; translation is skipped.")
+    system_prompt = (
+        "You are a professional bilingual subtitle proofreader. "
+        "Fix English and Chinese OCR/subtitle recognition errors, repeated lines, and duplicate loops. "
+        "Do not translate when Chinese subtitles are already provided."
+    )
+
+    processed_segments: List[Segment] = []
+    if checkpoint_path and checkpoint_path.exists():
+        try:
+            cached = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            if isinstance(cached, list) and len(cached) <= len(segments) and checkpoint_matches_segments(cached, segments):
+                processed_segments = to_simplified_segments(cached)
+                print(f"Resuming from checkpoint with {len(processed_segments)} completed segments.")
+            else:
+                print("Ignoring checkpoint because it does not match the current subtitle segmentation.")
+        except Exception as exc:
+            print(f"Ignoring unreadable checkpoint {checkpoint_path}: {exc}")
+
+    start_index = len(processed_segments)
+    start_index -= start_index % batch_size
+    processed_segments = processed_segments[:start_index]
+
+    for i in range(start_index, len(segments), batch_size):
+        batch = segments[i : i + batch_size]
+        print(f"Proofreading segments {i + 1} to {i + len(batch)} of {len(segments)}...")
+
+        before_text, after_text = build_bilingual_context_text(segments, i, i + len(batch), context_lines)
+        batch_text = "\n".join(format_bilingual_prompt_segment(j, segment) for j, segment in enumerate(batch))
+        context_start_index = max(0, i - context_lines)
+        context_end_index = min(len(segments), i + len(batch) + context_lines)
+        context_start = float(segments[context_start_index]["start"])
+        context_end = float(segments[context_end_index - 1]["end"])
+
+        prompt = f"""
+You will proofread only the TARGET LINE(S).
+
+The subtitles already contain Chinese. Do not perform a new translation pass.
+Proofread existing English and Chinese text. English may also be OCR output and may contain recognition errors.
+
+=== PREVIOUS CONTEXT, REFERENCE ONLY ===
+{before_text}
+
+=== TARGET LINE(S) TO OUTPUT ===
+{batch_text}
+
+=== FOLLOWING CONTEXT, REFERENCE ONLY ===
+{after_text}
+
+Return a raw JSON list with exactly {len(batch)} objects.
+Each object must correspond to one TARGET line and keep the same local index.
+Schema:
+[
+  {{
+    "index": 0,
+    "corrected_english": "...",
+    "corrected_chinese": "...",
+    "display": true,
+    "display_start": 12.34,
+    "display_end": 15.67
+  }}
+]
+
+Rules:
+- One input line must still produce one output object for checkpointing.
+- Correct obvious English and Chinese OCR/subtitle recognition errors.
+- Convert Traditional Chinese to natural Simplified Chinese.
+- Do not invent missing content. If a Chinese line is already good, keep it.
+- Keep corrected_english in natural English when an English source exists.
+- If adjacent TARGET lines are repeated, overlapping, or fragments of the same subtitle, keep the best complete subtitle on one object and set redundant objects to "display": false.
+- For the kept object, set display_start/display_end to cover the full subtitle span when it is clear from TARGET or nearby context.
+- display_start/display_end must be seconds and must stay within this context window: {context_start:.2f} to {context_end:.2f}.
+- Keep corrected_english empty only when no English source exists.
+- Do not output previous or following context lines.
+- Do not add explanations, markdown, notes, or extra keys.
+"""
+
+        try:
+            data = parse_json_response(call_llm(prompt, system_prompt, llm_model))
+            if not isinstance(data, list):
+                raise ValueError("LLM did not return a JSON list")
+
+            lookup: Dict[int, Dict[str, Any]] = {}
+            for item in data:
+                if isinstance(item, dict) and "index" in item:
+                    try:
+                        lookup[int(item["index"])] = item
+                    except (TypeError, ValueError):
+                        pass
+
+            batch_processed: List[Segment] = []
+            for j, segment in enumerate(batch):
+                item = lookup.get(j, {})
+                original_en, original_zh = original_en_zh(segment)
+                corrected_en = clean_subtitle_text(
+                    str(item.get("corrected_english") or item.get("en") or original_en)
+                )
+                corrected_zh = to_simplified_text(
+                    clean_subtitle_text(
+                        str(
+                            item.get("corrected_chinese")
+                            or item.get("chinese")
+                            or item.get("zh")
+                            or original_zh
+                        )
+                    )
+                )
+                batch_processed.append(
+                    apply_display_timing(
+                        {
+                            **segment,
+                            "text": corrected_en or corrected_zh,
+                            "en": corrected_en,
+                            "zh": corrected_zh,
+                        },
+                        item,
+                        context_start,
+                        context_end,
+                    )
+                )
+        except Exception as exc:
+            print(f"Warning: failed to proofread batch via LLM ({exc}). Falling back to existing subtitles.")
+            batch_processed = []
+            for segment in batch:
+                original_en, original_zh = original_en_zh(segment)
+                batch_processed.append(
+                    {
+                        **segment,
+                        "text": original_en or original_zh,
+                        "en": original_en,
+                        "zh": original_zh,
+                        "display": True,
+                    }
+                )
+
+        validate_timing_preserved(batch, batch_processed, i)
+        processed_segments.extend(batch_processed)
+        extend_display_over_hidden_segments(processed_segments)
+
+        if checkpoint_path:
+            write_json_atomic(checkpoint_path, processed_segments)
+
+    return processed_segments
+
+
 def checkpoint_matches_segments(cached: List[Segment], segments: List[Segment]) -> bool:
     for index, cached_segment in enumerate(cached):
         current = segments[index]
@@ -1013,6 +1512,18 @@ def default_output_root() -> Path:
     return Path(__file__).resolve().parents[2] / ("1 " + "\u5b57\u5e55")
 
 
+def segments_have_chinese(segments: List[Segment]) -> bool:
+    zh_text = " ".join(str(segment.get("zh") or "") for segment in segments)
+    if len(CJK_RE.findall(zh_text)) >= 3:
+        return True
+    text_without_english = []
+    for segment in segments:
+        if segment.get("en"):
+            continue
+        text_without_english.append(str(segment.get("text") or ""))
+    return len(CJK_RE.findall(" ".join(text_without_english))) >= 3
+
+
 def main() -> None:
     configure_output_encoding()
     parser = argparse.ArgumentParser(description="Transcribe, import, OCR, correct, and translate subtitles to ASS.")
@@ -1078,62 +1589,98 @@ def main() -> None:
                 print(f"Ignoring unreadable source cache {source_segments_path}: {exc}")
 
         if subtitle_segments is None:
-            if args.source in ("auto", "sidecar", "srt") and sidecar_path and sidecar_path.exists():
-                actual_source = "sidecar"
-                source_segments = parse_subtitle_file(sidecar_path)
-                if source_language == "auto":
-                    source_language = "subtitle"
-            elif args.source in ("sidecar", "srt"):
-                raise FileNotFoundError("Sidecar subtitle source requested, but no subtitle file was found.")
-            elif args.source in ("auto", "embedded"):
+            existing_segments: Optional[List[Segment]] = None
+            if args.source in ("auto", "sidecar", "srt"):
+                existing_segments = find_existing_sidecar_subtitle_segments(
+                    video_path,
+                    input_path,
+                    explicit_path=sidecar_path if (args.subtitle_file or args.srt) else None,
+                )
+                if existing_segments:
+                    actual_source = "existing Chinese sidecar subtitles"
+                    source_language = "existing Chinese subtitle"
+
+            if existing_segments is None and args.source in ("auto", "embedded"):
                 try:
-                    actual_source = "embedded"
-                    source_segments = load_embedded_subtitle_events(
-                        video_path,
-                        stream_index=args.subtitle_stream,
-                        source_language=args.source_language,
-                        out_dir=out_dir,
-                        args=args,
-                    )
-                    if source_language == "auto":
-                        source_language = source_segments[0].get("source_language") or "embedded subtitle"
+                    existing_segments = find_existing_embedded_subtitle_segments(video_path, out_dir, args)
+                    if existing_segments:
+                        actual_source = "existing Chinese embedded subtitles"
+                        source_language = "existing Chinese subtitle"
                 except Exception as exc:
                     if args.source == "embedded":
-                        print(f"Failed to load embedded subtitles: {exc}", file=sys.stderr)
+                        print(f"Failed to load embedded Chinese subtitles: {exc}", file=sys.stderr)
                         raise
-                    print(f"No embedded subtitles available ({exc}). Falling back to audio extraction...")
+                    print(f"No existing Chinese embedded subtitles available ({exc}).")
+
+            if existing_segments:
+                subtitle_segments = existing_segments
+                print("Existing Chinese subtitles detected; translation will be skipped after bilingual proofreading.")
+            else:
+                if args.source in ("auto", "sidecar", "srt") and sidecar_path and sidecar_path.exists():
+                    actual_source = "sidecar"
+                    source_segments = parse_subtitle_file(sidecar_path)
+                    if source_language == "auto":
+                        source_language = "subtitle"
+                elif args.source in ("sidecar", "srt"):
+                    raise FileNotFoundError("Sidecar subtitle source requested, but no subtitle file was found.")
+                elif args.source in ("auto", "embedded"):
+                    try:
+                        actual_source = "embedded"
+                        source_segments = load_embedded_subtitle_events(
+                            video_path,
+                            stream_index=args.subtitle_stream,
+                            source_language=args.source_language,
+                            out_dir=out_dir,
+                            args=args,
+                        )
+                        if source_language == "auto":
+                            source_language = source_segments[0].get("source_language") or "embedded subtitle"
+                    except Exception as exc:
+                        if args.source == "embedded":
+                            print(f"Failed to load embedded subtitles: {exc}", file=sys.stderr)
+                            raise
+                        print(f"No embedded subtitles available ({exc}). Falling back to audio extraction...")
+                        actual_source = "audio"
+                        extract_audio(video_path, temp_audio, audio_stream=args.audio_stream)
+                        source_segments = transcribe_audio(temp_audio, language=args.asr_language)
+                        if source_language == "auto":
+                            source_language = args.asr_language
+                else:
                     actual_source = "audio"
                     extract_audio(video_path, temp_audio, audio_stream=args.audio_stream)
                     source_segments = transcribe_audio(temp_audio, language=args.asr_language)
                     if source_language == "auto":
                         source_language = args.asr_language
-            else:
-                actual_source = "audio"
-                extract_audio(video_path, temp_audio, audio_stream=args.audio_stream)
-                source_segments = transcribe_audio(temp_audio, language=args.asr_language)
-                if source_language == "auto":
-                    source_language = args.asr_language
 
-            subtitle_segments = split_segments_for_subtitles(
-                source_segments,
-                max_words=args.max_words,
-                max_chars=args.max_chars,
-                max_duration=args.max_duration,
-            )
-            subtitle_segments = apply_timing_sanity_rules(subtitle_segments, max_duration=args.max_duration)
+                subtitle_segments = split_segments_for_subtitles(
+                    source_segments,
+                    max_words=args.max_words,
+                    max_chars=args.max_chars,
+                    max_duration=args.max_duration,
+                )
+                subtitle_segments = apply_timing_sanity_rules(subtitle_segments, max_duration=args.max_duration)
             write_json_atomic(source_segments_path, subtitle_segments)
 
         print(f"Actual subtitle source: {actual_source}")
         print_timing_report(subtitle_segments)
 
-        processed_segments = translate_and_correct_segments(
-            subtitle_segments,
-            llm_model=args.llm_model,
-            batch_size=args.batch_size,
-            context_lines=args.context_lines,
-            source_language=source_language,
-            checkpoint_path=checkpoint_path,
-        )
+        if segments_have_chinese(subtitle_segments):
+            processed_segments = proofread_existing_chinese_segments(
+                subtitle_segments,
+                llm_model=args.llm_model,
+                batch_size=args.batch_size,
+                context_lines=args.context_lines,
+                checkpoint_path=checkpoint_path,
+            )
+        else:
+            processed_segments = translate_and_correct_segments(
+                subtitle_segments,
+                llm_model=args.llm_model,
+                batch_size=args.batch_size,
+                context_lines=args.context_lines,
+                source_language=source_language,
+                checkpoint_path=checkpoint_path,
+            )
 
         en_ass = out_dir / f"{movie_name}.en.ass"
         zh_ass = out_dir / f"{movie_name}.zh.ass"
