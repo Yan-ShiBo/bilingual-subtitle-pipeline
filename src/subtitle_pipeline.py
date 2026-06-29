@@ -1229,6 +1229,7 @@ Rules:
 - Do not add explanations, markdown, notes, or extra keys.
 - Correct obvious OCR/ASR errors in English before translating.
 - Translate into natural Simplified Chinese.
+- You MUST translate uppercase descriptive text in parentheses or brackets (e.g. "(SIGHS)" or "[MUSIC]") into Simplified Chinese.
 """
         payload = {
             "model": model,
@@ -1238,10 +1239,25 @@ Rules:
             "keep_alive": -1,
             "options": {"temperature": 0.1},
         }
-        response = session.post(f"{base_url.rstrip('/')}/api/chat", json=payload, timeout=600)
-        response.raise_for_status()
-        data = response.json()
-        text = data.get("message", {}).get("content", "")
+        
+        data = None
+        for attempt in range(3):
+            try:
+                response = session.post(f"{base_url.rstrip('/')}/api/chat", json=payload, timeout=600)
+                response.raise_for_status()
+                data = response.json()
+                break
+            except Exception as exc:
+                print(f"LLM request failed (attempt {attempt+1}/3): {exc}")
+                if attempt < 2:
+                    import time
+                    time.sleep(2)
+                else:
+                    print("网络或大模型服务异常，连续重试失败，已中断翻译。再次运行可从断点继续。")
+                    import sys
+                    sys.exit(1)
+                    
+        text = data.get("message", {}).get("content", "") if data else ""
         items = parse_json_list_response(text)
         lookup = {}
         for item in items:

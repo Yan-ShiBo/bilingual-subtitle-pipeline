@@ -51,7 +51,7 @@ def load_cached_source_segments(path: Path) -> List[Segment]:
             continue
         normalized = {**item, "id": len(segments), "start": start, "end": end, "text": text}
         if normalized.get("en") is not None:
-            normalized["en"] = clean_subtitle_text(str(normalized["en"]))
+            normalized["en"] = clean_english_track_text(str(normalized["en"]))
         if normalized.get("zh") is not None:
             normalized["zh"] = to_simplified_text(clean_subtitle_text(str(normalized["zh"])))
         segments.append(normalized)
@@ -287,6 +287,11 @@ CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 
 def contains_cjk(text: str) -> bool:
     return bool(CJK_RE.search(text or ""))
+
+
+def clean_english_track_text(text: str) -> str:
+    text = clean_subtitle_text(text)
+    return "" if contains_cjk(text) else text
 
 
 def classify_subtitle_text(text: str) -> str:
@@ -601,7 +606,7 @@ def merge_existing_subtitle_segments(
             continue
         start = min(event.start for event in (en_event, zh_event) if event is not None)
         end = max(event.end for event in (en_event, zh_event) if event is not None)
-        en_text = clean_subtitle_text(en_event.text) if en_event else ""
+        en_text = clean_english_track_text(en_event.text) if en_event else ""
         zh_text = to_simplified_text(clean_subtitle_text(zh_event.text)) if zh_event else ""
         text = en_text or zh_text
         if not text and not zh_text:
@@ -1024,7 +1029,7 @@ def format_prompt_segment(index: int, segment: Segment) -> str:
 
 def format_bilingual_prompt_segment(index: int, segment: Segment) -> str:
     text = str(segment.get("text", ""))
-    en_text = clean_subtitle_text(str(segment.get("en") or ("" if contains_cjk(text) else text)))
+    en_text = clean_english_track_text(str(segment.get("en") or ("" if contains_cjk(text) else text)))
     zh_text = to_simplified_text(clean_subtitle_text(str(segment.get("zh") or (text if contains_cjk(text) else ""))))
     return (
         f"[{index}] {float(segment['start']):.2f}->{float(segment['end']):.2f} "
@@ -1184,6 +1189,7 @@ Rules:
 - Keep corrected_english in natural English when an English source exists.
 - IMPORTANT: The `corrected_english` field MUST be purely English. If the input `English:` field contains Chinese characters, you MUST translate them into English, or leave the field empty. Do not put Chinese characters in `corrected_english`.
 - If English contains SDH/non-speech cues such as music, applause, laughter, or speaker labels and the Chinese line lacks that information, add only that missing cue in concise Simplified Chinese.
+- You MUST translate uppercase descriptive text in parentheses or brackets (e.g. "(SIGHS)" or "[MUSIC]") into Simplified Chinese.
 - Keep names and recurring terminology consistent across the context. Do not translate a name in one line and leave the same name untranslated in another unless the context clearly requires it.
 - set display_start/display_end to cover the full subtitle span when it is clear from TARGET or nearby context.
 - display_start/display_end must be seconds and must stay within this context window: {context_start:.2f} to {context_end:.2f}.
@@ -1241,8 +1247,8 @@ Rules:
             if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
                 item = data[0]
                 if is_proofread:
-                    orig_en = str(segment.get("en") or segment.get("text", ""))
-                    corrected = str(item.get("corrected_english") or orig_en)
+                    orig_en, _ = original_en_zh(segment)
+                    corrected = clean_english_track_text(str(item.get("corrected_english") or orig_en))
                     translated = str(item.get("corrected_chinese") or item.get("chinese_translation") or "")
                     if is_language_valid(orig_en, corrected, translated):
                         return item
@@ -1343,11 +1349,26 @@ Rules:
 - Correct obvious ASR/OCR/subtitle errors in the source text before translating.
 - Keep corrected_text in the original source language.
 - Translate into natural Simplified Chinese.
+- You MUST translate uppercase descriptive text in parentheses or brackets (e.g. "(SIGHS)" or "[MUSIC]") into Simplified Chinese.
 - Keep personal names and recurring terminology consistent across the context. Do not translate a name in one line and leave the same name untranslated in another unless the context clearly requires it.
 """
 
         try:
-            data = parse_json_response(call_llm(prompt, system_prompt, llm_model))
+            data = None
+            for attempt in range(3):
+                try:
+                    data = parse_json_response(call_llm(prompt, system_prompt, llm_model))
+                    break
+                except Exception as exc:
+                    print(f"LLM request failed (attempt {attempt+1}/3): {exc}")
+                    if attempt < 2:
+                        import time
+                        time.sleep(2)
+                    else:
+                        print("网络或大模型服务异常，连续重试失败，已中断翻译。再次运行可从断点继续。")
+                        import sys
+                        sys.exit(1)
+                        
             if not isinstance(data, list):
                 raise ValueError("LLM did not return a JSON list")
 
@@ -1427,7 +1448,7 @@ Rules:
 
 def original_en_zh(segment: Segment) -> Tuple[str, str]:
     text = clean_subtitle_text(str(segment.get("text", "")))
-    en_text = clean_subtitle_text(str(segment.get("en") or ("" if contains_cjk(text) else text)))
+    en_text = clean_english_track_text(str(segment.get("en") or ("" if contains_cjk(text) else text)))
     zh_text = to_simplified_text(clean_subtitle_text(str(segment.get("zh") or (text if contains_cjk(text) else ""))))
     return en_text, zh_text
 
@@ -1512,6 +1533,7 @@ Rules:
 - Keep corrected_english in natural English when an English source exists.
 - IMPORTANT: The `corrected_english` field MUST be purely English. If the input `English:` field contains Chinese characters, you MUST translate them into English, or leave the field empty. Do not put Chinese characters in `corrected_english`.
 - If English contains SDH/non-speech cues such as music, applause, laughter, or speaker labels and the Chinese line lacks that information, add only that missing cue in concise Simplified Chinese.
+- You MUST translate uppercase descriptive text in parentheses or brackets (e.g. "(SIGHS)" or "[MUSIC]") into Simplified Chinese.
 - Keep names and recurring terminology consistent across the context. Do not translate a name in one line and leave the same name untranslated in another unless the context clearly requires it.
 - If adjacent TARGET lines are repeated, overlapping, or fragments of the same subtitle, keep the best complete subtitle on one object and set redundant objects to "display": false.
 - For the kept object, set display_start/display_end to cover the full subtitle span when it is clear from TARGET or nearby context.
@@ -1522,7 +1544,21 @@ Rules:
 """
 
         try:
-            data = parse_json_response(call_llm(prompt, system_prompt, llm_model))
+            data = None
+            for attempt in range(3):
+                try:
+                    data = parse_json_response(call_llm(prompt, system_prompt, llm_model))
+                    break
+                except Exception as exc:
+                    print(f"LLM request failed (attempt {attempt+1}/3): {exc}")
+                    if attempt < 2:
+                        import time
+                        time.sleep(2)
+                    else:
+                        print("网络或大模型服务异常，连续重试失败，已中断翻译。再次运行可从断点继续。")
+                        import sys
+                        sys.exit(1)
+
             if not isinstance(data, list):
                 raise ValueError("LLM did not return a JSON list")
 
@@ -1539,7 +1575,7 @@ Rules:
                 item = lookup.get(j, {})
                 original_en, original_zh = original_en_zh(segment)
                 corrected_en_val = str(item.get("corrected_english") or item.get("en") or original_en)
-                corrected_en = clean_subtitle_text(corrected_en_val)
+                corrected_en = clean_english_track_text(corrected_en_val)
                 corrected_zh_val = str(
                     item.get("corrected_chinese")
                     or item.get("chinese")
@@ -1556,7 +1592,7 @@ Rules:
                     if retry_item:
                         item.update(retry_item)
                         corrected_en_val = str(item.get("corrected_english") or item.get("en") or original_en)
-                        corrected_en = clean_subtitle_text(corrected_en_val)
+                        corrected_en = clean_english_track_text(corrected_en_val)
                         corrected_zh_val = str(
                             item.get("corrected_chinese")
                             or item.get("chinese")
@@ -1566,14 +1602,10 @@ Rules:
                         corrected_zh = to_simplified_text(clean_subtitle_text(corrected_zh_val))
                         
                         if not is_language_valid(original_en, corrected_en, corrected_zh):
-                            corrected_en = clean_subtitle_text(original_en)
-                            if contains_cjk(corrected_en):
-                                corrected_en = ""
+                            corrected_en = clean_english_track_text(original_en)
                             corrected_zh = to_simplified_text(clean_subtitle_text(original_zh))
                     else:
-                        corrected_en = clean_subtitle_text(original_en)
-                        if contains_cjk(corrected_en):
-                            corrected_en = ""
+                        corrected_en = clean_english_track_text(original_en)
                         corrected_zh = to_simplified_text(clean_subtitle_text(original_zh))
 
                 batch_processed.append(
@@ -1589,14 +1621,14 @@ Rules:
                     )
                 )
         except Exception as exc:
-            print(f"Warning: failed to proofread batch via LLM ({exc}). Falling back to existing subtitles.")
+            print(f"Warning: failed to process batch via LLM ({exc}). Falling back to original text.")
             batch_processed = []
             for segment in batch:
                 original_en, original_zh = original_en_zh(segment)
                 batch_processed.append(
                     {
                         **segment,
-                        "en": original_en,
+                        "en": clean_english_track_text(original_en),
                         "zh": original_zh,
                         "display": True,
                     }
@@ -1683,7 +1715,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 continue
             start = seconds_to_ass_time(float(segment.get("display_start", segment["start"])))
             end = seconds_to_ass_time(float(segment.get("display_end", segment["end"])))
-            en_text = escape_ass_text(segment.get("en", segment["text"]))
+            en_text = escape_ass_text(clean_english_track_text(str(segment.get("en", segment["text"]))))
             zh_text = escape_ass_text(segment.get("zh", ""))
             if mode == "en" and not en_text:
                 continue

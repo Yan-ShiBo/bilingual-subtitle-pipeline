@@ -99,7 +99,7 @@ class DisplayCleanupTests(unittest.TestCase):
           {
             "index": 0,
             "corrected_text": "The female orgasm builds to a point of warmth and ecstasy",
-            "chinese_translation": "merged translation",
+            "chinese_translation": "\u5408\u5e76\u540e\u7684\u7ffb\u8bd1",
             "display": true,
             "display_start": 209.03,
             "display_end": 213.0
@@ -131,7 +131,7 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertEqual(output[0]["display_end"], 213.0)
         self.assertFalse(output[1]["display"])
         self.assertFalse(output[2]["display"])
-        self.assertEqual(output[0]["zh"], "merged translation")
+        self.assertEqual(output[0]["zh"], "\u5408\u5e76\u540e\u7684\u7ffb\u8bd1")
 
     def test_main_reuses_source_cache_without_audio_extraction(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -327,6 +327,76 @@ class DisplayCleanupTests(unittest.TestCase):
 
         self.assertEqual(output[0]["zh"], "\u64ad\u653e\u97f3\u4e50")
         self.assertEqual(output[0]["en"], "(MUSIC PLAYING)")
+
+    def test_existing_chinese_proofreading_never_keeps_chinese_in_english_track(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 6.0,
+                "end": 7.0,
+                "text": "\u4fc4\u4ea5\u4fc4\u5dde \u54e5\u4f26\u5e03\u5e02 2045\u5e74",
+                "en": "\u4fc4\u4ea5\u4fc4\u5dde \u54e5\u4f26\u5e03\u5e02 2045\u5e74",
+                "zh": "\u4fc4\u4ea5\u4fc4\u5dde \u54e5\u4f26\u5e03\u5e02 2045\u5e74",
+            }
+        ]
+        llm_response = """
+        [
+          {
+            "index": 0,
+            "corrected_english": "\u4fc4\u4ea5\u4fc4\u5dde \u54e5\u4f26\u5e03\u5e02 2045\u5e74",
+            "corrected_chinese": "\u4fc4\u4ea5\u4fc4\u5dde \u54e5\u4f26\u5e03\u5e02 2045\u5e74",
+            "display": true
+          }
+        ]
+        """
+
+        def call_llm(prompt, *_args, **_kwargs):
+            self.assertIn("EN: - | ZH: \u4fc4\u4ea5\u4fc4\u5dde \u54e5\u4f26\u5e03\u5e02 2045\u5e74", prompt)
+            return llm_response
+
+        with patch.object(audio_to_subtitle, "call_llm", side_effect=call_llm):
+            output = proofread_existing_chinese_segments(
+                source,
+                llm_model="qwen3:30b",
+                batch_size=1,
+                context_lines=0,
+            )
+
+        self.assertEqual(output[0]["en"], "")
+        self.assertEqual(output[0]["zh"], "\u4fc4\u4ea5\u4fc4\u5dde \u54e5\u4f26\u5e03\u5e02 2045\u5e74")
+
+    def test_generate_ass_does_not_write_chinese_in_english_layer(self) -> None:
+        segments = [
+            {
+                "id": 0,
+                "start": 8.0,
+                "end": 9.0,
+                "text": "\u62d6\u8f66\u5c4b\u56ed\u533a",
+                "en": "\u62d6\u8f66\u5c4b\u56ed\u533a",
+                "zh": "\u62d6\u8f66\u5c4b\u56ed\u533a",
+                "display": True,
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bilingual_path = Path(tmpdir) / "out.bilingual.ass"
+            english_path = Path(tmpdir) / "out.en.ass"
+            generate_ass(segments, bilingual_path, "bilingual")
+            generate_ass(segments, english_path, "en")
+            bilingual_body = bilingual_path.read_text(encoding="utf-8")
+            english_body = english_path.read_text(encoding="utf-8")
+
+        self.assertIn("\u62d6\u8f66\u5c4b\u56ed\u533a", bilingual_body)
+        self.assertNotIn("{\\rEnglish}\\N\u62d6\u8f66\u5c4b\u56ed\u533a", bilingual_body)
+        self.assertNotIn("Dialogue:", english_body)
+
+    def test_frontend_preview_does_not_fallback_empty_english_to_source_text(self) -> None:
+        frontend_source = (ROOT / "src" / "subtitle_frontend.py").read_text(encoding="utf-8")
+
+        self.assertIn("function previewEnglishText(item)", frontend_source)
+        self.assertIn("hasCjk(value) ? '' : value", frontend_source)
+        self.assertIn("previewEnglishText(item)", frontend_source)
+        self.assertNotIn("item.en || item.text", frontend_source)
 
 
 if __name__ == "__main__":

@@ -1188,6 +1188,15 @@ function normalizePathForCompare(value) {
   return String(value || '').replace(/\//g, '\\').replace(/\\+$/g, '').toLowerCase();
 }
 
+function hasCjk(value) {
+  return /[\u3400-\u4dbf\u4e00-\u9fff]/.test(String(value || ''));
+}
+
+function previewEnglishText(item) {
+  const value = (item.en === undefined || item.en === null) ? (item.text || '') : item.en;
+  return hasCjk(value) ? '' : value;
+}
+
 function render(data) {
   if (data.sidecar_subtitles) updateSidecarOptions(data.sidecar_subtitles);
   if (data.embedded_subtitles) updateEmbeddedOptions(data.embedded_subtitles);
@@ -1237,7 +1246,7 @@ function render(data) {
 
   const rows = (data.preview || []).map(item => {
     const time = `${item.start ?? ''} -> ${item.end ?? ''}`;
-    return `<tr><td>${escapeHtml(item.id)}</td><td>${escapeHtml(time)}</td><td>${escapeHtml(item.en || item.text || '')}</td><td>${escapeHtml(item.zh || '')}</td></tr>`;
+    return `<tr><td>${escapeHtml(item.id)}</td><td>${escapeHtml(time)}</td><td>${escapeHtml(previewEnglishText(item))}</td><td>${escapeHtml(item.zh || '')}</td></tr>`;
   }).join('');
   document.getElementById('preview').innerHTML = rows || '<tr><td colspan="4" class="muted">暂无 checkpoint 内容</td></tr>';
 }
