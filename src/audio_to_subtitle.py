@@ -1116,12 +1116,12 @@ def extend_display_over_hidden_segments(segments: List[Segment], max_gap: float 
 
 
 def is_language_valid(original_text: str, corrected: str, translated: str) -> bool:
-    orig_has_cjk = contains_cjk(original_text)
-    corr_has_cjk = contains_cjk(corrected)
+    orig_cjk_count = len(CJK_RE.findall(original_text))
+    corr_cjk_count = len(CJK_RE.findall(corrected))
     trans_has_cjk = contains_cjk(translated)
 
-    # 英文不是英文：原始无中文字符，但修正后源文却包含了中文字符
-    if not orig_has_cjk and corr_has_cjk:
+    # 英文不是英文：如果修正后的中文字符数量超过了原始源文中的中文字符数量，说明LLM在擅自翻译或添加中文
+    if corr_cjk_count > orig_cjk_count:
         return False
         
     # 中文不是中文：译文无中文字符，但包含多个字母（说明可能是生硬复制了外文句子或根本没翻译）
@@ -1574,7 +1574,6 @@ Rules:
                     apply_display_timing(
                         {
                             **segment,
-                            "text": corrected_en or corrected_zh,
                             "en": corrected_en,
                             "zh": corrected_zh,
                         },
@@ -1591,7 +1590,6 @@ Rules:
                 batch_processed.append(
                     {
                         **segment,
-                        "text": original_en or original_zh,
                         "en": original_en,
                         "zh": original_zh,
                         "display": True,
