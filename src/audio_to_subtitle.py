@@ -278,7 +278,8 @@ def normalize_space(text: str) -> str:
 def clean_subtitle_text(text: str) -> str:
     text = re.sub(r"\{\\[^}]*\}", "", text)
     text = re.sub(r"</?(i|b|u|font)[^>]*>", "", text, flags=re.I)
-    return normalize_space(text)
+    text = normalize_space(text)
+    return "" if text == "-" else text
 
 
 CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
@@ -1910,7 +1911,7 @@ def main() -> None:
         zh_ass = out_dir / f"{movie_name}.zh.ass"
         bi_ass = out_dir / f"{movie_name}.bilingual.ass"
 
-        print("Generating bilingual subtitles...")
+        print("Generating bilingual subtitles...", flush=True)
         generate_ass(processed_segments, en_ass, "en")
         generate_ass(processed_segments, zh_ass, "zh")
         generate_ass(processed_segments, bi_ass, "bilingual")
