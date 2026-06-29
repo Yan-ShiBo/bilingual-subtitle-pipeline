@@ -1182,11 +1182,12 @@ Rules:
 - If corrected_chinese is already non-empty and complete, preserve its meaning and only proofread it. Do not replace it with a fresh translation.
 - Translate from English into corrected_chinese only when the original Chinese is empty or clearly lacks information present in the English line.
 - Keep corrected_english in natural English when an English source exists.
+- IMPORTANT: The `corrected_english` field MUST be purely English. If the input `English:` field contains Chinese characters, you MUST translate them into English, or leave the field empty. Do not put Chinese characters in `corrected_english`.
 - If English contains SDH/non-speech cues such as music, applause, laughter, or speaker labels and the Chinese line lacks that information, add only that missing cue in concise Simplified Chinese.
 - Keep names and recurring terminology consistent across the context. Do not translate a name in one line and leave the same name untranslated in another unless the context clearly requires it.
 - set display_start/display_end to cover the full subtitle span when it is clear from TARGET or nearby context.
 - display_start/display_end must be seconds and must stay within this context window: {context_start:.2f} to {context_end:.2f}.
-- Keep corrected_english empty only when no English source exists.
+- Keep corrected_english empty only when no English source exists or when the original English text contains no useful translatable English.
 - Do not output previous or following context lines.
 - Do not add explanations, markdown, notes, or extra keys.
 """
@@ -1509,12 +1510,13 @@ Rules:
 - If corrected_chinese is already non-empty and complete, preserve its meaning and only proofread it. Do not replace it with a fresh translation.
 - Translate from English into corrected_chinese only when the original Chinese is empty or clearly lacks information present in the English line.
 - Keep corrected_english in natural English when an English source exists.
+- IMPORTANT: The `corrected_english` field MUST be purely English. If the input `English:` field contains Chinese characters, you MUST translate them into English, or leave the field empty. Do not put Chinese characters in `corrected_english`.
 - If English contains SDH/non-speech cues such as music, applause, laughter, or speaker labels and the Chinese line lacks that information, add only that missing cue in concise Simplified Chinese.
 - Keep names and recurring terminology consistent across the context. Do not translate a name in one line and leave the same name untranslated in another unless the context clearly requires it.
 - If adjacent TARGET lines are repeated, overlapping, or fragments of the same subtitle, keep the best complete subtitle on one object and set redundant objects to "display": false.
 - For the kept object, set display_start/display_end to cover the full subtitle span when it is clear from TARGET or nearby context.
 - display_start/display_end must be seconds and must stay within this context window: {context_start:.2f} to {context_end:.2f}.
-- Keep corrected_english empty only when no English source exists.
+- Keep corrected_english empty only when no English source exists or when the original English text contains no useful translatable English.
 - Do not output previous or following context lines.
 - Do not add explanations, markdown, notes, or extra keys.
 """
@@ -1565,9 +1567,13 @@ Rules:
                         
                         if not is_language_valid(original_en, corrected_en, corrected_zh):
                             corrected_en = clean_subtitle_text(original_en)
+                            if contains_cjk(corrected_en):
+                                corrected_en = ""
                             corrected_zh = to_simplified_text(clean_subtitle_text(original_zh))
                     else:
                         corrected_en = clean_subtitle_text(original_en)
+                        if contains_cjk(corrected_en):
+                            corrected_en = ""
                         corrected_zh = to_simplified_text(clean_subtitle_text(original_zh))
 
                 batch_processed.append(
