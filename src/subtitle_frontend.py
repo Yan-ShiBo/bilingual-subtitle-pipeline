@@ -368,6 +368,8 @@ def summarize_segment(item: Dict[str, Any]) -> Dict[str, Any]:
         "text": item.get("text"),
         "en": item.get("en"),
         "zh": item.get("zh"),
+        "source_language": item.get("source_language"),
+        "processing_mode": item.get("processing_mode"),
         "display": item.get("display", True),
     }
 
@@ -499,7 +501,7 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
     english_subtitle_stream = payload.get("english_subtitle_stream")
     audio_stream = payload.get("audio_stream")
     source_language = payload.get("source_language") or "auto"
-    asr_language = payload.get("asr_language") or "en"
+    asr_language = payload.get("asr_language") or "source"
     subtitle_ocr_lang = payload.get("subtitle_ocr_lang") or "auto"
     batch_size = int(payload.get("batch_size") or 5)
     context_lines = int(payload.get("context_lines") or 30)
@@ -874,8 +876,9 @@ def html_page() -> str:
       <div class="span-2">
         <label>音频识别语言</label>
         <select id="asrLanguage">
-          <option value="en" selected>English</option>
+          <option value="source" selected>跟随源语言</option>
           <option value="auto">自动检测</option>
+          <option value="en">English</option>
           <option value="ja">Japanese</option>
           <option value="ko">Korean</option>
           <option value="fr">French</option>
@@ -966,7 +969,7 @@ def html_page() -> str:
   <section>
     <h2>Checkpoint 预览</h2>
     <table>
-      <thead><tr><th>ID</th><th>时间</th><th>英文</th><th>中文</th></tr></thead>
+      <thead><tr><th>ID</th><th>时间</th><th>源文/英文</th><th>中文</th></tr></thead>
       <tbody id="preview"></tbody>
     </table>
   </section>
@@ -1026,6 +1029,7 @@ function setSelectedPath(path) {
 }
 
 function payload() {
+  const sourceLanguage = document.getElementById('source_language').value;
   return {
     path: document.getElementById('path').value,
     output_root: document.getElementById('outputRoot').value,
@@ -1040,8 +1044,8 @@ function payload() {
     chinese_subtitle_stream: document.getElementById('chineseSubtitleStream').value,
     english_subtitle_stream: document.getElementById('englishSubtitleStream').value,
     audio_stream: document.getElementById('audioStream').value,
-    source_language: document.getElementById('source_language').value,
-    asr_language: document.getElementById('asrLanguage').value,
+    source_language: sourceLanguage,
+    asr_language: resolveAsrLanguageForPayload(),
     subtitle_ocr_lang: document.getElementById('subtitleOcrLang').value,
     llm_model: document.getElementById('llmModel').value,
     batch_size: Number(document.getElementById('batchSize').value || 5),
@@ -1050,6 +1054,15 @@ function payload() {
     max_chars: Number(document.getElementById('maxChars').value || 82),
     max_duration: Number(document.getElementById('maxDuration').value || 6)
   };
+}
+
+function resolveAsrLanguageForPayload() {
+  const sourceLanguage = document.getElementById('source_language').value;
+  const asrLanguage = document.getElementById('asrLanguage').value;
+  if (asrLanguage === 'source') {
+    return sourceLanguage && sourceLanguage !== 'auto' ? sourceLanguage : 'auto';
+  }
+  return asrLanguage || 'auto';
 }
 
 async function analyze() {
@@ -1189,12 +1202,28 @@ function normalizePathForCompare(value) {
 }
 
 function hasCjk(value) {
-  return /[\u3400-\u4dbf\u4e00-\u9fff]/.test(String(value || ''));
+  return /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]/.test(String(value || ''));
+}
+
+function normalizeLanguageTag(value) {
+  const lang = String(value || '').trim().toLowerCase();
+  if (!lang || ['auto', 'source', 'cached source', 'subtitle', 'embedded subtitle'].includes(lang)) return lang;
+  if (['en', 'eng', 'english'].includes(lang) || lang.includes('english')) return 'en';
+  if (['ja', 'jp', 'jpn', 'japanese'].includes(lang) || lang.includes('japanese')) return 'ja';
+  if (['ko', 'kor', 'korean'].includes(lang) || lang.includes('korean')) return 'ko';
+  if (['zh', 'zho', 'chi', 'chs', 'cht', 'cmn', 'cn', 'chinese'].includes(lang) || lang.includes('chinese')) return 'zh';
+  return lang.split('-', 1)[0];
+}
+
+function sourceLanguageAllowsCjkPreview(item) {
+  const lang = normalizeLanguageTag(item?.source_language);
+  return Boolean(lang) && !['auto', 'source', 'cached source', 'subtitle', 'embedded subtitle', 'zh'].includes(lang);
 }
 
 function previewEnglishText(item) {
   const value = (item.en === undefined || item.en === null) ? (item.text || '') : item.en;
-  return hasCjk(value) ? '' : value;
+  if (!sourceLanguageAllowsCjkPreview(item) && hasCjk(value)) return '';
+  return value;
 }
 
 function render(data) {
@@ -1397,6 +1426,11 @@ async function connectRemoteServer() {
       }));
       updateLlmModels(data.models, payload.name);
       closeRemoteModal();
+      if (data.models && data.models.length > 0) {
+        alert('远程服务器连接成功！获取到 ' + data.models.length + ' 个模型。');
+      } else {
+        alert('SSH 连接成功，但未能获取到远程 Ollama 模型列表 (Ollama服务可能未启动或端口不通)。');
+      }
     } else {
       document.getElementById('remoteError').textContent = data.error || '连接失败';
     }
@@ -1462,6 +1496,7 @@ function restoreFormState() {
           else el.value = data[id];
         }
       });
+      migrateRecognitionLanguageState();
       const analysis = getMatchingAnalysis();
       if (analysis) render(analysis);
       if (data.seriesName && data.movieName) {
@@ -1471,8 +1506,22 @@ function restoreFormState() {
   } catch (e) {}
 }
 
+function migrateRecognitionLanguageState() {
+  const source = document.getElementById('source_language');
+  const asr = document.getElementById('asrLanguage');
+  if (!source || !asr) return;
+  if (source.value && source.value !== 'auto' && source.value !== 'en' && asr.value === 'en') {
+    asr.value = 'source';
+  }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   restoreFormState();
+  migrateRecognitionLanguageState();
+  document.getElementById('source_language')?.addEventListener('change', () => {
+    migrateRecognitionLanguageState();
+    saveFormState();
+  });
   checkRemoteStatus();
 });
 document.addEventListener('input', saveFormState);

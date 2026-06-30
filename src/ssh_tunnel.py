@@ -52,14 +52,17 @@ class SSHTunnelManager:
     def fetch_models(self) -> list:
         if not self.status()["connected"]:
             return []
-        try:
-            req = Request("http://127.0.0.1:11435/api/tags", method="GET")
-            with urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                return [m["name"] for m in data.get("models", [])]
-        except Exception as e:
-            self.last_error = f"Fetch models error: {e}"
-            return []
+        
+        for attempt in range(5):
+            try:
+                req = Request("http://127.0.0.1:11435/api/tags", method="GET")
+                with urlopen(req, timeout=5) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    return [m["name"] for m in data.get("models", [])]
+            except Exception as e:
+                self.last_error = f"Fetch models error: {e}"
+                time.sleep(1)
+        return []
 
     def _forward_local_port(self):
         class ForwardServer(socket.socket):
