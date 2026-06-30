@@ -14,6 +14,7 @@ from openai import OpenAI
 Segment = Dict[str, Any]
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m2ts", ".ts", ".mov", ".wmv"}
 SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt"}
+UNKNOWN_SOURCE_LANGUAGE_TAGS = {"", "auto", "source", "cached source", "subtitle", "embedded subtitle"}
 
 
 def configure_output_encoding() -> None:
@@ -50,7 +51,7 @@ def load_cached_source_segments(path: Path) -> List[Segment]:
         if not text:
             continue
         normalized = {**item, "id": len(segments), "start": start, "end": end, "text": text}
-        if normalized.get("en") is not None:
+        if normalized.get("en") is not None and should_clean_english_track(normalized):
             normalized["en"] = clean_english_track_text(str(normalized["en"]))
         if normalized.get("zh") is not None:
             normalized["zh"] = to_simplified_text(clean_subtitle_text(str(normalized["zh"])))
@@ -58,6 +59,7 @@ def load_cached_source_segments(path: Path) -> List[Segment]:
 
     if not segments:
         raise ValueError("cached source segments are empty")
+    fill_missing_source_languages(segments)
     return segments
 
 
@@ -69,6 +71,64 @@ def infer_source_language_from_segments(segments: List[Segment], fallback: str) 
         if language:
             return str(language)
     return "cached source"
+
+
+def dominant_source_language(segments: List[Segment]) -> str:
+    counts: Dict[str, int] = {}
+    for segment in segments:
+        language = normalize_language_tag(str(segment.get("source_language") or ""))
+        if language in UNKNOWN_SOURCE_LANGUAGE_TAGS:
+            continue
+        counts[language] = counts.get(language, 0) + 1
+    if not counts:
+        return ""
+    return max(counts.items(), key=lambda item: item[1])[0]
+
+
+def fill_missing_source_languages(segments: List[Segment]) -> None:
+    language = dominant_source_language(segments)
+    if language in UNKNOWN_SOURCE_LANGUAGE_TAGS:
+        return
+    for segment in segments:
+        current = normalize_language_tag(str(segment.get("source_language") or ""))
+        if current in UNKNOWN_SOURCE_LANGUAGE_TAGS:
+            segment["source_language"] = language
+
+
+def normalize_language_tag(language: str) -> str:
+    value = (language or "").strip().lower()
+    if not value or value in {"auto", "source", "cached source"}:
+        return value
+    if value in {"en", "eng", "english"} or "english" in value:
+        return "en"
+    if value in {"ja", "jp", "jpn", "japanese"} or "japanese" in value:
+        return "ja"
+    if value in {"ko", "kor", "korean"} or "korean" in value:
+        return "ko"
+    if value in {"zh", "zho", "chi", "chs", "cht", "cmn", "cn", "chinese"} or "chinese" in value:
+        return "zh"
+    if value in {"fr", "fra", "fre", "french"} or "french" in value:
+        return "fr"
+    if value in {"de", "deu", "ger", "german"} or "german" in value:
+        return "de"
+    if value in {"es", "spa", "spanish"} or "spanish" in value:
+        return "es"
+    return value.split("-", 1)[0]
+
+
+def source_cache_matches_requested_language(
+    segments: List[Segment],
+    source_language: str,
+    asr_language: str,
+) -> bool:
+    desired = normalize_language_tag(source_language)
+    if not desired or desired == "auto":
+        desired = normalize_language_tag(resolve_asr_language(asr_language, source_language))
+    if not desired or desired == "auto":
+        return True
+
+    cached = normalize_language_tag(infer_source_language_from_segments(segments, ""))
+    return bool(cached and cached == desired)
 
 
 def get_ffmpeg_path() -> str:
@@ -140,7 +200,7 @@ def extract_audio(video_path: Path, temp_audio_path: Path, audio_stream: Optiona
     print("Audio extraction complete.")
 
 
-def transcribe_audio(audio_path: Path, language: Optional[str] = "en") -> List[Segment]:
+def transcribe_audio(audio_path: Path, language: Optional[str] = "auto") -> List[Segment]:
     print("Loading faster-whisper large-v3 model with FP16...")
     from faster_whisper import WhisperModel
     model = WhisperModel(
@@ -163,7 +223,8 @@ def transcribe_audio(audio_path: Path, language: Optional[str] = "en") -> List[S
         },
     )
 
-    print(f"Detected language '{info.language}' with probability {info.language_probability}")
+    detected_language = str(getattr(info, "language", "") or requested_language or language or "auto")
+    print(f"Detected language '{detected_language}' with probability {info.language_probability}")
 
     results: List[Segment] = []
     for segment in segments:
@@ -187,6 +248,7 @@ def transcribe_audio(audio_path: Path, language: Optional[str] = "en") -> List[S
             "start": float(segment.start),
             "end": float(segment.end),
             "text": text,
+            "source_language": detected_language,
         }
         if words:
             item["words"] = words
@@ -283,15 +345,29 @@ def clean_subtitle_text(text: str) -> str:
 
 
 CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+EAST_ASIAN_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]")
 
 
 def contains_cjk(text: str) -> bool:
     return bool(CJK_RE.search(text or ""))
 
 
+def contains_east_asian(text: str) -> bool:
+    return bool(EAST_ASIAN_RE.search(text or ""))
+
+
 def clean_english_track_text(text: str) -> str:
     text = clean_subtitle_text(text)
-    return "" if contains_cjk(text) else text
+    return "" if contains_east_asian(text) else text
+
+
+def should_clean_english_track(segment: Segment) -> bool:
+    language = normalize_language_tag(str(segment.get("source_language") or ""))
+    if language == "zh":
+        return True
+    if language not in UNKNOWN_SOURCE_LANGUAGE_TAGS:
+        return False
+    return True
 
 
 def classify_subtitle_text(text: str) -> str:
@@ -818,6 +894,14 @@ def choose_ocr_lang(language: str) -> str:
     return "en"
 
 
+def resolve_asr_language(asr_language: str, source_language: str) -> str:
+    requested = (asr_language or "").strip().lower()
+    source = (source_language or "").strip().lower()
+    if requested in {"", "source", "follow-source", "same"}:
+        return source if source and source != "auto" else "auto"
+    return requested
+
+
 def load_embedded_subtitle_events(
     video_path: Path,
     stream_index: Optional[int],
@@ -903,6 +987,11 @@ def split_segment_by_words(segment: Segment, max_words: int, max_chars: int, max
     words = segment.get("words") or []
     if not words:
         return []
+    metadata = {
+        key: value
+        for key, value in segment.items()
+        if key not in {"id", "start", "end", "text", "words"}
+    }
 
     chunks: List[List[Dict[str, Any]]] = []
     current: List[Dict[str, Any]] = []
@@ -927,6 +1016,7 @@ def split_segment_by_words(segment: Segment, max_words: int, max_chars: int, max
             continue
         output.append(
             {
+                **metadata,
                 "id": len(output),
                 "start": float(chunk[0]["start"]),
                 "end": float(chunk[-1]["end"]),
@@ -943,6 +1033,11 @@ def split_segment_by_text(segment: Segment, max_words: int, max_chars: int, max_
     chunks = split_plain_text(text, max_words=max_words, max_chars=max_chars, min_chunks=min_chunks)
     if len(chunks) <= 1:
         return [{**segment, "text": text}]
+    metadata = {
+        key: value
+        for key, value in segment.items()
+        if key not in {"id", "start", "end", "text", "words"}
+    }
 
     weights = [max(1, len(chunk)) for chunk in chunks]
     total_weight = sum(weights)
@@ -956,6 +1051,7 @@ def split_segment_by_text(segment: Segment, max_words: int, max_chars: int, max_
             end = start + duration * weight / total_weight
         output.append(
             {
+                **metadata,
                 "id": len(output),
                 "start": start,
                 "end": end,
@@ -1241,7 +1337,7 @@ Rules:
 - Keep personal names and recurring terminology consistent across the context. Do not translate a name in one line and leave the same name untranslated in another unless the context clearly requires it.
 """
     
-    for attempt in range(3):
+    for attempt in range(10):
         try:
             data = parse_json_response(call_llm(prompt, system_prompt, llm_model))
             if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
@@ -1261,7 +1357,7 @@ Rules:
         except Exception as exc:
             print(f"重试单句请求异常: {exc}")
     
-    print("3次重试均失败，将采用原始字幕。")
+    print("10次重试均失败，将采用原始字幕。")
     return {}
 
 
@@ -1284,7 +1380,11 @@ def translate_and_correct_segments(
     if checkpoint_path and checkpoint_path.exists():
         try:
             cached = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-            if isinstance(cached, list) and len(cached) <= len(segments) and checkpoint_matches_segments(cached, segments):
+            if (
+                isinstance(cached, list)
+                and len(cached) <= len(segments)
+                and checkpoint_matches_segments(cached, segments, expected_mode="translate")
+            ):
                 processed_segments = cached
                 print(f"Resuming from checkpoint with {len(processed_segments)} completed segments.")
             else:
@@ -1423,6 +1523,7 @@ Rules:
                             **segment,
                             "en": corrected,
                             "zh": translated or corrected,
+                            "processing_mode": "translate",
                         },
                         item,
                         context_start,
@@ -1432,7 +1533,13 @@ Rules:
         except Exception as exc:
             print(f"Warning: failed to process batch via LLM ({exc}). Falling back to original text.")
             batch_processed = [
-                {**segment, "en": segment["text"], "zh": segment["text"], "display": True}
+                {
+                    **segment,
+                    "en": segment["text"],
+                    "zh": segment["text"],
+                    "display": True,
+                    "processing_mode": "translate",
+                }
                 for segment in batch
             ]
 
@@ -1471,7 +1578,11 @@ def proofread_existing_chinese_segments(
     if checkpoint_path and checkpoint_path.exists():
         try:
             cached = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-            if isinstance(cached, list) and len(cached) <= len(segments) and checkpoint_matches_segments(cached, segments):
+            if (
+                isinstance(cached, list)
+                and len(cached) <= len(segments)
+                and checkpoint_matches_segments(cached, segments, expected_mode="proofread_existing_chinese")
+            ):
                 processed_segments = to_simplified_segments(cached)
                 print(f"Resuming from checkpoint with {len(processed_segments)} completed segments.")
             else:
@@ -1614,6 +1725,7 @@ Rules:
                             **segment,
                             "en": corrected_en,
                             "zh": corrected_zh,
+                            "processing_mode": "proofread_existing_chinese",
                         },
                         item,
                         context_start,
@@ -1631,6 +1743,7 @@ Rules:
                         "en": clean_english_track_text(original_en),
                         "zh": original_zh,
                         "display": True,
+                        "processing_mode": "proofread_existing_chinese",
                     }
                 )
 
@@ -1644,11 +1757,21 @@ Rules:
     return processed_segments
 
 
-def checkpoint_matches_segments(cached: List[Segment], segments: List[Segment]) -> bool:
+def checkpoint_matches_segments(
+    cached: List[Segment],
+    segments: List[Segment],
+    expected_mode: Optional[str] = None,
+) -> bool:
     for index, cached_segment in enumerate(cached):
         current = segments[index]
         if "display" not in cached_segment:
             print("Ignoring checkpoint because it lacks duplicate-cleanup display metadata.")
+            return False
+        if expected_mode and cached_segment.get("processing_mode") != expected_mode:
+            print(
+                "Ignoring checkpoint because it was generated by a different processing mode "
+                f"at item {index}: expected {expected_mode}, got {cached_segment.get('processing_mode')!r}."
+            )
             return False
         same_start = abs(float(cached_segment["start"]) - float(current["start"])) <= 0.02
         same_end = abs(float(cached_segment["end"]) - float(current["end"])) <= 0.02
@@ -1715,7 +1838,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 continue
             start = seconds_to_ass_time(float(segment.get("display_start", segment["start"])))
             end = seconds_to_ass_time(float(segment.get("display_end", segment["end"])))
-            en_text = escape_ass_text(clean_english_track_text(str(segment.get("en", segment["text"]))))
+            raw_source_text = str(segment.get("en", segment["text"]))
+            if should_clean_english_track(segment):
+                raw_source_text = clean_english_track_text(raw_source_text)
+            en_text = escape_ass_text(raw_source_text)
             zh_text = escape_ass_text(segment.get("zh", ""))
             if mode == "en" and not en_text:
                 continue
@@ -1761,9 +1887,15 @@ def segments_have_chinese(segments: List[Segment]) -> bool:
     zh_text = " ".join(str(segment.get("zh") or "") for segment in segments)
     if len(CJK_RE.findall(zh_text)) >= 3:
         return True
+    dominant_language = dominant_source_language(segments)
+    if dominant_language and dominant_language != "zh":
+        return False
     text_without_english = []
     for segment in segments:
         if segment.get("en"):
+            continue
+        language = normalize_language_tag(str(segment.get("source_language") or ""))
+        if language not in UNKNOWN_SOURCE_LANGUAGE_TAGS and language != "zh":
             continue
         text_without_english.append(str(segment.get("text") or ""))
     return len(CJK_RE.findall(" ".join(text_without_english))) >= 3
@@ -1784,7 +1916,7 @@ def main() -> None:
     parser.add_argument("--merge-existing-subtitles", choices=["yes", "no"], default="yes", help="Merge existing Chinese and English subtitles before proofreading.")
     parser.add_argument("--audio-stream", type=int, help="Audio stream index, e.g. 1 for 0:1.")
     parser.add_argument("--source-language", default="auto", help="Source subtitle language for correction/translation context.")
-    parser.add_argument("--asr-language", default="en", help="Whisper language code, or auto for detection.")
+    parser.add_argument("--asr-language", default="source", help="Whisper language code, source to follow --source-language, or auto for detection.")
     parser.add_argument("--subtitle-ocr-lang", default="auto", help="PaddleOCR language for image subtitles, or auto.")
     parser.add_argument("--device", default="gpu:0", help="OCR device for embedded image subtitles.")
     parser.add_argument("--ocr-scale", type=float, default=2.0)
@@ -1831,13 +1963,21 @@ def main() -> None:
     try:
         actual_source = args.source
         source_language = args.source_language
+        asr_language = resolve_asr_language(args.asr_language, args.source_language)
         subtitle_segments: Optional[List[Segment]] = None
         if source_segments_path.exists():
             try:
-                subtitle_segments = load_cached_source_segments(source_segments_path)
-                actual_source = "cached source segments"
-                source_language = infer_source_language_from_segments(subtitle_segments, source_language)
-                print(f"Reusing cached source segments from {source_segments_path} ({len(subtitle_segments)} events).")
+                cached_segments = load_cached_source_segments(source_segments_path)
+                if source_cache_matches_requested_language(cached_segments, args.source_language, args.asr_language):
+                    subtitle_segments = cached_segments
+                    actual_source = "cached source segments"
+                    source_language = infer_source_language_from_segments(subtitle_segments, source_language)
+                    print(f"Reusing cached source segments from {source_segments_path} ({len(subtitle_segments)} events).")
+                else:
+                    print(
+                        "Ignoring cached source segments because their language does not match "
+                        f"the requested source/asr language: {source_segments_path}"
+                    )
             except Exception as exc:
                 print(f"Ignoring unreadable source cache {source_segments_path}: {exc}")
 
@@ -1903,15 +2043,15 @@ def main() -> None:
                         print(f"No embedded subtitles available ({exc}). Falling back to audio extraction...")
                         actual_source = "audio"
                         extract_audio(video_path, temp_audio, audio_stream=args.audio_stream)
-                        source_segments = transcribe_audio(temp_audio, language=args.asr_language)
+                        source_segments = transcribe_audio(temp_audio, language=asr_language)
                         if source_language == "auto":
-                            source_language = args.asr_language
+                            source_language = infer_source_language_from_segments(source_segments, asr_language)
                 else:
                     actual_source = "audio"
                     extract_audio(video_path, temp_audio, audio_stream=args.audio_stream)
-                    source_segments = transcribe_audio(temp_audio, language=args.asr_language)
+                    source_segments = transcribe_audio(temp_audio, language=asr_language)
                     if source_language == "auto":
-                        source_language = args.asr_language
+                        source_language = infer_source_language_from_segments(source_segments, asr_language)
 
                 subtitle_segments = split_segments_for_subtitles(
                     source_segments,
