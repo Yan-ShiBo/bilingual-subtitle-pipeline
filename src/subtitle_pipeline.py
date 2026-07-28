@@ -1050,17 +1050,19 @@ def best_overlap(base: SubtitleEvent, candidates: list[tuple[int, SubtitleEvent]
         overlap = max(0.0, min(base.end, cand.end) - max(base.start, cand.start))
         cand_center = (cand.start + cand.end) / 2
         distance = abs(base_center - cand_center)
-        if overlap <= 0 and distance > 3.5:
-            continue
-        score = overlap * 10 - distance
+        if overlap <= 0:
+            gap = max(base.start - cand.end, cand.start - base.end)
+            if gap > 0.75:
+                continue
+            score = -gap * 10 - distance
+        else:
+            score = overlap * 10 - distance
         if best is None or score > best[0]:
             best = (score, distance, cand)
             best_idx = idx
     if not best:
         return None
-    score, distance, cand = best
-    if score < -2.5 and distance > 2.5:
-        return None
+    _, _, cand = best
     return best_idx, cand
 
 

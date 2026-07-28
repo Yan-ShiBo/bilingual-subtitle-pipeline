@@ -10,12 +10,20 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import audio_to_subtitle  # noqa: E402
+import subtitle_frontend  # noqa: E402
+from subtitle_pipeline import SubtitleEvent, pair_events  # noqa: E402
 from audio_to_subtitle import (  # noqa: E402
     apply_display_timing,
     checkpoint_matches_segments,
     extend_display_over_hidden_segments,
     generate_ass,
+    load_cached_source_segments,
+    merge_existing_subtitle_segments,
     proofread_existing_chinese_segments,
+    sanitize_checkpoint_display_timing,
+    segments_have_chinese,
+    split_segments_for_subtitles,
+    source_cache_uses_current_timing_policy,
     translate_and_correct_segments,
 )
 
@@ -32,7 +40,35 @@ class DisplayCleanupTests(unittest.TestCase):
 
         self.assertEqual(segments[0]["display_end"], 13.0)
 
-    def test_apply_display_timing_preserves_source_anchors(self) -> None:
+    def test_cached_checkpoint_timing_is_rebuilt_from_source_anchors(self) -> None:
+        cached = [
+            {
+                "id": 0,
+                "start": 10.0,
+                "end": 11.0,
+                "display_start": 35.0,
+                "display_end": 36.0,
+                "text": "complete",
+                "display": True,
+            },
+            {
+                "id": 1,
+                "start": 11.0,
+                "end": 12.0,
+                "display_start": 36.0,
+                "display_end": 37.0,
+                "text": "duplicate",
+                "display": False,
+            },
+        ]
+
+        sanitized = sanitize_checkpoint_display_timing(cached)
+
+        self.assertNotIn("display_start", sanitized[0])
+        self.assertEqual(sanitized[0]["display_end"], 12.0)
+        self.assertNotIn("display_end", sanitized[1])
+
+    def test_apply_display_timing_rejects_model_timing_changes(self) -> None:
         source = {"id": 4, "start": 20.0, "end": 21.0, "text": "fragment"}
 
         output = apply_display_timing(
@@ -48,7 +84,8 @@ class DisplayCleanupTests(unittest.TestCase):
 
         self.assertEqual(output["start"], 20.0)
         self.assertEqual(output["end"], 21.0)
-        self.assertEqual(output["display_end"], 24.0)
+        self.assertNotIn("display_start", output)
+        self.assertNotIn("display_end", output)
         self.assertTrue(checkpoint_matches_segments([output], [source]))
 
     def test_generate_ass_skips_hidden_segments(self) -> None:
@@ -181,6 +218,424 @@ class DisplayCleanupTests(unittest.TestCase):
                 audio_to_subtitle.main()
 
             self.assertTrue((out_dir / "Episode.bilingual.ass").exists())
+
+    def test_main_uses_output_scoped_temp_audio_and_preserves_sibling_wav(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video = root / "video.mp4"
+            video.write_bytes(b"placeholder")
+            sibling_wav = video.with_suffix(".wav")
+            sibling_wav.write_bytes(b"user audio")
+            output_root = root / "out"
+            captured = {}
+
+            def extract(_video, temp_audio, **_):
+                captured["path"] = temp_audio
+                temp_audio.write_bytes(b"pipeline temp")
+
+            argv = [
+                "audio_to_subtitle.py",
+                "--video",
+                str(video),
+                "--source",
+                "audio",
+                "--output-root",
+                str(output_root),
+                "--series-name",
+                "Series",
+                "--movie-name",
+                "Episode",
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(audio_to_subtitle, "extract_audio", side_effect=extract),
+                patch.object(
+                    audio_to_subtitle,
+                    "transcribe_audio",
+                    return_value=[{"id": 0, "start": 1.0, "end": 2.0, "text": "line", "source_language": "en"}],
+                ),
+                patch.object(audio_to_subtitle, "translate_and_correct_segments", side_effect=lambda segments, **_: segments),
+            ):
+                audio_to_subtitle.main()
+
+            self.assertEqual(sibling_wav.read_bytes(), b"user audio")
+            self.assertEqual(captured["path"].parent, output_root / "Series" / "Episode")
+            self.assertFalse(captured["path"].exists())
+
+    def test_restart_cleanup_preserves_video_sibling_wav(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video = root / "movie.mp4"
+            video.write_bytes(b"video")
+            sibling_wav = video.with_suffix(".wav")
+            sibling_wav.write_bytes(b"user audio")
+            out_dir = root / "out"
+            out_dir.mkdir()
+            pipeline_temp = out_dir / ".Episode.subtitle-audio.123.wav"
+            pipeline_temp.write_bytes(b"temp")
+
+            subtitle_frontend.remove_resume_files(out_dir, "Episode")
+
+            self.assertEqual(sibling_wav.read_bytes(), b"user audio")
+            self.assertFalse(pipeline_temp.exists())
+
+    def test_frontend_rejects_duplicate_run_for_same_output(self) -> None:
+        class FakeProcess:
+            pid = 43210
+
+            @staticmethod
+            def poll():
+                return None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video = root / "movie.mp4"
+            video.write_bytes(b"video")
+            payload = {
+                "path": str(video),
+                "output_root": str(root / "out"),
+                "series_name": "Series",
+                "movie_name": "Episode",
+                "source": "audio",
+            }
+            log_path = root / "run.log"
+            err_path = root / "run.err.log"
+            subtitle_frontend.RUNS.clear()
+            try:
+                with (
+                    patch.object(subtitle_frontend, "frontend_log_paths", return_value=(log_path, err_path)),
+                    patch.object(subtitle_frontend.subprocess, "Popen", return_value=FakeProcess()),
+                ):
+                    subtitle_frontend.start_processing(payload)
+                    with self.assertRaisesRegex(RuntimeError, "任务已在运行"):
+                        subtitle_frontend.start_processing(payload)
+            finally:
+                subtitle_frontend.RUNS.clear()
+
+    def test_main_uses_selected_english_embedded_stream_as_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video = root / "movie.mkv"
+            video.write_bytes(b"video")
+            output_root = root / "out"
+            captured = {}
+
+            def load_embedded(_video, stream_index, **_):
+                captured["stream_index"] = stream_index
+                return [{"id": 0, "start": 1.0, "end": 2.0, "text": "English line", "source_language": "en"}]
+
+            argv = [
+                "audio_to_subtitle.py",
+                "--video",
+                str(video),
+                "--source",
+                "embedded",
+                "--english-subtitle-stream",
+                "7",
+                "--output-root",
+                str(output_root),
+                "--series-name",
+                "Series",
+                "--movie-name",
+                "Episode",
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(audio_to_subtitle, "find_existing_embedded_subtitle_segments", return_value=None),
+                patch.object(audio_to_subtitle, "load_embedded_subtitle_events", side_effect=load_embedded),
+                patch.object(audio_to_subtitle, "extract_audio", side_effect=AssertionError("extract_audio called")),
+                patch.object(audio_to_subtitle, "translate_and_correct_segments", side_effect=lambda segments, **_: segments),
+            ):
+                audio_to_subtitle.main()
+
+            self.assertEqual(captured["stream_index"], 7)
+
+    def test_main_audio_asr_language_defaults_to_selected_source_language(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video = root / "movie.mp4"
+            video.write_bytes(b"placeholder")
+            output_root = root / "out"
+            captured = {}
+
+            def transcribe(_audio_path, language):
+                captured["language"] = language
+                return [{"id": 0, "start": 1.0, "end": 2.0, "text": "konnichiwa"}]
+
+            argv = [
+                "audio_to_subtitle.py",
+                "--video",
+                str(video),
+                "--source",
+                "audio",
+                "--output-root",
+                str(output_root),
+                "--series-name",
+                "Series",
+                "--movie-name",
+                "Episode",
+                "--source-language",
+                "ja",
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(audio_to_subtitle, "extract_audio"),
+                patch.object(audio_to_subtitle, "transcribe_audio", side_effect=transcribe),
+                patch.object(audio_to_subtitle, "translate_and_correct_segments", side_effect=lambda segments, **_: segments),
+            ):
+                audio_to_subtitle.main()
+
+            self.assertEqual(captured["language"], "ja")
+
+    def test_main_ignores_cached_source_when_requested_language_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video = root / "movie.mp4"
+            video.write_bytes(b"placeholder")
+            output_root = root / "out"
+            out_dir = output_root / "Series" / "Episode"
+            out_dir.mkdir(parents=True)
+            source_cache = out_dir / "Episode.segments.source.json"
+            source_cache.write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": 0,
+                            "start": 1.0,
+                            "end": 2.0,
+                            "text": "old English recognition",
+                            "source_language": "en",
+                        }
+                    ],
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            captured = {}
+
+            def transcribe(_audio_path, language):
+                captured["language"] = language
+                return [{"id": 0, "start": 1.0, "end": 2.0, "text": "konnichiwa", "source_language": "ja"}]
+
+            argv = [
+                "audio_to_subtitle.py",
+                "--video",
+                str(video),
+                "--source",
+                "audio",
+                "--output-root",
+                str(output_root),
+                "--series-name",
+                "Series",
+                "--movie-name",
+                "Episode",
+                "--source-language",
+                "ja",
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(audio_to_subtitle, "extract_audio"),
+                patch.object(audio_to_subtitle, "transcribe_audio", side_effect=transcribe),
+                patch.object(audio_to_subtitle, "translate_and_correct_segments", side_effect=lambda segments, **_: segments),
+            ):
+                audio_to_subtitle.main()
+
+            self.assertEqual(captured["language"], "ja")
+            refreshed_cache = json.loads(source_cache.read_text(encoding="utf-8"))
+            self.assertEqual(refreshed_cache[0]["source_language"], "ja")
+
+    def test_japanese_source_with_kanji_is_not_treated_as_existing_chinese_subtitle(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 1.0,
+                "end": 2.0,
+                "text": "\u9332\u97f3\u306e\u6280\u8853",
+                "source_language": "ja",
+            }
+        ]
+
+        self.assertFalse(segments_have_chinese(source))
+
+    def test_cached_source_fills_missing_language_from_dominant_language(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "source.json"
+            source_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": 0,
+                            "start": 1.0,
+                            "end": 2.0,
+                            "text": "\u9332\u97f3\u306e\u6280\u8853",
+                            "source_language": "ja",
+                        },
+                        {
+                            "id": 1,
+                            "start": 2.0,
+                            "end": 3.0,
+                            "text": "\u697d\u66f2\u306e\u5370\u8c61",
+                        },
+                    ],
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = load_cached_source_segments(source_path)
+
+        self.assertEqual(loaded[1]["source_language"], "ja")
+
+    def test_legacy_merged_subtitle_cache_requires_timing_rebuild(self) -> None:
+        legacy = [
+            {
+                "id": 0,
+                "start": 1.0,
+                "end": 4.0,
+                "text": "line",
+                "en": "line",
+                "zh": "\u5b57\u5e55",
+                "source_language": "existing Chinese embedded subtitle",
+            }
+        ]
+        current = [{**legacy[0], "source_cache_version": 2}]
+
+        self.assertFalse(source_cache_uses_current_timing_policy(legacy))
+        self.assertTrue(source_cache_uses_current_timing_policy(current))
+
+    def test_split_segments_preserves_source_language(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 1.0,
+                "end": 10.0,
+                "text": "\u30ec\u30b3\u30fc\u30c7\u30a3\u30f3\u30b0 \u30df\u30c3\u30af\u30b9 \u6280\u8853",
+                "source_language": "ja",
+                "words": [
+                    {"start": 1.0, "end": 2.0, "word": "\u30ec\u30b3\u30fc\u30c7\u30a3\u30f3\u30b0"},
+                    {"start": 2.0, "end": 3.0, "word": "\u30df\u30c3\u30af\u30b9"},
+                    {"start": 3.0, "end": 4.0, "word": "\u6280\u8853"},
+                ],
+            }
+        ]
+
+        pieces = split_segments_for_subtitles(source, max_words=14, max_chars=8, max_duration=3.0)
+
+        self.assertGreater(len(pieces), 1)
+        self.assertTrue(all(piece.get("source_language") == "ja" for piece in pieces))
+
+    def test_split_segments_splits_bilingual_text_and_duration_together(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 10.0,
+                "end": 18.0,
+                "text": "This is a deliberately long subtitle that needs multiple readable events.",
+                "en": "This is a deliberately long subtitle that needs multiple readable events.",
+                "zh": "\u8fd9\u662f\u4e00\u6761\u6545\u610f\u5199\u5f97\u5f88\u957f\u7684\u5b57\u5e55\u9700\u8981\u88ab\u5206\u6210\u591a\u4e2a\u5bb9\u6613\u9605\u8bfb\u7684\u7247\u6bb5",
+                "source_language": "existing Chinese embedded subtitle",
+            }
+        ]
+
+        pieces = split_segments_for_subtitles(source, max_words=6, max_chars=28, max_duration=3.0)
+
+        self.assertGreater(len(pieces), 1)
+        self.assertTrue(all(float(piece["end"]) - float(piece["start"]) <= 3.01 for piece in pieces))
+        self.assertTrue(all(len(piece["en"]) <= 28 for piece in pieces if piece.get("en")))
+        self.assertTrue(all(len(piece["zh"]) <= 28 for piece in pieces if piece.get("zh")))
+        self.assertEqual(
+            " ".join(piece["en"] for piece in pieces if piece.get("en")),
+            source[0]["en"],
+        )
+        self.assertEqual(
+            "".join(piece["zh"] for piece in pieces if piece.get("zh")),
+            source[0]["zh"],
+        )
+
+    def test_merge_existing_subtitles_uses_spoken_track_timing(self) -> None:
+        en_segments = [
+            {"id": 0, "start": 30.0, "end": 32.0, "text": "The spoken line ends here."}
+        ]
+        zh_segments = [
+            {"id": 0, "start": 30.3, "end": 35.5, "text": "\u4e2d\u6587\u5b57\u5e55\u7684\u65f6\u95f4\u8f74\u660e\u663e\u504f\u665a"}
+        ]
+
+        merged = merge_existing_subtitle_segments(
+            en_segments,
+            zh_segments,
+            "existing Chinese embedded subtitle",
+        )
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["start"], 30.0)
+        self.assertEqual(merged[0]["end"], 32.0)
+
+    def test_pair_events_rejects_nonoverlapping_subtitles_with_large_gap(self) -> None:
+        pairs = pair_events(
+            [SubtitleEvent(10.0, 11.0, "spoken")],
+            [SubtitleEvent(12.0, 13.0, "\u8fdf\u5230\u5b57\u5e55")],
+        )
+
+        self.assertEqual(pairs[0], (SubtitleEvent(10.0, 11.0, "spoken"), None))
+        self.assertEqual(pairs[1], (None, SubtitleEvent(12.0, 13.0, "\u8fdf\u5230\u5b57\u5e55")))
+
+    def test_japanese_translate_rejects_old_unversioned_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_path = Path(tmpdir) / "checkpoint.json"
+            source = [
+                {
+                    "id": 0,
+                    "start": 1.0,
+                    "end": 2.0,
+                    "text": "\u9332\u97f3\u306e\u6280\u8853",
+                    "source_language": "ja",
+                }
+            ]
+            checkpoint_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            **source[0],
+                            "en": "",
+                            "zh": "\u5f55\u97f3\u7684\u6280\u672f",
+                            "display": True,
+                        }
+                    ],
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            llm_response = """
+            [
+              {
+                "index": 0,
+                "corrected_text": "\u9332\u97f3\u306e\u6280\u8853",
+                "chinese_translation": "\u5f55\u97f3\u7684\u6280\u672f",
+                "display": true
+              }
+            ]
+            """
+
+            with patch.object(audio_to_subtitle, "call_llm", return_value=llm_response):
+                output = translate_and_correct_segments(
+                    source,
+                    llm_model="qwen3:30b",
+                    batch_size=1,
+                    context_lines=0,
+                    source_language="ja",
+                    checkpoint_path=checkpoint_path,
+                )
+
+        self.assertEqual(output[0]["en"], "\u9332\u97f3\u306e\u6280\u8853")
+        self.assertEqual(output[0]["processing_mode"], "translate")
+
+    def test_frontend_defaults_audio_recognition_to_follow_source_language(self) -> None:
+        frontend_source = (ROOT / "src" / "subtitle_frontend.py").read_text(encoding="utf-8")
+
+        self.assertIn('<option value="source" selected>', frontend_source)
+        self.assertNotIn('<option value="en" selected>', frontend_source)
+        self.assertIn("resolveAsrLanguageForPayload()", frontend_source)
 
     def test_main_uses_chinese_sidecar_without_translation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -390,13 +845,88 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertNotIn("{\\rEnglish}\\N\u62d6\u8f66\u5c4b\u56ed\u533a", bilingual_body)
         self.assertNotIn("Dialogue:", english_body)
 
+    def test_generate_ass_does_not_write_japanese_kana_in_unknown_english_layer(self) -> None:
+        segments = [
+            {
+                "id": 0,
+                "start": 8.0,
+                "end": 9.0,
+                "text": "\u306e",
+                "en": "\u306e",
+                "zh": "",
+                "display": True,
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            english_path = Path(tmpdir) / "out.en.ass"
+            generate_ass(segments, english_path, "en")
+            english_body = english_path.read_text(encoding="utf-8")
+
+        self.assertNotIn("Dialogue:", english_body)
+
+    def test_generate_ass_keeps_non_english_source_layer_when_language_is_known(self) -> None:
+        segments = [
+            {
+                "id": 0,
+                "start": 8.0,
+                "end": 9.0,
+                "text": "\u9332\u97f3\u306e\u6280\u8853",
+                "en": "\u9332\u97f3\u306e\u6280\u8853",
+                "zh": "\u5f55\u97f3\u7684\u6280\u672f",
+                "source_language": "ja",
+                "display": True,
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bilingual_path = Path(tmpdir) / "out.bilingual.ass"
+            source_path = Path(tmpdir) / "out.source.ass"
+            generate_ass(segments, bilingual_path, "bilingual")
+            generate_ass(segments, source_path, "en")
+            bilingual_body = bilingual_path.read_text(encoding="utf-8")
+            source_body = source_path.read_text(encoding="utf-8")
+
+        self.assertIn("\u9332\u97f3\u306e\u6280\u8853", bilingual_body)
+        self.assertIn("\u9332\u97f3\u306e\u6280\u8853", source_body)
+
     def test_frontend_preview_does_not_fallback_empty_english_to_source_text(self) -> None:
         frontend_source = (ROOT / "src" / "subtitle_frontend.py").read_text(encoding="utf-8")
 
+        self.assertIn("<th>源文/英文</th>", frontend_source)
         self.assertIn("function previewEnglishText(item)", frontend_source)
-        self.assertIn("hasCjk(value) ? '' : value", frontend_source)
+        self.assertIn("function sourceLanguageAllowsCjkPreview(item)", frontend_source)
+        self.assertIn("\\u3040-\\u30ff", frontend_source)
+        self.assertIn("!sourceLanguageAllowsCjkPreview(item) && hasCjk(value)", frontend_source)
         self.assertIn("previewEnglishText(item)", frontend_source)
         self.assertNotIn("item.en || item.text", frontend_source)
+
+    def test_frontend_preview_uses_source_timing_not_legacy_model_timing(self) -> None:
+        summary = subtitle_frontend.summarize_segment(
+            {
+                "id": 1,
+                "start": 10.0,
+                "end": 11.0,
+                "display_start": 35.0,
+                "display_end": 36.0,
+                "text": "line",
+            }
+        )
+
+        self.assertEqual(summary["start"], 10.0)
+        self.assertEqual(summary["end"], 11.0)
+
+    def test_frontend_uses_progressive_disclosure_for_source_options(self) -> None:
+        page = subtitle_frontend.html_page()
+
+        self.assertIn('id="existingSubtitleOptions"', page)
+        self.assertIn('id="audioRecognitionOptions"', page)
+        self.assertIn('id="advancedSettings"', page)
+        self.assertIn("function updateWorkflowVisibility()", page)
+        self.assertIn("source.addEventListener('change', updateWorkflowVisibility)", page)
+        self.assertIn("subtitle_file: usesSidecar && !mergeExisting", page)
+        self.assertIn("chinese_subtitle_stream: usesEmbedded && mergeExisting", page)
+        self.assertIn("audio_stream: usesAudio ?", page)
 
 
 if __name__ == "__main__":

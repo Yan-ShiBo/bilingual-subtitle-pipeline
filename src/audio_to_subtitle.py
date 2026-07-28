@@ -1,6 +1,7 @@
 import argparse
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -15,6 +16,7 @@ Segment = Dict[str, Any]
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m2ts", ".ts", ".mov", ".wmv"}
 SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt"}
 UNKNOWN_SOURCE_LANGUAGE_TAGS = {"", "auto", "source", "cached source", "subtitle", "embedded subtitle"}
+SOURCE_CACHE_VERSION = 2
 
 
 def configure_output_encoding() -> None:
@@ -71,6 +73,17 @@ def infer_source_language_from_segments(segments: List[Segment], fallback: str) 
         if language:
             return str(language)
     return "cached source"
+
+
+def source_cache_uses_current_timing_policy(segments: List[Segment]) -> bool:
+    has_merged_existing_subtitles = any(
+        ("en" in segment or "zh" in segment)
+        and "existing chinese" in str(segment.get("source_language") or "").lower()
+        for segment in segments
+    )
+    if not has_merged_existing_subtitles:
+        return True
+    return all(int(segment.get("source_cache_version") or 0) >= SOURCE_CACHE_VERSION for segment in segments)
 
 
 def dominant_source_language(segments: List[Segment]) -> str:
@@ -680,8 +693,9 @@ def merge_existing_subtitle_segments(
     for en_event, zh_event in pairs:
         if not en_event and not zh_event:
             continue
-        start = min(event.start for event in (en_event, zh_event) if event is not None)
-        end = max(event.end for event in (en_event, zh_event) if event is not None)
+        timing_event = en_event or zh_event
+        start = timing_event.start
+        end = timing_event.end
         en_text = clean_english_track_text(en_event.text) if en_event else ""
         zh_text = to_simplified_text(clean_subtitle_text(zh_event.text)) if zh_event else ""
         text = en_text or zh_text
@@ -958,6 +972,9 @@ def split_plain_text(text: str, max_words: int, max_chars: int, min_chunks: int 
     words = text.split()
     if not words:
         return []
+    if len(words) == 1 and contains_cjk(text):
+        target_chunks = max(1, min_chunks, math.ceil(len(text) / max_chars))
+        return split_text_balanced(text, target_chunks, joiner="")
 
     target_chunks = max(1, min_chunks)
     dynamic_max_words = max(3, min(max_words, math.ceil(len(words) / target_chunks)))
@@ -981,6 +998,122 @@ def split_plain_text(text: str, max_words: int, max_chars: int, min_chunks: int 
         chunks.append(current_text())
 
     return [chunk for chunk in chunks if chunk]
+
+
+def split_text_balanced(text: str, chunk_count: int, joiner: str) -> List[str]:
+    units = list(text) if joiner == "" else text.split()
+    if not units:
+        return [""] * max(1, chunk_count)
+
+    chunk_count = max(1, min(chunk_count, len(units)))
+    base_size, extra = divmod(len(units), chunk_count)
+    chunks: List[str] = []
+    offset = 0
+    for index in range(chunk_count):
+        size = base_size + (1 if index < extra else 0)
+        chunk = joiner.join(units[offset : offset + size]).strip()
+        chunks.append(chunk)
+        offset += size
+    return chunks
+
+
+def track_chunk_count(text: str, max_words: int, max_chars: int, is_cjk: bool) -> int:
+    if not text:
+        return 1
+    if is_cjk:
+        return max(1, math.ceil(len(text) / max_chars))
+    return max(
+        1,
+        math.ceil(len(text.split()) / max_words),
+        math.ceil(len(text) / max_chars),
+    )
+
+
+def split_bilingual_segment(
+    segment: Segment,
+    max_words: int,
+    max_chars: int,
+    max_duration: float,
+) -> List[Segment]:
+    en_text = clean_english_track_text(str(segment.get("en") or ""))
+    zh_text = to_simplified_text(clean_subtitle_text(str(segment.get("zh") or "")))
+    source_text = clean_subtitle_text(str(segment.get("text") or en_text or zh_text))
+    start = float(segment["start"])
+    end = float(segment["end"])
+    duration = end - start
+    zh_max_chars = min(max_chars, 28)
+    source_is_en = bool(en_text) and source_text == en_text
+    source_is_zh = bool(zh_text) and source_text == zh_text
+    source_is_cjk = contains_cjk(source_text) and len(source_text.split()) <= 1
+    source_char_limit = zh_max_chars if source_is_cjk else max_chars
+    source_joiner = "" if source_is_cjk else " "
+    max_available_chunks = max(
+        len(en_text.split()),
+        len(zh_text),
+        len(source_text) if source_is_cjk else len(source_text.split()),
+        1,
+    )
+    chunk_count = max(
+        1,
+        math.ceil(duration / max_duration),
+        track_chunk_count(en_text, max_words, max_chars, is_cjk=False),
+        track_chunk_count(zh_text, max_words, zh_max_chars, is_cjk=True),
+        track_chunk_count(source_text, max_words, source_char_limit, is_cjk=source_is_cjk),
+    )
+
+    while True:
+        en_chunks = split_text_balanced(en_text, chunk_count, joiner=" ") if en_text else [""] * chunk_count
+        zh_chunks = split_text_balanced(zh_text, chunk_count, joiner="") if zh_text else [""] * chunk_count
+        en_chunks += [""] * (chunk_count - len(en_chunks))
+        zh_chunks += [""] * (chunk_count - len(zh_chunks))
+        if source_is_en:
+            text_chunks = en_chunks
+        elif source_is_zh:
+            text_chunks = zh_chunks
+        else:
+            text_chunks = split_text_balanced(source_text, chunk_count, joiner=source_joiner)
+            text_chunks += [""] * (chunk_count - len(text_chunks))
+        limits_ok = all(
+            (not chunk or (len(chunk) <= max_chars and len(chunk.split()) <= max_words))
+            for chunk in en_chunks
+        ) and all(not chunk or len(chunk) <= zh_max_chars for chunk in zh_chunks) and all(
+            not chunk
+            or (
+                len(chunk) <= source_char_limit
+                and (source_is_cjk or len(chunk.split()) <= max_words)
+            )
+            for chunk in text_chunks
+        )
+        if limits_ok or chunk_count >= max_available_chunks:
+            break
+        chunk_count += 1
+
+    metadata = {
+        key: value
+        for key, value in segment.items()
+        if key not in {"id", "start", "end", "text", "en", "zh", "words", "display_start", "display_end"}
+    }
+    output: List[Segment] = []
+    for index in range(chunk_count):
+        piece_start = start + duration * index / chunk_count
+        piece_end = end if index == chunk_count - 1 else start + duration * (index + 1) / chunk_count
+        piece_en = en_chunks[index]
+        piece_zh = zh_chunks[index]
+        piece_text = text_chunks[index] or piece_en or piece_zh
+        if not piece_text and not piece_en and not piece_zh:
+            continue
+        output.append(
+            {
+                **metadata,
+                "id": len(output),
+                "start": piece_start,
+                "end": piece_end,
+                "text": piece_text,
+                "en": piece_en,
+                "zh": piece_zh,
+            }
+        )
+    return output
 
 
 def split_segment_by_words(segment: Segment, max_words: int, max_chars: int, max_duration: float) -> List[Segment]:
@@ -1065,28 +1198,33 @@ def split_segment_by_text(segment: Segment, max_words: int, max_chars: int, max_
 
 def split_segments_for_subtitles(
     segments: List[Segment],
-    max_words: int = 14,
-    max_chars: int = 82,
-    max_duration: float = 6.0,
+    max_words: int = 12,
+    max_chars: int = 56,
+    max_duration: float = 5.5,
 ) -> List[Segment]:
     output: List[Segment] = []
 
     for segment in segments:
         text = clean_subtitle_text(segment.get("text", ""))
-        if not text:
+        en_text = clean_english_track_text(str(segment.get("en") or ""))
+        zh_text = to_simplified_text(clean_subtitle_text(str(segment.get("zh") or "")))
+        if not text and not en_text and not zh_text:
             continue
-        segment = {**segment, "text": text}
-        duration = float(segment["end"]) - float(segment["start"])
-        needs_split = duration > max_duration or len(text) > max_chars or len(text.split()) > max_words
-
-        if not needs_split:
-            pieces = [segment]
-        elif segment.get("words"):
-            pieces = split_segment_by_words(segment, max_words, max_chars, max_duration)
-            if not pieces:
-                pieces = split_segment_by_text(segment, max_words, max_chars, max_duration)
+        segment = {**segment, "text": text or en_text or zh_text}
+        if "en" in segment or "zh" in segment:
+            pieces = split_bilingual_segment(segment, max_words, max_chars, max_duration)
         else:
-            pieces = split_segment_by_text(segment, max_words, max_chars, max_duration)
+            duration = float(segment["end"]) - float(segment["start"])
+            needs_split = duration > max_duration or len(text) > max_chars or len(text.split()) > max_words
+
+            if not needs_split:
+                pieces = [segment]
+            elif segment.get("words"):
+                pieces = split_segment_by_words(segment, max_words, max_chars, max_duration)
+                if not pieces:
+                    pieces = split_segment_by_text(segment, max_words, max_chars, max_duration)
+            else:
+                pieces = split_segment_by_text(segment, max_words, max_chars, max_duration)
 
         for piece in pieces:
             if float(piece["end"]) <= float(piece["start"]):
@@ -1096,6 +1234,26 @@ def split_segments_for_subtitles(
 
     print(f"Prepared {len(output)} subtitle events from {len(segments)} source segments.")
     return output
+
+
+def prepare_segments_for_output(
+    segments: List[Segment],
+    max_words: int,
+    max_chars: int,
+    max_duration: float,
+) -> List[Segment]:
+    visible: List[Segment] = []
+    for segment in segments:
+        if segment.get("display", True) is False:
+            continue
+        item = dict(segment)
+        item["start"] = float(item.get("display_start", item["start"]))
+        item["end"] = float(item.get("display_end", item["end"]))
+        item.pop("display_start", None)
+        item.pop("display_end", None)
+        if item["end"] > item["start"]:
+            visible.append(item)
+    return split_segments_for_subtitles(visible, max_words, max_chars, max_duration)
 
 
 def apply_timing_sanity_rules(segments: List[Segment], max_duration: float = 6.0) -> List[Segment]:
@@ -1151,15 +1309,6 @@ def parse_display_flag(value: Any) -> bool:
     return True
 
 
-def parse_display_time(value: Any) -> Optional[float]:
-    if value in (None, ""):
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
 def apply_display_timing(
     segment: Segment,
     item: Dict[str, Any],
@@ -1169,41 +1318,16 @@ def apply_display_timing(
     output = dict(segment)
     display = parse_display_flag(item.get("display", item.get("show", item.get("keep", True))))
     output["display"] = display
-    if not display:
-        output.pop("display_start", None)
-        output.pop("display_end", None)
-        return output
-
-    display_start = parse_display_time(item.get("display_start"))
-    display_end = parse_display_time(item.get("display_end"))
-    if display_start is None:
-        display_start = parse_display_time(item.get("start"))
-    if display_end is None:
-        display_end = parse_display_time(item.get("end"))
-
-    if display_start is None:
-        display_start = float(segment["start"])
-    if display_end is None:
-        display_end = float(segment["end"])
-
-    display_start = max(context_start, min(context_end, display_start))
-    display_end = max(context_start, min(context_end, display_end))
-    if display_end <= display_start:
-        display_start = float(segment["start"])
-        display_end = float(segment["end"])
-
-    if abs(display_start - float(segment["start"])) > 0.02:
-        output["display_start"] = display_start
-    else:
-        output.pop("display_start", None)
-    if abs(display_end - float(segment["end"])) > 0.02:
-        output["display_end"] = display_end
-    else:
-        output.pop("display_end", None)
+    output.pop("display_start", None)
+    output.pop("display_end", None)
     return output
 
 
-def extend_display_over_hidden_segments(segments: List[Segment], max_gap: float = 2.0) -> None:
+def extend_display_over_hidden_segments(
+    segments: List[Segment],
+    max_gap: float = 2.0,
+    max_duration: float = 6.0,
+) -> None:
     last_visible: Optional[Segment] = None
     for segment in segments:
         if segment.get("display", True) is False:
@@ -1211,9 +1335,23 @@ def extend_display_over_hidden_segments(segments: List[Segment], max_gap: float 
                 visible_end = float(last_visible.get("display_end", last_visible["end"]))
                 gap = float(segment["start"]) - visible_end
                 if gap <= max_gap:
-                    last_visible["display_end"] = max(visible_end, float(segment["end"]))
+                    latest_end = float(last_visible.get("display_start", last_visible["start"])) + max_duration
+                    extended_end = min(float(segment["end"]), latest_end)
+                    if extended_end > visible_end:
+                        last_visible["display_end"] = extended_end
             continue
         last_visible = segment
+
+
+def sanitize_checkpoint_display_timing(segments: List[Segment]) -> List[Segment]:
+    sanitized: List[Segment] = []
+    for segment in segments:
+        item = dict(segment)
+        item.pop("display_start", None)
+        item.pop("display_end", None)
+        sanitized.append(item)
+    extend_display_over_hidden_segments(sanitized)
+    return sanitized
 
 
 def is_language_valid(original_text: str, corrected: str, translated: str) -> bool:
@@ -1270,9 +1408,7 @@ Schema:
     "index": 0,
     "corrected_english": "...",
     "corrected_chinese": "...",
-    "display": true,
-    "display_start": 12.34,
-    "display_end": 15.67
+    "display": true
   }}
 ]
 
@@ -1287,8 +1423,7 @@ Rules:
 - If English contains SDH/non-speech cues such as music, applause, laughter, or speaker labels and the Chinese line lacks that information, add only that missing cue in concise Simplified Chinese.
 - You MUST translate uppercase descriptive text in parentheses or brackets (e.g. "(SIGHS)" or "[MUSIC]") into Simplified Chinese.
 - Keep names and recurring terminology consistent across the context. Do not translate a name in one line and leave the same name untranslated in another unless the context clearly requires it.
-- set display_start/display_end to cover the full subtitle span when it is clear from TARGET or nearby context.
-- display_start/display_end must be seconds and must stay within this context window: {context_start:.2f} to {context_end:.2f}.
+- Never output or change timestamps. Timing is enforced by the subtitle pipeline.
 - Keep corrected_english empty only when no English source exists or when the original English text contains no useful translatable English.
 - Do not output previous or following context lines.
 - Do not add explanations, markdown, notes, or extra keys.
@@ -1319,16 +1454,13 @@ Schema:
     "index": 0,
     "corrected_text": "...",
     "chinese_translation": "...",
-    "display": true,
-    "display_start": 12.34,
-    "display_end": 15.67
+    "display": true
   }}
 ]
 
 Rules:
 - One input line must still produce one output object for checkpointing.
-- set display_start/display_end to cover the full spoken span when it is clear from TARGET or nearby context.
-- display_start/display_end must be seconds and must stay within this context window: {context_start:.2f} to {context_end:.2f}.
+- Never output or change timestamps. Timing is enforced by the subtitle pipeline.
 - Do not output previous or following context lines.
 - Do not add explanations, markdown, notes, or extra keys.
 - Correct obvious ASR/OCR/subtitle errors in the source text before translating.
@@ -1385,7 +1517,7 @@ def translate_and_correct_segments(
                 and len(cached) <= len(segments)
                 and checkpoint_matches_segments(cached, segments, expected_mode="translate")
             ):
-                processed_segments = cached
+                processed_segments = sanitize_checkpoint_display_timing(cached)
                 print(f"Resuming from checkpoint with {len(processed_segments)} completed segments.")
             else:
                 print(f"Ignoring checkpoint because it does not match the current subtitle segmentation.")
@@ -1431,17 +1563,15 @@ Schema:
     "index": 0,
     "corrected_text": "...",
     "chinese_translation": "...",
-    "display": true,
-    "display_start": 12.34,
-    "display_end": 15.67
+    "display": true
   }}
 ]
 
 Rules:
 - One input line must still produce one output object for checkpointing.
-- If adjacent TARGET lines are ASR repetitions or overlapping fragments of the same spoken sentence, keep the best complete subtitle on one object and set redundant objects to "display": false.
-- For the kept object, use corrected_text and chinese_translation for the complete sentence, and set display_start/display_end to cover the full spoken span when it is clear from TARGET or nearby context.
-- display_start/display_end must be seconds and must stay within this context window: {context_start:.2f} to {context_end:.2f}.
+- If adjacent TARGET lines are ASR repetitions or overlapping fragments of the same spoken sentence, keep the earliest suitable object visible and set only later redundant objects to "display": false.
+- For the kept object, use corrected_text and chinese_translation for the complete sentence.
+- Never output or change timestamps. Timing is enforced by the subtitle pipeline.
 - If a TARGET line only repeats or continues a sentence already clearly represented in PREVIOUS CONTEXT, set "display": false.
 - If two TARGET lines are genuine consecutive new information, keep both visible.
 - Do not output previous or following context lines.
@@ -1583,7 +1713,7 @@ def proofread_existing_chinese_segments(
                 and len(cached) <= len(segments)
                 and checkpoint_matches_segments(cached, segments, expected_mode="proofread_existing_chinese")
             ):
-                processed_segments = to_simplified_segments(cached)
+                processed_segments = sanitize_checkpoint_display_timing(to_simplified_segments(cached))
                 print(f"Resuming from checkpoint with {len(processed_segments)} completed segments.")
             else:
                 print("Ignoring checkpoint because it does not match the current subtitle segmentation.")
@@ -1629,9 +1759,7 @@ Schema:
     "index": 0,
     "corrected_english": "...",
     "corrected_chinese": "...",
-    "display": true,
-    "display_start": 12.34,
-    "display_end": 15.67
+    "display": true
   }}
 ]
 
@@ -1646,9 +1774,8 @@ Rules:
 - If English contains SDH/non-speech cues such as music, applause, laughter, or speaker labels and the Chinese line lacks that information, add only that missing cue in concise Simplified Chinese.
 - You MUST translate uppercase descriptive text in parentheses or brackets (e.g. "(SIGHS)" or "[MUSIC]") into Simplified Chinese.
 - Keep names and recurring terminology consistent across the context. Do not translate a name in one line and leave the same name untranslated in another unless the context clearly requires it.
-- If adjacent TARGET lines are repeated, overlapping, or fragments of the same subtitle, keep the best complete subtitle on one object and set redundant objects to "display": false.
-- For the kept object, set display_start/display_end to cover the full subtitle span when it is clear from TARGET or nearby context.
-- display_start/display_end must be seconds and must stay within this context window: {context_start:.2f} to {context_end:.2f}.
+- If adjacent TARGET lines are repeated, overlapping, or fragments of the same subtitle, keep the earliest suitable object visible and set only later redundant objects to "display": false.
+- Never output or change timestamps. Timing is enforced by the subtitle pipeline.
 - Keep corrected_english empty only when no English source exists or when the original English text contains no useful translatable English.
 - Do not output previous or following context lines.
 - Do not add explanations, markdown, notes, or extra keys.
@@ -1929,9 +2056,9 @@ def main() -> None:
     parser.add_argument("--llm-model", type=str, default="qwen3:14b", help="Ollama model name")
     parser.add_argument("--batch-size", type=int, default=5, help="LLM batch size in subtitle sentence units.")
     parser.add_argument("--context-lines", type=int, default=30, help="Reference this many subtitle lines before and after each target batch.")
-    parser.add_argument("--max-words", type=int, default=14, help="Maximum English words per subtitle event")
-    parser.add_argument("--max-chars", type=int, default=82, help="Maximum English characters per subtitle event")
-    parser.add_argument("--max-duration", type=float, default=6.0, help="Maximum seconds per subtitle event before splitting")
+    parser.add_argument("--max-words", type=int, default=12, help="Maximum English words per subtitle event")
+    parser.add_argument("--max-chars", type=int, default=56, help="Maximum English characters per subtitle event")
+    parser.add_argument("--max-duration", type=float, default=5.5, help="Maximum seconds per subtitle event before splitting")
     args = parser.parse_args()
 
     input_path = Path(args.video)
@@ -1949,17 +2076,20 @@ def main() -> None:
 
     output_root = Path(args.output_root) if args.output_root else default_output_root()
     out_dir = output_root / series_name / movie_name
+    out_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = out_dir / f"{movie_name}.segments.checkpoint.json"
     source_segments_path = out_dir / f"{movie_name}.segments.source.json"
 
     sidecar_path = Path(args.subtitle_file or args.srt) if (args.subtitle_file or args.srt) else None
     chinese_sidecar_path = Path(args.chinese_subtitle_file) if args.chinese_subtitle_file else None
     english_sidecar_path = Path(args.english_subtitle_file) if args.english_subtitle_file else None
+    if sidecar_path is None:
+        sidecar_path = english_sidecar_path or chinese_sidecar_path
     merge_existing_subtitles = args.merge_existing_subtitles == "yes"
     if args.source in ("auto", "sidecar", "srt") and not sidecar_path:
         sidecar_path = find_sidecar_subtitle(video_path, input_path)
 
-    temp_audio = video_path.with_suffix(".wav")
+    temp_audio = out_dir / f".{movie_name}.subtitle-audio.{os.getpid()}.wav"
     try:
         actual_source = args.source
         source_language = args.source_language
@@ -1968,7 +2098,12 @@ def main() -> None:
         if source_segments_path.exists():
             try:
                 cached_segments = load_cached_source_segments(source_segments_path)
-                if source_cache_matches_requested_language(cached_segments, args.source_language, args.asr_language):
+                if not source_cache_uses_current_timing_policy(cached_segments):
+                    print(
+                        "Ignoring legacy merged-subtitle source cache because it predates the current "
+                        f"timing-anchor policy: {source_segments_path}"
+                    )
+                elif source_cache_matches_requested_language(cached_segments, args.source_language, args.asr_language):
                     subtitle_segments = cached_segments
                     actual_source = "cached source segments"
                     source_language = infer_source_language_from_segments(subtitle_segments, source_language)
@@ -2027,9 +2162,14 @@ def main() -> None:
                 elif args.source in ("auto", "embedded"):
                     try:
                         actual_source = "embedded"
+                        fallback_stream_index = args.subtitle_stream
+                        if fallback_stream_index is None:
+                            fallback_stream_index = args.english_subtitle_stream
+                        if fallback_stream_index is None:
+                            fallback_stream_index = args.chinese_subtitle_stream
                         source_segments = load_embedded_subtitle_events(
                             video_path,
-                            stream_index=args.subtitle_stream,
+                            stream_index=fallback_stream_index,
                             source_language=args.source_language,
                             out_dir=out_dir,
                             args=args,
@@ -2053,14 +2193,18 @@ def main() -> None:
                     if source_language == "auto":
                         source_language = infer_source_language_from_segments(source_segments, asr_language)
 
-                subtitle_segments = split_segments_for_subtitles(
-                    source_segments,
-                    max_words=args.max_words,
-                    max_chars=args.max_chars,
-                    max_duration=args.max_duration,
-                )
-                subtitle_segments = apply_timing_sanity_rules(subtitle_segments, max_duration=args.max_duration)
-            write_json_atomic(source_segments_path, subtitle_segments)
+                subtitle_segments = source_segments
+
+        subtitle_segments = split_segments_for_subtitles(
+            subtitle_segments,
+            max_words=args.max_words,
+            max_chars=args.max_chars,
+            max_duration=args.max_duration,
+        )
+        subtitle_segments = apply_timing_sanity_rules(subtitle_segments, max_duration=args.max_duration)
+        for segment in subtitle_segments:
+            segment["source_cache_version"] = SOURCE_CACHE_VERSION
+        write_json_atomic(source_segments_path, subtitle_segments)
 
         print(f"Actual subtitle source: {actual_source}")
         print_timing_report(subtitle_segments)
@@ -2083,20 +2227,29 @@ def main() -> None:
                 checkpoint_path=checkpoint_path,
             )
 
+        output_segments = prepare_segments_for_output(
+            processed_segments,
+            max_words=args.max_words,
+            max_chars=args.max_chars,
+            max_duration=args.max_duration,
+        )
         en_ass = out_dir / f"{movie_name}.en.ass"
         zh_ass = out_dir / f"{movie_name}.zh.ass"
         bi_ass = out_dir / f"{movie_name}.bilingual.ass"
 
         print("Generating bilingual subtitles...", flush=True)
-        generate_ass(processed_segments, en_ass, "en")
-        generate_ass(processed_segments, zh_ass, "zh")
-        generate_ass(processed_segments, bi_ass, "bilingual")
+        generate_ass(output_segments, en_ass, "en")
+        generate_ass(output_segments, zh_ass, "zh")
+        generate_ass(output_segments, bi_ass, "bilingual")
 
-        print_timing_report(processed_segments)
+        print_timing_report(output_segments)
         print(f"Success! Subtitles saved to {out_dir}")
     finally:
         if temp_audio.exists():
-            temp_audio.unlink()
+            try:
+                temp_audio.unlink()
+            except OSError as exc:
+                print(f"Warning: could not remove temporary audio {temp_audio}: {exc}", file=sys.stderr)
 
 
 if __name__ == "__main__":

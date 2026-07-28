@@ -5,6 +5,7 @@ outputs/
 test_outputs*/
 runtime/logs/*
 runtime/scratch/*
+runtime/audits/*
 !runtime/logs/README.md
 !runtime/scratch/README.md
 

@@ -4,6 +4,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -26,6 +27,7 @@ DEFAULT_OUTPUT_ROOT = MOVIE_ROOT / ("1 " + "\u5b57\u5e55")
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m2ts", ".ts", ".mov", ".wmv"}
 SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt"}
 RUNS: Dict[int, Dict[str, Any]] = {}
+RUNS_LOCK = threading.Lock()
 NAME_CACHE: Dict[str, Dict[str, str]] = {}
 
 
@@ -363,8 +365,8 @@ def checkpoint_info(output_root: Path, series_name: str, movie_name: str) -> Dic
 def summarize_segment(item: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "id": item.get("id"),
-        "start": item.get("display_start", item.get("start")),
-        "end": item.get("display_end", item.get("end")),
+        "start": item.get("start"),
+        "end": item.get("end"),
         "text": item.get("text"),
         "en": item.get("en"),
         "zh": item.get("zh"),
@@ -452,7 +454,7 @@ def choose_folder() -> str:
     return path
 
 
-def remove_resume_files(out_dir: Path, movie_name: str, video_path: Optional[Path] = None) -> None:
+def remove_resume_files(out_dir: Path, movie_name: str) -> None:
     names = [
         f"{movie_name}.segments.checkpoint.json",
         f"{movie_name}.segments.source.json",
@@ -470,9 +472,11 @@ def remove_resume_files(out_dir: Path, movie_name: str, video_path: Optional[Pat
     if embedded_dir.exists():
         shutil.rmtree(embedded_dir, ignore_errors=True)
         
-    if video_path:
-        temp_audio = video_path.with_suffix(".wav")
-        if temp_audio.exists():
+    if out_dir.exists():
+        prefix = f".{movie_name}.subtitle-audio."
+        for temp_audio in out_dir.iterdir():
+            if not temp_audio.is_file() or not temp_audio.name.startswith(prefix) or temp_audio.suffix.lower() != ".wav":
+                continue
             try:
                 temp_audio.unlink()
             except OSError:
@@ -505,19 +509,14 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
     subtitle_ocr_lang = payload.get("subtitle_ocr_lang") or "auto"
     batch_size = int(payload.get("batch_size") or 5)
     context_lines = int(payload.get("context_lines") or 30)
-    max_words = int(payload.get("max_words") or 14)
-    max_chars = int(payload.get("max_chars") or 82)
-    max_duration = float(payload.get("max_duration") or 6.0)
+    max_words = int(payload.get("max_words") or 12)
+    max_chars = int(payload.get("max_chars") or 56)
+    max_duration = float(payload.get("max_duration") or 5.5)
 
     out_dir = output_dir(output_root, series_name, movie_name)
     out_dir.mkdir(parents=True, exist_ok=True)
-    if restart:
-        remove_resume_files(out_dir, movie_name, video)
 
     log_path, err_path = frontend_log_paths(series_name, movie_name)
-    for path in (log_path, err_path):
-        if path.exists():
-            path.unlink()
 
     args = [
         sys.executable,
@@ -572,18 +571,33 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
     env["PYTHONUNBUFFERED"] = "1"
-    stdout = log_path.open("w", encoding="utf-8")
-    stderr = err_path.open("w", encoding="utf-8")
-    try:
-        process = subprocess.Popen(args, cwd=str(PROJECT_ROOT), stdout=stdout, stderr=stderr, env=env)
-    finally:
-        stdout.close()
-        stderr.close()
-    RUNS[process.pid] = {
-        "process": process,
-        "series_name": series_name,
-        "movie_name": movie_name
-    }
+    with RUNS_LOCK:
+        for pid, info in list(RUNS.items()):
+            existing = info.get("process")
+            if existing is None or existing.poll() is not None:
+                RUNS.pop(pid, None)
+                continue
+            if info.get("series_name") == series_name and info.get("movie_name") == movie_name:
+                raise RuntimeError(f"任务已在运行，PID {pid}。请先等待完成或终止现有任务。")
+
+        if restart:
+            remove_resume_files(out_dir, movie_name)
+        for path in (log_path, err_path):
+            if path.exists():
+                path.unlink()
+
+        stdout = log_path.open("w", encoding="utf-8")
+        stderr = err_path.open("w", encoding="utf-8")
+        try:
+            process = subprocess.Popen(args, cwd=str(PROJECT_ROOT), stdout=stdout, stderr=stderr, env=env)
+        finally:
+            stdout.close()
+            stderr.close()
+        RUNS[process.pid] = {
+            "process": process,
+            "series_name": series_name,
+            "movie_name": movie_name
+        }
 
     return {
         "pid": process.pid,
@@ -597,12 +611,14 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
 def stop_process_tree(pid: int) -> bool:
     if pid <= 0:
         return False
-    info = RUNS.get(pid)
+    with RUNS_LOCK:
+        info = RUNS.get(pid)
     process = info["process"] if info else None
     if not process:
         return False
     if process.poll() is not None:
-        RUNS.pop(pid, None)
+        with RUNS_LOCK:
+            RUNS.pop(pid, None)
         return False
 
     if os.name == "nt":
@@ -612,7 +628,8 @@ def stop_process_tree(pid: int) -> bool:
             stderr=subprocess.DEVNULL,
             check=False,
         )
-        RUNS.pop(pid, None)
+        with RUNS_LOCK:
+            RUNS.pop(pid, None)
         return result.returncode == 0
 
     process.terminate()
@@ -621,7 +638,8 @@ def stop_process_tree(pid: int) -> bool:
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait(timeout=10)
-    RUNS.pop(pid, None)
+    with RUNS_LOCK:
+        RUNS.pop(pid, None)
     return True
 
 
@@ -678,15 +696,17 @@ def run_status(payload: Dict[str, Any]) -> Dict[str, Any]:
     series_name = payload["series_name"]
     movie_name = payload["movie_name"]
     out_dir = output_dir(output_root, series_name, movie_name)
+    with RUNS_LOCK:
+        run_items = list(RUNS.items())
     if pid == 0:
-        for p_pid, info in RUNS.items():
+        for p_pid, info in run_items:
             if info["series_name"] == series_name and info["movie_name"] == movie_name:
                 proc = info["process"]
                 if proc.poll() is None:
                     pid = p_pid
                     break
 
-    info_proc = RUNS.get(pid)
+    info_proc = dict(run_items).get(pid)
     process = info_proc["process"] if info_proc else None
     running = process.poll() is None if process else process_is_running(pid)
     log_path, err_path = frontend_log_paths(series_name, movie_name)
@@ -738,7 +758,20 @@ def html_page() -> str:
     button.secondary { background: white; color: #1f6feb; }
     button.danger { background: #b42318; border-color: #b42318; }
     button:disabled { opacity: .55; cursor: not-allowed; }
+    [hidden] { display: none !important; }
     .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 12px; align-items: end; }
+    .workflow-grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 12px; align-items: end; }
+    .workflow-group { grid-column: span 12; border-top: 1px solid #e5e7eb; padding-top: 14px; margin-top: 2px; }
+    .workflow-group h3 { font-size: 14px; margin: 0 0 12px; color: #303842; }
+    .checkbox-control { display: flex; align-items: center; gap: 8px; min-height: 38px; margin: 0; color: #20242a; }
+    .checkbox-control input { width: auto; height: auto; }
+    .field-actions { display: flex; gap: 8px; align-items: end; }
+    .field-actions select { min-width: 0; }
+    .field-actions button { flex: 0 0 auto; white-space: nowrap; }
+    .actions-row { grid-column: span 12; display: flex; justify-content: flex-end; gap: 8px; }
+    details.advanced { grid-column: span 12; border-top: 1px solid #e5e7eb; padding-top: 12px; }
+    details.advanced summary { width: fit-content; color: #1f6feb; font-size: 13px; cursor: pointer; user-select: none; }
+    details.advanced .workflow-grid { margin-top: 12px; }
     .span-2 { grid-column: span 2; }
     .span-3 { grid-column: span 3; }
     .span-4 { grid-column: span 4; }
@@ -746,7 +779,8 @@ def html_page() -> str:
     .span-8 { grid-column: span 8; }
     .span-12 { grid-column: span 12; }
     .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
-    .stat { border: 1px solid #dde1e7; border-radius: 8px; padding: 12px; background: #fafbfc; min-height: 60px; }
+    .stat { border-right: 1px solid #e5e7eb; padding: 8px 12px; min-height: 52px; }
+    .stat:nth-child(4n) { border-right: 0; }
     .stat b { display: block; font-size: 20px; margin-top: 4px; }
     .muted { color: #66717f; font-size: 13px; }
     pre { white-space: pre-wrap; word-break: break-word; background: #111827; color: #e5e7eb; border-radius: 8px; padding: 12px; max-height: 320px; overflow: auto; }
@@ -769,8 +803,14 @@ def html_page() -> str:
     @media (max-width: 800px) {
       main { padding: 14px; }
       .grid { grid-template-columns: 1fr; }
+      .workflow-grid { grid-template-columns: 1fr; }
       .span-2, .span-3, .span-4, .span-6, .span-8, .span-12 { grid-column: span 1; }
+      .workflow-group, details.advanced, .actions-row { grid-column: span 1; }
+      .actions-row { justify-content: stretch; }
+      .actions-row button { flex: 1; }
       .stats { grid-template-columns: 1fr 1fr; }
+      .stat:nth-child(4n) { border-right: 1px solid #e5e7eb; }
+      .stat:nth-child(2n) { border-right: 0; }
     }
     .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); align-items: center; justify-content: center; z-index: 1000; }
     .modal { background: white; padding: 24px; border-radius: 8px; width: 100%; max-width: 400px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
@@ -798,29 +838,29 @@ def html_page() -> str:
 <main>
   <h1>字幕识别翻译控制台</h1>
 
-  <section>
-    <h2>输入</h2>
+  <section aria-labelledby="inputHeading">
+    <h2 id="inputHeading">输入</h2>
     <div class="grid">
       <div class="span-8">
-        <label>视频文件或蓝光文件夹</label>
+        <label for="path">视频文件或蓝光文件夹</label>
         <input id="path" placeholder="例如 E:\4杜比HDR\电影\解除好友2：暗网的磁力 ...">
       </div>
       <div class="span-2"><button class="secondary" onclick="selectFile()">选择视频</button></div>
       <div class="span-2"><button class="secondary" onclick="selectFolder()">选择文件夹</button></div>
       <div class="span-4">
-        <label>输出根目录</label>
+        <label for="outputRoot">输出根目录</label>
         <input id="outputRoot">
       </div>
       <div class="span-4">
-        <label>系列名</label>
+        <label for="seriesName">系列名</label>
         <input id="seriesName">
       </div>
       <div class="span-4">
-        <label>片名/集名</label>
+        <label for="movieName">片名/集名</label>
         <input id="movieName">
       </div>
-      <div class="span-4">
-        <label>字幕来源</label>
+      <div class="span-6">
+        <label for="source">字幕来源</label>
         <select id="source">
           <option value="auto" selected>自动：已有字幕 → 内封字幕 → 音频识别</option>
           <option value="sidecar">手动：已有字幕文件</option>
@@ -828,40 +868,8 @@ def html_page() -> str:
           <option value="audio">手动：Whisper 音频识别</option>
         </select>
       </div>
-      <div class="span-4">
-        <label>中英字幕合并</label>
-        <label style="display:flex;align-items:center;gap:8px;height:38px"><input id="mergeExistingSubtitles" type="checkbox" checked>合并已有中文字幕和英文字幕</label>
-      </div>
-      <div class="span-4" id="sidecarPathGroup">
-        <label>已有字幕文件</label>
-        <select id="sidecarPath"><option value="">自动选择</option></select>
-      </div>
-      <div class="span-4" id="chineseSidecarPathGroup">
-        <label>中文字幕文件</label>
-        <select id="chineseSidecarPath"><option value="">自动选择</option></select>
-      </div>
-      <div class="span-4" id="englishSidecarPathGroup">
-        <label>英文字幕文件</label>
-        <select id="englishSidecarPath"><option value="">可选：自动选择</option></select>
-      </div>
-      <div class="span-4" id="subtitleStreamGroup">
-        <label>视频内封字幕轨</label>
-        <select id="subtitleStream"><option value="">自动选择</option></select>
-      </div>
-      <div class="span-4" id="chineseSubtitleStreamGroup">
-        <label>内封中文字幕轨</label>
-        <select id="chineseSubtitleStream"><option value="">自动选择</option></select>
-      </div>
-      <div class="span-4" id="englishSubtitleStreamGroup">
-        <label>内封英文字幕轨</label>
-        <select id="englishSubtitleStream"><option value="">可选：自动选择</option></select>
-      </div>
-      <div class="span-4" id="audioStreamGroup">
-        <label>音频轨道</label>
-        <select id="audioStream"><option value="">自动选择</option></select>
-      </div>
-      <div class="span-2">
-        <label>源字幕语言</label>
+      <div class="span-3">
+        <label for="source_language">源字幕语言</label>
         <select id="source_language">
           <option value="auto" selected>自动</option>
           <option value="en">English</option>
@@ -873,63 +881,117 @@ def html_page() -> str:
           <option value="zh">中文</option>
         </select>
       </div>
-      <div class="span-2">
-        <label>音频识别语言</label>
-        <select id="asrLanguage">
-          <option value="source" selected>跟随源语言</option>
-          <option value="auto">自动检测</option>
-          <option value="en">English</option>
-          <option value="ja">Japanese</option>
-          <option value="ko">Korean</option>
-          <option value="fr">French</option>
-          <option value="de">German</option>
-          <option value="es">Spanish</option>
-          <option value="zh">中文</option>
-        </select>
-      </div>
-      <div class="span-2">
-        <label>图像字幕 OCR 语言</label>
-        <select id="subtitleOcrLang">
-          <option value="auto" selected>自动</option>
-          <option value="en">English</option>
-          <option value="ch">简体中文</option>
-          <option value="chinese_cht">繁体中文</option>
-          <option value="japan">Japanese</option>
-          <option value="korean">Korean</option>
-          <option value="fr">French</option>
-          <option value="german">German</option>
-        </select>
-      </div>
       <div class="span-3">
-        <label>大语言模型</label>
-        <div style="display:flex; gap:8px;">
-            <select id="llmModel">
-              <option value="qwen3:14b">[Local] qwen3:14b</option>
-            </select>
-            <button class="secondary" style="padding: 0 8px;" onclick="openRemoteModal()" title="设置远程 Ollama 服务器">⚙️</button>
+        <label for="llmModel">校对与翻译模型</label>
+        <div class="field-actions">
+          <select id="llmModel">
+            <option value="qwen3:14b">[Local] qwen3:14b</option>
+          </select>
+          <button class="secondary" onclick="openRemoteModal()" title="设置远程 Ollama 服务器">远程</button>
         </div>
       </div>
-      <div class="span-1">
-        <label>每组字幕</label>
-        <input id="batchSize" type="number" value="5" min="1" max="20">
+
+      <div class="workflow-group" id="existingSubtitleOptions" hidden>
+        <h3>已有字幕</h3>
+        <div class="workflow-grid">
+          <div class="span-4">
+            <label>中英字幕合并</label>
+            <label class="checkbox-control"><input id="mergeExistingSubtitles" type="checkbox" checked>合并中文字幕和英文字幕</label>
+          </div>
+          <div class="workflow-grid span-12" id="sidecarOptions" hidden>
+            <div class="span-4" id="sidecarPathGroup">
+              <label for="sidecarPath">已有字幕文件</label>
+              <select id="sidecarPath"><option value="">自动选择</option></select>
+            </div>
+            <div class="span-4" id="chineseSidecarPathGroup">
+              <label for="chineseSidecarPath">中文字幕文件</label>
+              <select id="chineseSidecarPath"><option value="">自动选择</option></select>
+            </div>
+            <div class="span-4" id="englishSidecarPathGroup">
+              <label for="englishSidecarPath">英文字幕文件</label>
+              <select id="englishSidecarPath"><option value="">可选：自动选择</option></select>
+            </div>
+          </div>
+          <div class="workflow-grid span-12" id="embeddedOptions" hidden>
+            <div class="span-4" id="subtitleStreamGroup">
+              <label for="subtitleStream">视频内封字幕轨</label>
+              <select id="subtitleStream"><option value="">自动选择</option></select>
+            </div>
+            <div class="span-4" id="chineseSubtitleStreamGroup">
+              <label for="chineseSubtitleStream">内封中文字幕轨</label>
+              <select id="chineseSubtitleStream"><option value="">自动选择</option></select>
+            </div>
+            <div class="span-4" id="englishSubtitleStreamGroup">
+              <label for="englishSubtitleStream">内封英文字幕轨</label>
+              <select id="englishSubtitleStream"><option value="">可选：自动选择</option></select>
+            </div>
+            <div class="span-4">
+              <label for="subtitleOcrLang">图像字幕 OCR 语言</label>
+              <select id="subtitleOcrLang">
+                <option value="auto" selected>自动</option>
+                <option value="en">English</option>
+                <option value="ch">简体中文</option>
+                <option value="chinese_cht">繁体中文</option>
+                <option value="japan">Japanese</option>
+                <option value="korean">Korean</option>
+                <option value="fr">French</option>
+                <option value="german">German</option>
+              </select>
+            </div>
+          </div>
+        </div>
       </div>
-      <div class="span-2">
-        <label>前后参考单元</label>
-        <input id="contextLines" type="number" value="30" min="0" max="100">
+
+      <div class="workflow-group" id="audioRecognitionOptions" hidden>
+        <h3>音频识别</h3>
+        <div class="workflow-grid">
+          <div class="span-4" id="audioStreamGroup">
+            <label for="audioStream">音频轨道</label>
+            <select id="audioStream"><option value="">自动选择</option></select>
+          </div>
+          <div class="span-4">
+            <label for="asrLanguage">音频识别语言</label>
+            <select id="asrLanguage">
+              <option value="source" selected>跟随源语言</option>
+              <option value="auto">自动检测</option>
+              <option value="en">English</option>
+              <option value="ja">Japanese</option>
+              <option value="ko">Korean</option>
+              <option value="fr">French</option>
+              <option value="de">German</option>
+              <option value="es">Spanish</option>
+              <option value="zh">中文</option>
+            </select>
+          </div>
+        </div>
       </div>
-      <div class="span-2">
-        <label>最大词数</label>
-        <input id="maxWords" type="number" value="14" min="4" max="40">
-      </div>
-      <div class="span-2">
-        <label>最大字符</label>
-        <input id="maxChars" type="number" value="82" min="20" max="160">
-      </div>
-      <div class="span-2">
-        <label>最长秒数</label>
-        <input id="maxDuration" type="number" value="6" min="1" max="20" step="0.5">
-      </div>
-      <div class="span-2"><button id="analyzeBtn" onclick="analyze()">分析</button></div>
+
+      <details class="advanced" id="advancedSettings">
+        <summary>高级设置</summary>
+        <div class="workflow-grid">
+          <div class="span-2">
+            <label for="batchSize">每组字幕</label>
+            <input id="batchSize" type="number" value="5" min="1" max="20">
+          </div>
+          <div class="span-2">
+            <label for="contextLines">前后参考单元</label>
+            <input id="contextLines" type="number" value="30" min="0" max="100">
+          </div>
+          <div class="span-2">
+            <label for="maxWords">最大词数</label>
+            <input id="maxWords" type="number" value="12" min="4" max="40">
+          </div>
+          <div class="span-2">
+            <label for="maxChars">最大字符</label>
+            <input id="maxChars" type="number" value="56" min="20" max="160">
+          </div>
+          <div class="span-2">
+            <label for="maxDuration">最长秒数</label>
+            <input id="maxDuration" type="number" value="5.5" min="1" max="20" step="0.5">
+          </div>
+        </div>
+      </details>
+      <div class="actions-row"><button id="analyzeBtn" onclick="analyze()">分析视频</button></div>
     </div>
   </section>
 
@@ -950,8 +1012,8 @@ def html_page() -> str:
         <label><input type="radio" name="runMode" value="resume" checked>从中断继续</label>
         <label><input type="radio" name="runMode" value="restart">从头开始</label>
       </div>
-      <button onclick="startRun()">运行程序</button>
-      <button class="danger" onclick="stopRun()">终止运行</button>
+      <button id="runBtn" onclick="startRun()">运行程序</button>
+      <button id="stopBtn" class="danger" onclick="stopRun()" disabled>终止运行</button>
       <button class="secondary" onclick="refreshStatus()">刷新状态</button>
     </div>
   </section>
@@ -983,6 +1045,7 @@ def html_page() -> str:
 <script>
 const FORM_STORAGE_KEY = 'subtitleFormState';
 const ANALYSIS_STORAGE_KEY = 'subtitleLastAnalysis';
+const DISPLAY_LIMITS_VERSION_KEY = 'subtitleDisplayLimitsVersion';
 const state = { pid: 0, lastAnalysis: null, analyzing: false };
 document.getElementById('outputRoot').value = String.raw`__DEFAULT_OUTPUT_ROOT__`;
 
@@ -1028,31 +1091,69 @@ function setSelectedPath(path) {
   input.value = path;
 }
 
+function activeSourceMode() {
+  const selected = document.getElementById('source').value;
+  if (selected !== 'auto') return selected;
+  const analysis = getMatchingAnalysis();
+  return analysis?.auto_source || 'auto';
+}
+
+function setHidden(id, hidden) {
+  const element = document.getElementById(id);
+  if (element) element.hidden = hidden;
+}
+
+function updateWorkflowVisibility() {
+  const mode = activeSourceMode();
+  const usesSidecar = mode === 'sidecar';
+  const usesEmbedded = mode === 'embedded';
+  const usesAudio = mode === 'audio';
+  const usesExisting = usesSidecar || usesEmbedded;
+  const merge = document.getElementById('mergeExistingSubtitles').checked;
+
+  setHidden('existingSubtitleOptions', !usesExisting);
+  setHidden('sidecarOptions', !usesSidecar);
+  setHidden('embeddedOptions', !usesEmbedded);
+  setHidden('audioRecognitionOptions', !usesAudio);
+  setHidden('sidecarPathGroup', !usesSidecar || merge);
+  setHidden('chineseSidecarPathGroup', !usesSidecar || !merge);
+  setHidden('englishSidecarPathGroup', !usesSidecar || !merge);
+  setHidden('subtitleStreamGroup', !usesEmbedded || merge);
+  setHidden('chineseSubtitleStreamGroup', !usesEmbedded || !merge);
+  setHidden('englishSubtitleStreamGroup', !usesEmbedded || !merge);
+}
+
 function payload() {
   const sourceLanguage = document.getElementById('source_language').value;
+  const source = document.getElementById('source').value;
+  const mode = activeSourceMode();
+  const usesSidecar = mode === 'sidecar';
+  const usesEmbedded = mode === 'embedded';
+  const usesAudio = mode === 'audio';
+  const mergeExisting = source !== 'audio' && document.getElementById('mergeExistingSubtitles').checked;
   return {
     path: document.getElementById('path').value,
     output_root: document.getElementById('outputRoot').value,
     series_name: document.getElementById('seriesName').value,
     movie_name: document.getElementById('movieName').value,
-    source: document.getElementById('source').value,
-    subtitle_file: document.getElementById('sidecarPath').value,
-    merge_existing_subtitles: document.getElementById('mergeExistingSubtitles').checked,
-    chinese_subtitle_file: document.getElementById('chineseSidecarPath').value,
-    english_subtitle_file: document.getElementById('englishSidecarPath').value,
-    subtitle_stream: document.getElementById('subtitleStream').value,
-    chinese_subtitle_stream: document.getElementById('chineseSubtitleStream').value,
-    english_subtitle_stream: document.getElementById('englishSubtitleStream').value,
-    audio_stream: document.getElementById('audioStream').value,
+    source,
+    subtitle_file: usesSidecar && !mergeExisting ? document.getElementById('sidecarPath').value : '',
+    merge_existing_subtitles: mergeExisting,
+    chinese_subtitle_file: usesSidecar && mergeExisting ? document.getElementById('chineseSidecarPath').value : '',
+    english_subtitle_file: usesSidecar && mergeExisting ? document.getElementById('englishSidecarPath').value : '',
+    subtitle_stream: usesEmbedded && !mergeExisting ? document.getElementById('subtitleStream').value : '',
+    chinese_subtitle_stream: usesEmbedded && mergeExisting ? document.getElementById('chineseSubtitleStream').value : '',
+    english_subtitle_stream: usesEmbedded && mergeExisting ? document.getElementById('englishSubtitleStream').value : '',
+    audio_stream: usesAudio ? document.getElementById('audioStream').value : '',
     source_language: sourceLanguage,
-    asr_language: resolveAsrLanguageForPayload(),
-    subtitle_ocr_lang: document.getElementById('subtitleOcrLang').value,
+    asr_language: source === 'auto' || usesAudio ? resolveAsrLanguageForPayload() : 'auto',
+    subtitle_ocr_lang: source === 'auto' || usesEmbedded ? document.getElementById('subtitleOcrLang').value : 'auto',
     llm_model: document.getElementById('llmModel').value,
     batch_size: Number(document.getElementById('batchSize').value || 5),
     context_lines: Number(document.getElementById('contextLines').value || 30),
-    max_words: Number(document.getElementById('maxWords').value || 14),
-    max_chars: Number(document.getElementById('maxChars').value || 82),
-    max_duration: Number(document.getElementById('maxDuration').value || 6)
+    max_words: Number(document.getElementById('maxWords').value || 12),
+    max_chars: Number(document.getElementById('maxChars').value || 56),
+    max_duration: Number(document.getElementById('maxDuration').value || 5.5)
   };
 }
 
@@ -1089,6 +1190,9 @@ async function analyze() {
 }
 
 async function startRun() {
+  const runBtn = document.getElementById('runBtn');
+  if (state.pid) return;
+  runBtn.disabled = true;
   try {
     const base = payload();
     base.restart = document.querySelector('input[name="runMode"]:checked').value === 'restart';
@@ -1101,6 +1205,7 @@ async function startRun() {
     setTimeout(refreshStatus, 1500);
   } catch (e) {
     document.getElementById('log').textContent = `启动失败: ${e.message}`;
+    runBtn.disabled = false;
   }
 }
 
@@ -1235,6 +1340,8 @@ function render(data) {
   document.getElementById('totalCount').textContent = data.total_count ?? '未知';
   document.getElementById('completedCount').textContent = data.completed_count ?? 0;
   document.getElementById('runningState').textContent = data.running ? '运行中' : '未运行';
+  document.getElementById('runBtn').disabled = Boolean(data.running);
+  document.getElementById('stopBtn').disabled = !data.running;
   document.getElementById('sidecarState').textContent = data.has_sidecar_subtitles === undefined ? '未知' : (data.has_sidecar_subtitles ? `${(data.sidecar_subtitles || []).length} 个` : '无');
   const embeddedItems = (data.embedded_subtitles || []).filter(item => !item.error);
   document.getElementById('embeddedState').textContent = data.has_embedded_subtitles === undefined ? '未知' : (data.has_embedded_subtitles ? `${embeddedItems.length} 条轨道` : '无');
@@ -1278,6 +1385,7 @@ function render(data) {
     return `<tr><td>${escapeHtml(item.id)}</td><td>${escapeHtml(time)}</td><td>${escapeHtml(previewEnglishText(item))}</td><td>${escapeHtml(item.zh || '')}</td></tr>`;
   }).join('');
   document.getElementById('preview').innerHTML = rows || '<tr><td colspan="4" class="muted">暂无 checkpoint 内容</td></tr>';
+  updateWorkflowVisibility();
 }
 
 function updateSidecarOptions(items) {
@@ -1515,13 +1623,30 @@ function migrateRecognitionLanguageState() {
   }
 }
 
+function migrateDisplayLimitDefaults() {
+  if (Number(localStorage.getItem(DISPLAY_LIMITS_VERSION_KEY) || 0) >= 2) return;
+  const maxWords = document.getElementById('maxWords');
+  const maxChars = document.getElementById('maxChars');
+  const maxDuration = document.getElementById('maxDuration');
+  if (maxWords.value === '14') maxWords.value = '12';
+  if (maxChars.value === '82') maxChars.value = '56';
+  if (maxDuration.value === '6') maxDuration.value = '5.5';
+  localStorage.setItem(DISPLAY_LIMITS_VERSION_KEY, '2');
+  saveFormState();
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   restoreFormState();
   migrateRecognitionLanguageState();
+  migrateDisplayLimitDefaults();
+  const source = document.getElementById('source');
+  source.addEventListener('change', updateWorkflowVisibility);
+  document.getElementById('mergeExistingSubtitles').addEventListener('change', updateWorkflowVisibility);
   document.getElementById('source_language')?.addEventListener('change', () => {
     migrateRecognitionLanguageState();
     saveFormState();
   });
+  updateWorkflowVisibility();
   checkRemoteStatus();
 });
 document.addEventListener('input', saveFormState);

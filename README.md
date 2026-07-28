@@ -4,7 +4,9 @@
 
 ## 界面预览
 
-![控制台界面](docs/images/screenshot.jpg)
+![控制台自动模式](docs/images/frontend-current.png)
+
+![已有字幕双轨选择](docs/images/frontend-sidecar-merge.png)
 
 ## 目录结构
 
@@ -44,17 +46,17 @@ http://127.0.0.1:8765
 手动启动：
 
 ```powershell
-cd /d "E:\4杜比HDR\电影\字幕抽取识别"
+cd /d "E:\6_Engineering_Projects\bilingual-subtitle-pipeline"
 python .\src\subtitle_frontend.py --host 127.0.0.1 --port 8765
 ```
 
 前端流程：
 
 1. 选择视频文件或蓝光文件夹。
-2. 点击“分析”，页面会显示主视频、是否找到已有字幕、是否有内封字幕、内封字幕轨道列表、自动来源判断、checkpoint 和已完成数量。
-3. 选择字幕来源：自动、已有字幕文件、视频内封字幕或 Whisper 音频识别。
-4. 如果手动选择已有字幕或内封字幕，可以从分析结果中选择具体字幕文件或字幕轨道。
-5. 选择源字幕语言、音频识别语言、图像字幕 OCR 语言。
+2. 选择字幕来源：自动、已有字幕文件、视频内封字幕或 Whisper 音频识别。
+3. 页面只展开当前来源需要的选项；中英双轨选择、OCR 和音频识别设置不会同时平铺。
+4. 点击“分析视频”，页面会显示主视频、已有/内封字幕、自动来源判断、checkpoint 和已完成数量；自动模式随后展开命中的来源选项。
+5. 按需选择具体字幕文件、字幕轨道和语言。批量、上下文与显示长度限制在“高级设置”中。
 6. 选择“从中断继续”或“从头开始”，点击“运行程序”。
 7. 需要中断时点击“终止运行”，前端会终止当前任务进程树。
 
@@ -83,7 +85,7 @@ python .\src\subtitle_frontend.py --host 127.0.0.1 --port 8765
 --subtitle-file "E:\path\movie.en.srt"  # 指定已有字幕文件
 --subtitle-stream 3                     # 指定内封字幕轨，例如 ffprobe 的 0:3
 --source-language en                    # 源字幕语言，auto/en/ja/ko/fr/de/es/zh 等
---asr-language en                       # Whisper 识别语言，auto 表示自动检测
+--asr-language source                   # Whisper 识别语言；source 表示跟随 --source-language，auto 表示自动检测
 --subtitle-ocr-lang en                  # 图像字幕 OCR 语言，auto/en/ch/chinese_cht/japan/korean 等
 ```
 
@@ -98,14 +100,15 @@ python .\src\subtitle_frontend.py --host 127.0.0.1 --port 8765
 - 每组参考前 `30` 个和后 `30` 个字幕单元。
 - 上下文只用于理解人物、代词、术语和语义连续性，不会输出到结果。
 - 组内先纠正源文，再翻译成自然的简体中文。
-- 每个输入字幕单元必须对应一个输出对象。
-- 不允许合并、拆分、重排、遗漏或新增字幕单元。
+- 每个输入字幕单元必须对应一个输出对象，保证 checkpoint 可续跑。
+- 重复或滚动片段可以保留最早完整项并把后续冗余项设为 `display=false`。
+- 模型完成后会再次按默认 12 词、56 个英文字符、28 个中文字符和 5.5 秒的上限准备 ASS 显示事件。
 
 ## 时间标签规则
 
 时间标签不交给 LLM 处理。
 
-程序只把字幕文本发给 LLM，不把 `start` / `end` 时间码放进 prompt。LLM 返回后，程序把原始时间码复制回输出字幕，并校验：
+程序会把时间码作为上下文参考，但不允许 LLM 返回或修改时间。LLM 返回后，程序继续使用源字幕时间锚，并校验：
 
 - 输出条数必须等于输入条数。
 - 每条输出的 `start` 必须等于原始 `start`。
@@ -113,6 +116,8 @@ python .\src\subtitle_frontend.py --host 127.0.0.1 --port 8765
 - 如果 checkpoint 与当前字幕切分不匹配，会忽略旧 checkpoint，避免时间轴错配。
 
 Whisper 偶发的“短文本异常长时间”会再经过兜底切分，避免一两个词挂十几秒。
+
+已有中英文字幕合并时，以英文对白轨为时间锚；没有重叠且间隔超过 0.75 秒的中英文事件不会强行配对。
 
 ## Checkpoint
 
@@ -129,6 +134,10 @@ Whisper 偶发的“短文本异常长时间”会再经过兜底切分，避免
 ```
 
 重新运行同一任务时会先校验 checkpoint 是否和当前字幕切分一致。一致才继续，不一致会忽略旧 checkpoint。
+
+旧的纯 ASR/单语 source cache 继续直接复用。旧的双语合并 source cache 因缺少新版时间锚元数据会重建一次；sidecar 只重新解析字幕文件，embedded/OCR 中间缓存仍会复用。
+
+音频抽取的临时 WAV 写在当前字幕输出目录，使用 `.subtitle-audio.<PID>.wav` 专用名称；程序不会创建、覆盖或删除视频旁边的同名 WAV。
 
 ## 示例 1：Ready Player One MKV
 
