@@ -144,6 +144,7 @@ class AssStyleTests(unittest.TestCase):
         self.assertIn("subtitle_style_profile:", page)
         self.assertIn("subtitle_font_name:", page)
         self.assertIn("subtitle_font_scale:", page)
+        self.assertIn("subtitle_font_file:", page)
 
     def test_frontend_passes_ass_appearance_to_child_process(self) -> None:
         class FakeProcess:
@@ -172,6 +173,8 @@ class AssStyleTests(unittest.TestCase):
                 "subtitle_style_profile": "mobile",
                 "subtitle_font_name": "Noto Sans CJK SC",
                 "subtitle_font_scale": 125,
+                "subtitle_font_file": str(root / "NotoSansCJKSC.ttf"),
+                "subtitle_sync": "detect",
             }
             subtitle_frontend.RUNS.clear()
             try:
@@ -191,6 +194,8 @@ class AssStyleTests(unittest.TestCase):
         self.assertEqual(args[args.index("--subtitle-style-profile") + 1], "mobile")
         self.assertEqual(args[args.index("--subtitle-font-name") + 1], "Noto Sans CJK SC")
         self.assertEqual(args[args.index("--subtitle-font-scale") + 1], "125")
+        self.assertEqual(args[args.index("--subtitle-font-file") + 1], str(root / "NotoSansCJKSC.ttf"))
+        self.assertEqual(args[args.index("--subtitle-sync") + 1], "detect")
 
 
 if __name__ == "__main__":

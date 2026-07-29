@@ -750,6 +750,8 @@ Windows 上 `SO_REUSEADDR` 还允许多个进程以不符合预期的方式尝�
 
 ## 35. 全面审查后仍需继续处理的质量和工程项
 
+> 2026-07-30 状态：本节列出的五组优先事项已按顺序实现，分别记录在问题 36-40。镜头切换吸附和具体手机播放器兼容性仍属于独立的视觉/设备验证，不混入这五项的完成标准。
+
 ### P1：已有字幕与声音的自动同步
 
 当前流程只在中英文轨之间选择时间锚点，并处理事件内部的长度、重叠和阅读速度；它没有把字幕活动与电影音频进行全局或分段对齐。因此源字幕整体晚 800 毫秒、帧率不同或中途增删片段时，Qwen 校对文本也不能修复时间轴。
@@ -792,3 +794,101 @@ ASS 使用 `PlayRes` 和相对视频画面的字号，因此播放器缩放视�
 ### P2：网页状态持久化
 
 远程配置和表单状态保存在按端口隔离的浏览器 `localStorage`。源码更新后新前端通常使用新端口，因此旧端口保存的配置不会自动出现。SSH 密钥模式只需迁移非敏感配置；密码模式若要跨端口持久化，应使用 Windows 凭据保护或明确的加密存储，不能把明文密码直接写入项目文件。
+
+## 36. 已有字幕相对声音整体延迟、漂移或中途变更
+
+### 现象与根因
+
+中英文轨配对只能解决两条字幕之间的断句和相对时间，不能证明字幕与影片声音一致。内封字幕或网络字幕可能整体提前/延后、由 23.976/25 fps 转换产生线性漂移，或因为广告、片头、导演剪辑不同而在中途改变偏移。LLM 只处理文本，不能根据时间码本身推断声音位置。
+
+### 修复
+
+- 新增 `src/subtitle_sync.py`，固定使用 `ffsubsync==0.5.1`，以所选音频的 WebRTC VAD 为基准，不把视频内另一条字幕误当作参考。
+- 启用帧率搜索和 `--split-penalty 20` 的分段偏移，可处理全局延迟、帧率漂移和中途插入/删减。
+- 启用两层低质量保护：ffsubsync 会拒绝负相关、超过 45 秒的质量候选或超过 8% 的帧率变化；流程还会拒绝事件数变化、搜索边界截断、乱序、超过 6 次的大幅分段跳变、单条时长变化超过 2 秒、非正时长和后端异常。
+- timing SRT 为每个事件写入稳定标记，ffsubsync 即使重排输出块也会按原事件 ID 映射，不把输出顺序误当作输入顺序。
+- 分段候选未通过流程质量门时再运行一次无分段的安全全局对齐。全局结果合格则报告 `aligned_global_fallback` 并使用它；仍不合格就保持原时间。
+- 前端“已有字幕”层级新增 `自动校正 / 仅检测并生成报告 / 关闭`。自动模式只在后端报告成功时应用；检测模式永远保持原时间。
+- 输出 `<片名>.subtitle-sync.report.json`，记录后端、模式、事件数、全局偏移、帧率比例、中位起点变化、P95/最大绝对变化和是否实际应用。
+- 被修改事件保留 `pre_sync_start/pre_sync_end`，source cache 记录同步后的确定性输入。同步模式进入来源请求指纹，更换模式后不会误用旧缓存。
+- 只有 sidecar/embedded 来源运行同步；Whisper ASR 已经直接由当前音频生成时间锚，不重复抽音频、识别或占用本地 GPU。
+
+同步仍不能替代镜头切换吸附。它解决的是字幕活动与语音活动的时间关系，不分析字幕是否挡住画面内容。
+
+## 37. 合法同时对白被统一重叠清理删除
+
+### 现象与根因
+
+旧的 `resolve_timeline_overlaps()` 把所有重叠都视为滚动识别碎片。前一事件被裁后不足 0.4 秒就直接删除，因此两人同时说话、对白与屏幕文字并存时会丢掉真实内容。
+
+### 修复
+
+- sidecar、embedded 及中英合并事件增加 `preserve_distinct_overlap` 来源标记，ASR 事件不带该标记。
+- 重叠处理同时比较规范化后的实际显示内容。两个已有字幕事件内容不同且都允许重叠时保留原始起止时间，由 ASS `Collisions: Normal` 负责堆叠布局。
+- 相同内容、LLM 标记隐藏的重复项、Whisper/OCR 滚动碎片仍走原有去重、裁剪和 0.4 秒闪烁保护。
+- 时间报告把重叠拆成 `intentional_overlaps` 和 `unexpected_overlaps`，合法重叠不再伪装成时间轴错误。
+- 回归测试覆盖“短碎片仍删除”和“两个不同的来源字幕同时存在且均不丢失”。
+
+## 38. 人名远距离漂移及旧 checkpoint 静默冒充新策略
+
+### 现象与根因
+
+滑动上下文只能约束附近批次。同一人物隔数百行再次出现时，早期译名已经离开上下文；切换 `qwen3:14b`/`qwen3:30b` 或升级提示词后，旧 checkpoint 又可能直接续跑，使新规则看起来没有生效。
+
+### 修复
+
+- Qwen 每个目标对象新增 `terminology` 字段，只返回本句出现的人名和复现术语。
+- 程序采用“首次批准映射优先”的片级字典；后续批次无论 `context_lines` 是否为 0，都会收到完整的 `APPROVED MOVIE-WIDE TERMINOLOGY`。
+- 每批输出还会做确定性一致性检查。源文出现已批准人名/术语但中文没有对应译名，或模型提出冲突映射时，会进入单句重试；重试后仍冲突则中断该批并保留最后一个有效 checkpoint。
+- 片级状态随每个 checkpoint 批次写入段落元数据，并独立输出 `<片名>.terminology.json`；断点恢复时从已验证的 checkpoint 重建，不读取来源不匹配的陈旧词表。
+- 每个 checkpoint 段落记录 `llm_model`、`processing_policy_version` 和 `terminology_policy_version`。
+- checkpoint 校验新增模型与策略版本。任一不匹配就从现有 source cache 重新校对，不重新抽音频或运行 OCR/Whisper。
+- 前端分析结果显示不兼容状态，并把默认运行方式从“继续任务”切到“重新校对（保留识别）”。
+
+## 39. 手机换设备后自定义字体丢失
+
+### 现象与根因
+
+ASS 的 `PlayRes` 能让字号随视频画面缩放，但 `.ass` 只有 family name，没有字体数据。目标手机没有该字体时，播放器只能回退，中文覆盖、字重和实际宽度都可能变化。
+
+### 修复
+
+- “字幕外观”新增 TTF/OTF/TTC 文件选择，只有展开外观设置时显示。
+- 新增 `src/font_delivery.py`，使用 `fonttools` 读取字体内部首选 family name；选择文件后以内部名称生成 ASS，避免把文件名误当字体族。
+- 字体复制到输出目录 `fonts/`，原始字体文件不修改。
+- 使用现有 ffmpeg 生成 `<片名>.bilingual.mks`，其中包含双语 ASS 轨和字体 attachment；这是小型外置 Matroska 字幕包，不复制整部影片。
+- 输出 `<片名>.bilingual.font-delivery.json` 记录 ASS、字体、family name 和 MKS 路径。
+- 已用 Windows Arial 字体做真实封装验证，生成的 MKS 包含约 1 MB 字体附件。
+
+`adaptive/mobile/compact` 仍按视频画面自适应，不等同于 iOS/Android 系统动态字号。手机播放器必须支持 ASS/libass 和 Matroska 字体附件；不支持的播放器仍可能覆盖样式，需要在目标设备实测。
+
+## 40. 双入口、漂移依赖、无 CI 以及新端口丢设置
+
+### 现象与根因
+
+示例脚本仍调用旧 `subtitle_pipeline.py` 的独立翻译流程；安装脚本使用未固定版本的散落依赖；仓库没有自动测试。前端表单和远程服务器配置只存在当前端口的 `localStorage`，更新源码换端口后看起来像所有设置丢失；保存密码还会留下浏览器明文。
+
+### 修复
+
+- `src/audio_to_subtitle.py` 成为唯一正式处理入口。`scripts/run_ready_player_one.ps1` 已切换；直接运行旧入口时只保留 `--list-streams` 工具能力，其余兼容参数转发到正式入口。
+- 新增 `requirements.txt`、`requirements-ci.txt`、`requirements-dev.txt` 和 `pyproject.toml`；直接依赖固定精确版本。GPU/OCR 依赖通过 `requirements-gpu.txt` 叠加，CUDA 13 Paddle wheel 仍由专用脚本安装。
+- `pgsrip 0.1.12` 强制要求 `setuptools<71`，与当前 Python 工具链冲突，因此不再作为默认安装项；PGS 使用仓库内解析器，环境中已存在 `pgsrip` 时仍可作为兼容后端。
+- 新增 `.github/workflows/ci.yml`，在 Windows/Python 3.13 执行 Ruff、`compileall` 和完整 `unittest`。
+- 同步、字体、策略和前端设置分别拆到独立模块，减少继续扩大两个主文件的范围。
+- 新增 `%LOCALAPPDATA%\BilingualSubtitlePipeline\frontend-settings.json` 服务端设置。页面保留当前端口 `localStorage` 作为快速缓存，同时异步同步到服务端；新端口先加载服务端状态再叠加本端口状态。
+- 旧浏览器中存在明文密码时会迁移到服务端保护存储，并立刻从 `localStorage` 删除密码字段。
+- 密码只在密码认证且明确勾选时保存，使用当前 Windows 用户的 DPAPI 加密；JSON 文件只含 Base64 密文。SSH 密钥内容始终不进入浏览器或配置文件。
+- 前端只允许绑定 `localhost`、`127.0.0.1` 或 `::1`，每个请求还校验 loopback Host，降低 DNS 重绑定读取本地配置的风险。
+- 有请求体的接口只接受 `application/json` 对象并限制为 1 MiB；设置只接受受限数量的标量字段，避免跨站表单和异常大载荷滥用本地接口。
+
+## 41. Windows 短路径中的 `~` 被误当作 SSH home 展开
+
+### 现象与根因
+
+GitHub Windows Runner 的临时目录可能使用 `RUNNER~1` 这类 8.3 短路径。Paramiko 在展开 OpenSSH `IdentityFile` 时会把绝对路径中间的 `~` 也替换成用户 home，形成类似 `C:\Users\RUNNERC:\Users\runneradmin1\...` 的无效路径。该问题同样可能影响真实配置中包含短路径的密钥。
+
+### 修复
+
+- SSH config 的主机、用户、端口等继续使用 Paramiko 完整 lookup 结果。
+- 对不含 OpenSSH `%` token 的绝对 `IdentityFile`，从匹配后的未展开配置保留原路径；`~/.ssh/...` 和带 `%` token 的相对模板仍使用 Paramiko 展开结果。
+- 回归测试固定使用包含 `runner~1` 的绝对密钥路径，确保本地与 GitHub Windows Runner 行为一致。

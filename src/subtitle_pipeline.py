@@ -18,7 +18,7 @@ from typing import Any, Iterable
 
 from PIL import Image, ImageFilter
 
-from ass_styles import STYLE_PROFILE_NAMES, ass_style_header, probe_video_play_resolution
+from ass_styles import STYLE_PROFILE_NAMES, ass_style_header
 
 
 def configure_output_encoding() -> None:
@@ -1623,81 +1623,61 @@ def main() -> int:
     if not video.exists():
         raise FileNotFoundError(video)
     ffmpeg = find_ffmpeg(args.ffmpeg)
-    log(f"Using ffmpeg: {ffmpeg}")
-    streams = probe_streams(video, ffmpeg)
     if args.list_streams:
+        log(f"Using ffmpeg: {ffmpeg}")
+        streams = probe_streams(video, ffmpeg)
         print_streams(streams)
         return 0
-    en_stream, zh_stream, zh_kind = choose_streams(streams)
-    log(f"English stream: 0:{en_stream.index} {en_stream.codec} {en_stream.title}")
-    if zh_stream:
-        log(f"Chinese stream: 0:{zh_stream.index} {zh_stream.codec} {zh_stream.title} ({zh_kind})")
-    else:
-        log("Chinese stream: not found; Ollama translation will be used.")
 
-    base_dir = args.output.resolve() / safe_stem(video)
-    base_dir.mkdir(parents=True, exist_ok=True)
-
-    en_ocr_lang = "en"
-    en_events = get_stream_events(video, en_stream, ffmpeg, base_dir / "english", en_ocr_lang, args)
-    en_events = [e for e in en_events if e.text.strip()]
-    en_srt = base_dir / f"{safe_stem(video)}.en.srt"
-    write_srt(en_events, en_srt)
-    log(f"English SRT: {en_srt} ({len(en_events)} lines)")
-
-    if zh_stream:
-        if zh_kind == "zh-Hant":
-            zh_ocr_lang = "chinese_cht"
-        else:
-            zh_ocr_lang = "ch"
-        zh_events = get_stream_events(video, zh_stream, ffmpeg, base_dir / "chinese", zh_ocr_lang, args)
-        zh_events = [e for e in zh_events if e.text.strip()]
-        if zh_kind in {"zh-Hant", "zh-yue"}:
-            zh_events = convert_traditional_to_simplified(zh_events)
-        zh_srt = base_dir / f"{safe_stem(video)}.zh-Hans.srt"
-        write_srt(zh_events, zh_srt)
-        log(f"Simplified Chinese SRT: {zh_srt} ({len(zh_events)} lines)")
-    else:
-        zh_cache = base_dir / "ollama_zh_cache.json"
-        model_name = args.model
-        base_url = "http://127.0.0.1:11434"
-        if model_name.startswith("remote:"):
-            parts = model_name.split(":", 2)
-            if len(parts) == 3:
-                base_url = "http://127.0.0.1:11435"
-                model_name = parts[2]
-
-        en_events, zh_events = ollama_translate_events(
-            en_events,
-            model_name,
-            zh_cache,
-            batch_size=args.batch_size,
-            context_lines=args.context_lines,
-            base_url=base_url,
-        )
-        corrected_en_srt = base_dir / f"{safe_stem(video)}.en.corrected.srt"
-        write_srt(en_events, corrected_en_srt)
-        log(f"Corrected English SRT: {corrected_en_srt} ({len(en_events)} lines)")
-        zh_srt = base_dir / f"{safe_stem(video)}.zh-Hans.ollama.srt"
-        write_srt(zh_events, zh_srt)
-        log(f"Ollama Chinese SRT: {zh_srt} ({len(zh_events)} lines)")
-
-    pairs = pair_events(en_events, zh_events)
-    ass_path = base_dir / f"{safe_stem(video)}.bilingual.ass"
-    log("Generating bilingual subtitles...")
-    play_resolution = probe_video_play_resolution(video)
-    write_bilingual_ass(
-        pairs,
-        ass_path,
-        play_resolution=play_resolution,
-        style_profile=args.subtitle_style_profile,
-        font_name=args.subtitle_font_name,
-        font_scale=args.subtitle_font_scale,
+    log(
+        "subtitle_pipeline.py is now a compatibility entry point; "
+        "routing this run through audio_to_subtitle.py."
     )
-    matched = sum(1 for en, zh in pairs if en and zh and zh.text.strip())
-    zh_total = sum(1 for _, zh in pairs if zh and zh.text.strip())
-    log(f"Bilingual ASS: {ass_path}")
-    log(f"Matched bilingual lines: {matched}; Chinese lines included: {zh_total}")
+    forwarded = [
+        "audio_to_subtitle.py",
+        "--video",
+        str(video),
+        "--source",
+        "auto",
+        "--output-root",
+        str(args.output.resolve()),
+        "--device",
+        args.device,
+        "--llm-model",
+        args.model,
+        "--ocr-scale",
+        str(args.ocr_scale),
+        "--crop-pad",
+        str(args.crop_pad),
+        "--limit",
+        str(args.limit),
+        "--batch-size",
+        str(args.batch_size),
+        "--context-lines",
+        str(args.context_lines),
+        "--subtitle-style-profile",
+        args.subtitle_style_profile,
+        "--subtitle-font-scale",
+        str(args.subtitle_font_scale),
+    ]
+    if args.fast_ocr:
+        forwarded.append("--fast-ocr")
+    if args.subtitle_font_name:
+        forwarded.extend(["--subtitle-font-name", args.subtitle_font_name])
+    if args.ffmpeg:
+        log(
+            "The compatibility entry point ignores --ffmpeg; configure ffmpeg on PATH "
+            "when using the canonical pipeline."
+        )
+
+    from audio_to_subtitle import main as canonical_main
+
+    original_argv = sys.argv
+    try:
+        sys.argv = forwarded
+        canonical_main()
+    finally:
+        sys.argv = original_argv
     return 0
 
 

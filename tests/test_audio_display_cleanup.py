@@ -261,6 +261,63 @@ class DisplayCleanupTests(unittest.TestCase):
 
         self.assertFalse(checkpoint_matches_segments(old_checkpoint, source))
 
+    def test_checkpoint_rejects_different_model_or_policy(self) -> None:
+        source = [{"id": 0, "start": 1.0, "end": 2.0, "text": "same text"}]
+        cached = [
+            {
+                **source[0],
+                "display": True,
+                "processing_mode": "translate",
+                "processing_policy_version": audio_to_subtitle.PROCESSING_POLICY_VERSION,
+                "llm_model": "qwen3:14b",
+            }
+        ]
+
+        self.assertFalse(
+            checkpoint_matches_segments(
+                cached,
+                source,
+                expected_mode="translate",
+                expected_model="qwen3:30b",
+                expected_policy_version=audio_to_subtitle.PROCESSING_POLICY_VERSION,
+            )
+        )
+        cached[0]["llm_model"] = "qwen3:30b"
+        cached[0]["processing_policy_version"] -= 1
+        self.assertFalse(
+            checkpoint_matches_segments(
+                cached,
+                source,
+                expected_mode="translate",
+                expected_model="qwen3:30b",
+                expected_policy_version=audio_to_subtitle.PROCESSING_POLICY_VERSION,
+            )
+        )
+
+    def test_checkpoint_rejects_outdated_terminology_policy(self) -> None:
+        source = [{"id": 0, "start": 1.0, "end": 2.0, "text": "John"}]
+        cached = [
+            {
+                **source[0],
+                "display": True,
+                "processing_mode": "translate",
+                "processing_policy_version": audio_to_subtitle.PROCESSING_POLICY_VERSION,
+                "terminology_policy_version": 0,
+                "llm_model": "qwen3:30b",
+            }
+        ]
+
+        self.assertFalse(
+            checkpoint_matches_segments(
+                cached,
+                source,
+                expected_mode="translate",
+                expected_model="qwen3:30b",
+                expected_policy_version=audio_to_subtitle.PROCESSING_POLICY_VERSION,
+                expected_terminology_policy_version=audio_to_subtitle.TERMINOLOGY_POLICY_VERSION,
+            )
+        )
+
     def test_translate_segments_accepts_llm_hidden_duplicates(self) -> None:
         source = [
             {"id": 0, "start": 209.03, "end": 211.0, "text": "The female orgasm builds to a"},
@@ -316,20 +373,92 @@ class DisplayCleanupTests(unittest.TestCase):
         def call_llm(prompt, *_args, **_kwargs):
             prompts.append(prompt)
             if len(prompts) == 1:
-                return '[{"index":0,"corrected_text":"John arrived.","chinese_translation":"\u7ea6\u7ff0\u5230\u4e86\u3002","display":true}]'
-            self.assertIn("PREVIOUS APPROVED OUTPUT", prompt)
-            self.assertIn("\u7ea6\u7ff0\u5230\u4e86", prompt)
-            return '[{"index":0,"corrected_text":"John sat down.","chinese_translation":"\u7ea6\u7ff0\u5750\u4e0b\u4e86\u3002","display":true}]'
+                return (
+                    '[{"index":0,"corrected_text":"John arrived.",'
+                    '"chinese_translation":"\u7ea6\u7ff0\u5230\u4e86\u3002","display":true,'
+                    '"terminology":[{"source":"John","target":"\u7ea6\u7ff0"}]}]'
+                )
+            self.assertIn("APPROVED MOVIE-WIDE TERMINOLOGY", prompt)
+            self.assertIn("John => \u7ea6\u7ff0", prompt)
+            return (
+                '[{"index":0,"corrected_text":"John sat down.",'
+                '"chinese_translation":"\u7ea6\u7ff0\u5750\u4e0b\u4e86\u3002","display":true,'
+                '"terminology":[{"source":"John","target":"\u7ea6\u7ff0"}]}]'
+            )
 
-        with patch.object(audio_to_subtitle, "call_llm", side_effect=call_llm):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            terminology_path = Path(tmpdir) / "terminology.json"
+            with patch.object(audio_to_subtitle, "call_llm", side_effect=call_llm):
+                output = translate_and_correct_segments(
+                    source,
+                    llm_model="qwen3:30b",
+                    batch_size=1,
+                    context_lines=0,
+                    source_language="en",
+                    terminology_path=terminology_path,
+                )
+            terminology = json.loads(terminology_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(output[1]["zh"], "\u7ea6\u7ff0\u5750\u4e0b\u4e86\u3002")
+        self.assertEqual(terminology["entries"], [{"source": "John", "target": "\u7ea6\u7ff0"}])
+
+    def test_relevant_early_terminology_survives_prompt_limit(self) -> None:
+        glossary = {"john": {"source": "John", "target": "\u7ea6\u7ff0"}}
+        for index in range(300):
+            glossary[f"term-{index}"] = {
+                "source": f"Term {index}",
+                "target": f"\u672f\u8bed{index}",
+            }
+
+        prompt_glossary = audio_to_subtitle.format_terminology_glossary(
+            glossary,
+            "John returns after a long absence.",
+        )
+
+        self.assertIn("John => \u7ea6\u7ff0", prompt_glossary)
+        self.assertIn("Term 299 => \u672f\u8bed299", prompt_glossary)
+
+    def test_translation_retries_when_known_name_mapping_is_inconsistent(self) -> None:
+        source = [
+            {"id": 0, "start": 1.0, "end": 2.0, "text": "John arrived."},
+            {"id": 1, "start": 2.0, "end": 3.0, "text": "John sat down."},
+        ]
+        responses = [
+            (
+                '[{"index":0,"corrected_text":"John arrived.",'
+                '"chinese_translation":"\u7ea6\u7ff0\u5230\u4e86\u3002","display":true,'
+                '"terminology":[{"source":"John","target":"\u7ea6\u7ff0"}]}]'
+            ),
+            (
+                '[{"index":0,"corrected_text":"John sat down.",'
+                '"chinese_translation":"\u5f3a\u5c3c\u5750\u4e0b\u4e86\u3002","display":true,'
+                '"terminology":[{"source":"John","target":"\u5f3a\u5c3c"}]}]'
+            ),
+        ]
+        repaired = {
+            "corrected_text": "John sat down.",
+            "chinese_translation": "\u7ea6\u7ff0\u5750\u4e0b\u4e86\u3002",
+            "display": True,
+            "terminology": [{"source": "John", "target": "\u7ea6\u7ff0"}],
+        }
+
+        with (
+            patch.object(audio_to_subtitle, "call_llm", side_effect=responses),
+            patch.object(
+                audio_to_subtitle,
+                "retry_single_segment_llm",
+                return_value=repaired,
+            ) as retry,
+        ):
             output = translate_and_correct_segments(
                 source,
                 llm_model="qwen3:30b",
                 batch_size=1,
-                context_lines=2,
+                context_lines=0,
                 source_language="en",
             )
 
+        retry.assert_called_once()
         self.assertEqual(output[1]["zh"], "\u7ea6\u7ff0\u5750\u4e0b\u4e86\u3002")
 
     def test_main_reuses_source_cache_without_audio_extraction(self) -> None:
@@ -520,6 +649,9 @@ class DisplayCleanupTests(unittest.TestCase):
                 "zh": "\u5df2\u5b8c\u6210",
                 "display": True,
                 "processing_mode": "translate",
+                "processing_policy_version": audio_to_subtitle.PROCESSING_POLICY_VERSION,
+                "terminology_policy_version": audio_to_subtitle.TERMINOLOGY_POLICY_VERSION,
+                "llm_model": "qwen3:30b",
             }
         ]
 
@@ -937,6 +1069,8 @@ class DisplayCleanupTests(unittest.TestCase):
                 str(video),
                 "--source",
                 "embedded",
+                "--subtitle-sync",
+                "off",
                 "--english-subtitle-stream",
                 "7",
                 "--output-root",
@@ -1106,7 +1240,7 @@ class DisplayCleanupTests(unittest.TestCase):
                 "source_language": "existing Chinese embedded subtitle",
             }
         ]
-        current = [{**legacy[0], "source_cache_version": 2}]
+        current = [{**legacy[0], "source_cache_version": audio_to_subtitle.SOURCE_CACHE_VERSION}]
 
         self.assertFalse(source_cache_uses_current_timing_policy(legacy))
         self.assertTrue(source_cache_uses_current_timing_policy(current))
@@ -1294,6 +1428,30 @@ class DisplayCleanupTests(unittest.TestCase):
 
         self.assertEqual(len(output), 1)
         self.assertEqual(output[0]["text"], "Complete sentence")
+
+    def test_distinct_existing_subtitles_can_overlap_without_data_loss(self) -> None:
+        segments = [
+            {
+                "id": 0,
+                "start": 1.0,
+                "end": 3.0,
+                "text": "First speaker",
+                "preserve_distinct_overlap": True,
+            },
+            {
+                "id": 1,
+                "start": 1.2,
+                "end": 2.8,
+                "text": "Second speaker",
+                "preserve_distinct_overlap": True,
+            },
+        ]
+
+        output = resolve_timeline_overlaps(segments)
+
+        self.assertEqual([item["text"] for item in output], ["First speaker", "Second speaker"])
+        self.assertEqual(output[0]["end"], 3.0)
+        self.assertEqual(output[1]["start"], 1.2)
 
     def test_prompt_contains_duration_aware_readability_budgets(self) -> None:
         segment = {"id": 0, "start": 0.0, "end": 1.0, "text": "A readable line"}
@@ -1673,6 +1831,8 @@ class DisplayCleanupTests(unittest.TestCase):
                 str(video),
                 "--source",
                 "auto",
+                "--subtitle-sync",
+                "off",
                 "--output-root",
                 str(output_root),
                 "--series-name",

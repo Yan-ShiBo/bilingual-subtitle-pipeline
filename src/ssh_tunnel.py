@@ -26,6 +26,31 @@ def _expand_key_path(value: str) -> str:
     return str(Path(os.path.expandvars(os.path.expanduser(value))).resolve())
 
 
+def _identity_files_from_config(
+    config: paramiko.SSHConfig,
+    requested_host: str,
+    expanded_values: Any,
+) -> list[str]:
+    expanded = [expanded_values] if isinstance(expanded_values, str) else list(expanded_values or [])
+    try:
+        raw_lookup = config._lookup(hostname=requested_host)
+        raw_values = raw_lookup.get("identityfile") or []
+        raw = [raw_values] if isinstance(raw_values, str) else list(raw_values)
+    except (AttributeError, TypeError):
+        raw = []
+
+    output: list[str] = []
+    for index, expanded_value in enumerate(expanded):
+        raw_value = str(raw[index]) if index < len(raw) else ""
+        preserve_raw_absolute = (
+            bool(raw_value)
+            and Path(raw_value).is_absolute()
+            and "%" not in raw_value
+        )
+        output.append(raw_value if preserve_raw_absolute else str(expanded_value))
+    return output
+
+
 def resolve_ssh_connection(
     host: str,
     port: int = 22,
@@ -39,15 +64,18 @@ def resolve_ssh_connection(
 
     config_path = ssh_config_path or DEFAULT_SSH_CONFIG_PATH
     config_values: Dict[str, Any] = {}
+    configured_identities: list[str] = []
     if config_path.exists():
         config = paramiko.SSHConfig()
         with config_path.open("r", encoding="utf-8") as handle:
             config.parse(handle)
         config_values = config.lookup(requested_host)
+        configured_identities = _identity_files_from_config(
+            config,
+            requested_host,
+            config_values.get("identityfile"),
+        )
 
-    configured_identities = config_values.get("identityfile") or []
-    if isinstance(configured_identities, str):
-        configured_identities = [configured_identities]
     identity_files = [key_filename] if str(key_filename or "").strip() else configured_identities
     identity_files = [_expand_key_path(str(path)) for path in identity_files if str(path or "").strip()]
 

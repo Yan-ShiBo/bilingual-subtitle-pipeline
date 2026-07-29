@@ -42,7 +42,8 @@ class SshTunnelTests(unittest.TestCase):
     def test_resolve_ssh_connection_uses_openssh_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            key_path = root / "id_test"
+            key_path = root / "runner~1" / "id_test"
+            key_path.parent.mkdir()
             key_path.write_text("placeholder", encoding="utf-8")
             config_path = root / "config"
             config_path.write_text(

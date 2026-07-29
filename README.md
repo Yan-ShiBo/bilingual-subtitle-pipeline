@@ -15,7 +15,10 @@
 ├─ src/                  # Python 主程序代码
 │  ├─ subtitle_frontend.py
 │  ├─ audio_to_subtitle.py
-│  └─ subtitle_pipeline.py
+│  ├─ subtitle_sync.py
+│  ├─ font_delivery.py
+│  ├─ frontend_settings.py
+│  └─ subtitle_pipeline.py       # OCR/轨道工具及兼容入口
 ├─ docs/                 # 项目文档及界面截图
 │  └─ images/
 ├─ scripts/              # 安装和示例运行脚本
@@ -23,7 +26,10 @@
 │  ├─ logs/              # 前端任务日志，可删除
 │  └─ scratch/           # 测试输出和临时缓存，可删除
 ├─ start_frontend.bat    # 双击启动本地前端
+├─ requirements.txt      # 锁定的基础依赖
 ├─ requirements-gpu.txt
+├─ requirements-ci.txt
+├─ pyproject.toml
 └─ README.md
 ```
 
@@ -58,7 +64,7 @@ python .\src\subtitle_frontend.py --host 127.0.0.1 --port 8765
 2. 选择字幕来源：自动、已有字幕文件、视频内封字幕或 Whisper 音频识别。
 3. 页面只展开当前来源需要的选项；中英双轨选择、OCR 和音频识别设置不会同时平铺。
 4. 点击“分析视频”，页面会显示主视频、已有/内封字幕、自动来源判断、checkpoint 和已完成数量；自动模式随后展开命中的来源选项。
-5. 按需选择具体字幕文件、字幕轨道和语言。批量、上下文与显示长度限制在“高级设置”中。
+5. 按需选择具体字幕文件、字幕轨道和语言。使用已有字幕时可选择“自动校正、仅检测、关闭”音频同步；批量、上下文与显示长度限制在“高级设置”中。
 6. 选择运行方式后点击“运行程序”：
    - `继续任务`：复用 source cache 和 checkpoint，只处理未完成部分。
    - `重新校对（保留识别）`：保留音频识别、OCR 和内封字幕缓存，删除旧 checkpoint 与 ASS，用当前提示词重新校对翻译。
@@ -72,7 +78,7 @@ python .\src\subtitle_frontend.py --host 127.0.0.1 --port 8765
 前端“校对与翻译模型”右侧的“远程”按钮支持两种 SSH 认证：
 
 - `SSH 密钥`：默认方式。主机可填写 IP 或 `~/.ssh/config` 中的别名；密钥文件留空时自动读取 SSH config、SSH agent 和默认密钥。
-- `密码`：兼容旧服务器。只有选择密码认证后才显示密码和“保存密码到本机浏览器”。
+- `密码`：兼容旧服务器。只有选择密码认证后才显示密码和“使用 Windows 凭据保护保存密码”。
 
 当前机器的推荐配置为：
 
@@ -86,7 +92,7 @@ python .\src\subtitle_frontend.py --host 127.0.0.1 --port 8765
 
 后端会解析 OpenSSH 的 `HostName`、`User`、`IdentityFile`、`IdentitiesOnly` 和 keepalive 设置，并使用 `known_hosts` 校验服务器身份。连接成功后优先用本地 `127.0.0.1:11435` 转发到远端 `127.0.0.1:11434`；端口已被另一个前端占用时会自动选择空闲端口，并把该实例自己的地址传给翻译子进程。选择 `remote:<连接名>:<模型>` 时不会调用本地 Ollama；模型默认在最后一次请求后保留 10 分钟，可通过 `OLLAMA_KEEP_ALIVE` 调整。
 
-密钥模式只在浏览器保存服务器配置和可选的密钥路径，不读取或保存私钥内容。密码模式仍可按需把密码保存在当前浏览器 `localStorage`；共享电脑不应启用。
+表单和非敏感远程配置由本地前端统一保存在 `%LOCALAPPDATA%\BilingualSubtitlePipeline\frontend-settings.json`，因此切换前端端口后仍会恢复。密钥模式只保存可选的密钥路径，不读取或复制私钥内容。密码模式勾选保存后使用当前 Windows 用户的 DPAPI 加密，配置文件和浏览器 `localStorage` 都不保存明文密码；其他 Windows 用户不能解密。保存接口只允许 loopback Host，请求体必须是 `application/json` 且不超过 1 MiB；前端也拒绝绑定到非本机地址。
 
 ## 字幕来源优先级
 
@@ -113,6 +119,7 @@ python .\src\subtitle_frontend.py --host 127.0.0.1 --port 8765
 --source-language en                    # 源字幕语言，auto/en/ja/ko/fr/de/es/zh 等
 --asr-language source                   # Whisper 识别语言；source 表示跟随 --source-language，auto 表示自动检测
 --subtitle-ocr-lang en                  # 图像字幕 OCR 语言，auto/en/ch/chinese_cht/japan/korean 等
+--subtitle-sync auto                    # 已有字幕对音频：auto / detect / off
 ```
 
 注意：源字幕和音频不一定是英文。只有英文字幕时，英译中会走和“英文语音识别后再英译中”一致的 5 句分组纠错翻译流程；其他源语言也会先纠错源文，再翻译成简体中文。
@@ -126,6 +133,7 @@ python .\src\subtitle_frontend.py --host 127.0.0.1 --port 8765
 - 每组参考前 `30` 个和后 `30` 个字幕单元。
 - 上下文只用于理解人物、代词、术语和语义连续性，不会输出到结果。
 - 后续批次还会看到前面已经确认的源文/中文结果，用于保持人名译法和术语一致。
+- 每个目标对象会返回本句出现的人名/术语映射；程序维护独立的片级术语表，后续批次即使已超出滑动上下文也必须复用。
 - 组内先纠正源文，再翻译成自然的简体中文。
 - 每个输入字幕单元必须对应且只能对应一个输出对象；模型缺行、重复索引或返回可见空译文时会中断当前批次，不会把错误结果写入 checkpoint。
 - 重复或滚动片段可以保留最早完整项并把后续冗余项设为 `display=false`。
@@ -145,14 +153,15 @@ python .\src\subtitle_frontend.py --host 127.0.0.1 --port 8765
 
 生成最终显示事件时再执行确定性时间整理：
 
-- Whisper 滚动窗口或来源字幕发生重叠时，先按识别顺序消解重叠，再切分长句，避免两句话的碎片交错显示。
+- Whisper 滚动窗口发生重叠时，先按识别顺序消解重叠，再切分长句，避免两句话的碎片交错显示。
+- 已有字幕中内容不同的同时对白、对白与画面文字重叠会保留为并行 ASS 事件；只有重复/滚动识别片段才裁剪或隐藏。
 - 重叠裁剪后不足 0.4 秒的闪烁残片会丢弃；相邻字幕尽量保留约 2 帧间隔。
 - Whisper 偶发的“短文本异常长时间”会再经过兜底切分，避免一两个词挂十几秒。
 - 中文目标为每秒不超过 9 个非空白字符、每行尽量不超过 16 字；英文目标为每秒不超过 20 个字符、每行尽量不超过 42 字，最多两行。
 - 阅读时间不足且下一条字幕前有安全空档时，出点最多延长 0.5 秒；绝不越过下一条字幕。
 - 程序会打印中英文最大 CPS、超目标事件数和超单行目标事件数，便于对整片做量化复核。
 
-已有中英文字幕合并时，以英文对白轨为时间锚；没有重叠且间隔超过 0.75 秒的中英文事件不会强行配对。
+已有中英文字幕合并时，以英文对白轨为初始时间锚；没有重叠且间隔超过 0.75 秒的中英文事件不会强行配对。随后默认用 `ffsubsync 0.5.1` 的 WebRTC VAD、帧率搜索和分段偏移把整条已有字幕对齐到所选音频。程序用稳定事件标记恢复原顺序，并检查搜索边界、乱序、分段跳变和时长变化；不安全的分段候选会自动降级到全局对齐，两者都不合格时保持原时间。原始时间保存在 source 输入和 `pre_sync_*` 元数据中，对齐摘要写入 `<片名>.subtitle-sync.report.json`。`detect` 只报告候选偏移，`off` 完全跳过；音频 ASR 来源不执行这一步，也不会因此占用本地 GPU。
 
 阅读速度与行宽参考 [Netflix 简体中文规范](https://partnerhelp.netflixstudios.com/hc/en-us/articles/215986007-Chinese-Simplified-Timed-Text-Style-Guide)、[Netflix 英文规范](https://partnerhelp.netflixstudios.com/hc/en-us/articles/217350977-English-USA-Timed-Text-Style-Guide)、[Netflix 时间规范](https://partnerhelp.netflixstudios.com/hc/en-us/articles/360051554394-Timed-Text-Style-Guide-Subtitle-Timing-Guidelines) 和 [Prime Video 字幕规范](https://videocentral.amazon.com/support/delivery-specifications/prime-video-subtitling-guidelines?language=en_US)。项目采用较保守的中文 9 CPS、英文 20 CPS 作为诊断目标；这不是承诺每条旧来源字幕都能在不删减原意的前提下自动达标。
 
@@ -172,9 +181,10 @@ python .\src\subtitle_frontend.py --host 127.0.0.1 --port 8765
 --subtitle-style-profile adaptive   # adaptive / mobile / compact
 --subtitle-font-name "Arial"        # ASS 字体族名，不是字体文件名
 --subtitle-font-scale 100           # 70 到 160
+--subtitle-font-file "E:\Fonts\MyFont.ttf"
 ```
 
-字体文件本身只决定字形和字符覆盖，不负责适配屏幕。外置 `.ass` 只记录字体族名，不会自动携带 `.ttf/.otf` 文件；手机播放器必须能找到该字体，否则会回退到其他字体。跨设备分发时，推荐把字体作为 Matroska 附件封装进 MKV，并确保 ASS 中填写的是字体内部的 family name，而不是字体文件名。
+字体文件本身只决定字形和字符覆盖，不负责适配屏幕。选择 TTF/OTF/TTC 后，程序用 `fonttools` 读取字体内部 family name，复制字体到输出目录的 `fonts/`，并用 ffmpeg 生成包含双语 ASS 和字体附件的 `<片名>.bilingual.mks`；不需要复制整部电影。支持 Matroska 字幕附件和 libass 内嵌字体的播放器可直接加载该小型字幕包。外置 `.ass` 仍可单独使用，但播放器找不到字体时会回退。
 
 ASS 的自适应基于视频画面比例，无法在生成时获知手机的物理尺寸、刘海/系统控件、当前横竖屏状态或系统无障碍字幕字号。播放器还可能覆盖或忽略 ASS 样式。因此：
 
@@ -198,6 +208,12 @@ ASS 的自适应基于视频画面比例，无法在生成时获知手机的物�
 ```
 
 重新运行同一任务时会先校验 checkpoint 是否和当前字幕切分及来源请求一致。一致才继续，不一致会忽略旧 checkpoint。
+
+校验还包含 `llm_model` 和 `processing_policy_version`。模型或提示词/阅读策略升级后，网页会明确提示 checkpoint 需要重新校对，并默认选择“重新校对（保留识别）”，不会删除 source cache。片级术语表写入：
+
+```text
+<输出目录>\<片名>.terminology.json
+```
 
 前端三个运行方式的缓存边界：
 
@@ -273,6 +289,9 @@ python .\src\audio_to_subtitle.py `
 <片名>.en.ass          # 源文字幕层，文件名保留 en 是为了兼容旧流程
 <片名>.zh.ass          # 简体中文字幕
 <片名>.bilingual.ass   # 双语字幕
+<片名>.bilingual.mks   # 选择字体文件时生成，包含 ASS 与字体附件
+<片名>.subtitle-sync.report.json
+<片名>.terminology.json
 ```
 
 ## 依赖
@@ -280,13 +299,17 @@ python .\src\audio_to_subtitle.py `
 - Python
 - ffmpeg 或 `imageio-ffmpeg`
 - `faster-whisper`
+- `ffsubsync==0.5.1`，用于已有字幕的音频对齐
+- `fonttools`，用于读取并交付自定义字体
 - `psutil`，用于前端重启后验证并恢复运行任务
 - CUDA 可用的 PyTorch / CTranslate2 环境
-- PaddleOCR / pgsrip / OpenCC，用于 PGS/OCR 路径
+- PaddleOCR / OpenCC，用于 PGS/OCR 路径；PGS 默认使用仓库内解析器，已安装的 `pgsrip` 仅作为可选兼容后端
 - Ollama
 - Ollama 模型：`qwen3:14b`
 
-安装辅助脚本在 `scripts/` 目录中。
+基础依赖、GPU/OCR 依赖和 CI 依赖分别锁定在 `requirements.txt`、`requirements-gpu.txt` 和 `requirements-ci.txt`。安装辅助脚本在 `scripts/` 目录中。GitHub Actions 在 Windows/Python 3.13 上执行 Ruff、编译检查和全部单元测试。
+
+`src/audio_to_subtitle.py` 是唯一正式处理入口。旧的 `src/subtitle_pipeline.py` 仍提供轨道探测、PGS/OCR 和配对函数；直接执行时会把兼容参数转发到正式入口，不再运行另一套翻译与缓存流程。
 
 ## 质量检查
 
@@ -302,6 +325,11 @@ python .\src\audio_to_subtitle.py `
 
 ## 更新日志
 
+* 已有字幕默认使用 ffsubsync 做低质量保护的全局/分段音频同步，并生成可审计报告；音频 ASR 来源不重复同步。
+* 来源字幕的合法同时对白会保留为 ASS 并行事件，ASR/OCR 重复片段仍按原规则去重。
+* 新增片级术语表、模型标识和处理策略版本，解决远距离人物名漂移及旧 checkpoint 静默复用。
+* 自定义字体可读取内部 family name，并输出带字体附件的 `.bilingual.mks` 小型字幕包。
+* 统一正式 CLI 入口，锁定依赖并增加 Windows CI；网页设置跨端口持久化，密码改用 Windows DPAPI。
 * 新增按可用显示时间计算的 Qwen 字符预算、中文 9 CPS/英文 20 CPS 诊断、16/42 字行宽目标和最多 0.5 秒的安全出点延长。
 * 最终输出在切分前后消解时间轴重叠，修复 ASR 滚动窗口导致的字幕碎片交错、叠字和极短闪烁残片。
 * 前端运行方式拆为“继续任务”“重新校对（保留识别）”“完全重建”，修改提示词后可直接复用 ASR/OCR 结果。
