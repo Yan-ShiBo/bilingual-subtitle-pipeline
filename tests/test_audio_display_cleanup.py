@@ -24,8 +24,11 @@ from audio_to_subtitle import (  # noqa: E402
     generate_ass,
     load_cached_source_segments,
     merge_existing_subtitle_segments,
+    optimize_readability_timing,
     prepare_segments_for_output,
     proofread_existing_chinese_segments,
+    readability_stats,
+    resolve_timeline_overlaps,
     sanitize_checkpoint_display_timing,
     segments_have_chinese,
     split_segments_for_subtitles,
@@ -593,11 +596,92 @@ class DisplayCleanupTests(unittest.TestCase):
             out_dir.mkdir()
             pipeline_temp = out_dir / ".Episode.subtitle-audio.123.wav"
             pipeline_temp.write_bytes(b"temp")
+            source_cache = out_dir / "Episode.segments.source.json"
+            source_cache.write_text("[]", encoding="utf-8")
+            embedded_dir = out_dir / "embedded"
+            embedded_dir.mkdir()
+            (embedded_dir / "stream.ass").write_text("cached", encoding="utf-8")
 
             subtitle_frontend.remove_resume_files(out_dir, "Episode")
 
             self.assertEqual(sibling_wav.read_bytes(), b"user audio")
             self.assertFalse(pipeline_temp.exists())
+            self.assertFalse(source_cache.exists())
+            self.assertFalse(embedded_dir.exists())
+
+    def test_reprocess_cleanup_preserves_recognition_caches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_dir = Path(tmpdir)
+            source_cache = out_dir / "Episode.segments.source.json"
+            source_cache.write_text('[{"text":"recognized"}]', encoding="utf-8")
+            checkpoint = out_dir / "Episode.segments.checkpoint.json"
+            checkpoint.write_text('[{"zh":"old"}]', encoding="utf-8")
+            output_paths = [
+                out_dir / "Episode.en.ass",
+                out_dir / "Episode.zh.ass",
+                out_dir / "Episode.bilingual.ass",
+            ]
+            for path in output_paths:
+                path.write_text("old output", encoding="utf-8")
+            embedded_dir = out_dir / "embedded"
+            embedded_dir.mkdir()
+            embedded_cache = embedded_dir / "stream.ass"
+            embedded_cache.write_text("cached OCR", encoding="utf-8")
+            pipeline_temp = out_dir / ".Episode.subtitle-audio.123.wav"
+            pipeline_temp.write_bytes(b"cached audio")
+
+            subtitle_frontend.remove_translation_outputs(out_dir, "Episode")
+
+            self.assertTrue(source_cache.exists())
+            self.assertTrue(embedded_cache.exists())
+            self.assertTrue(pipeline_temp.exists())
+            self.assertFalse(checkpoint.exists())
+            self.assertTrue(all(not path.exists() for path in output_paths))
+
+    def test_frontend_run_modes_keep_legacy_restart_compatibility(self) -> None:
+        self.assertEqual(subtitle_frontend.resolve_run_mode({"run_mode": "resume"}), "resume")
+        self.assertEqual(subtitle_frontend.resolve_run_mode({"run_mode": "reprocess"}), "reprocess")
+        self.assertEqual(subtitle_frontend.resolve_run_mode({"run_mode": "restart"}), "restart")
+        self.assertEqual(subtitle_frontend.resolve_run_mode({"restart": True}), "restart")
+        self.assertEqual(subtitle_frontend.resolve_run_mode({}), "resume")
+
+    def test_frontend_reprocess_routes_to_translation_only_cleanup(self) -> None:
+        class FakeProcess:
+            pid = 54321
+
+            @staticmethod
+            def poll():
+                return None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video = root / "movie.mp4"
+            video.write_bytes(b"video")
+            log_path = root / "run.log"
+            err_path = root / "run.err.log"
+            payload = {
+                "path": str(video),
+                "output_root": str(root / "out"),
+                "series_name": "Series",
+                "movie_name": "Episode",
+                "source": "audio",
+                "run_mode": "reprocess",
+            }
+            subtitle_frontend.RUNS.clear()
+            try:
+                with (
+                    patch.object(subtitle_frontend, "frontend_log_paths", return_value=(log_path, err_path)),
+                    patch.object(subtitle_frontend, "remove_translation_outputs") as translation_cleanup,
+                    patch.object(subtitle_frontend, "remove_resume_files") as full_cleanup,
+                    patch.object(subtitle_frontend.subprocess, "Popen", return_value=FakeProcess()),
+                ):
+                    result = subtitle_frontend.start_processing(payload)
+            finally:
+                subtitle_frontend.RUNS.clear()
+
+        translation_cleanup.assert_called_once()
+        full_cleanup.assert_not_called()
+        self.assertEqual(result["run_mode"], "reprocess")
 
     def test_frontend_rejects_duplicate_run_for_same_output(self) -> None:
         class FakeProcess:
@@ -985,7 +1069,7 @@ class DisplayCleanupTests(unittest.TestCase):
 
         self.assertEqual(len(output), 1)
         self.assertEqual(output[0]["start"], 10.0)
-        self.assertEqual(output[0]["end"], 12.0)
+        self.assertEqual(output[0]["end"], 12.5)
 
     def test_output_caps_single_word_with_abnormal_long_timing(self) -> None:
         segments = [
@@ -1004,6 +1088,107 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertEqual(len(output), 1)
         self.assertEqual(output[0]["start"], 10.0)
         self.assertEqual(output[0]["end"], 15.5)
+
+    def test_output_extends_into_safe_gap_for_reading_speed(self) -> None:
+        segments = [
+            {
+                "id": 0,
+                "start": 0.0,
+                "end": 1.0,
+                "text": "A line",
+                "en": "A line",
+                "zh": "这是十二个字的中文字幕",
+                "display": True,
+            },
+            {
+                "id": 1,
+                "start": 2.0,
+                "end": 3.0,
+                "text": "Next",
+                "en": "Next",
+                "zh": "下一句",
+                "display": True,
+            },
+        ]
+
+        output = prepare_segments_for_output(
+            segments,
+            max_words=12,
+            max_chars=56,
+            max_duration=5.5,
+        )
+
+        self.assertGreater(output[0]["end"], 1.0)
+        self.assertLess(output[0]["end"], output[1]["start"])
+        self.assertLessEqual(output[0]["end"], 1.5)
+        self.assertLessEqual(readability_stats(output)["chinese_max_cps"], 9.0)
+
+    def test_reading_extension_never_overlaps_next_subtitle(self) -> None:
+        segments = [
+            {"id": 0, "start": 0.0, "end": 1.0, "text": "很长很长的中文字幕"},
+            {"id": 1, "start": 1.05, "end": 2.0, "text": "下一句"},
+        ]
+
+        output = optimize_readability_timing(segments, max_duration=5.5)
+
+        self.assertEqual(output[0]["end"], 1.0)
+        self.assertEqual(output[1]["start"], 1.05)
+
+    def test_final_output_is_sorted_and_removes_stacked_overlaps(self) -> None:
+        segments = [
+            {"id": 0, "start": 2.0, "end": 3.0, "text": "Later"},
+            {"id": 1, "start": 0.0, "end": 2.0, "text": "Earlier"},
+            {"id": 2, "start": 1.0, "end": 2.5, "text": "Overlapping"},
+        ]
+
+        output = prepare_segments_for_output(
+            segments,
+            max_words=12,
+            max_chars=56,
+            max_duration=5.5,
+        )
+
+        self.assertEqual([item["text"] for item in output], ["Earlier", "Overlapping", "Later"])
+        self.assertTrue(
+            all(output[index]["end"] <= output[index + 1]["start"] for index in range(len(output) - 1))
+        )
+
+    def test_tiny_overlap_fragment_is_dropped_instead_of_flashing(self) -> None:
+        segments = [
+            {"id": 0, "start": 0.0, "end": 2.0, "text": "fragment"},
+            {"id": 1, "start": 0.3, "end": 2.5, "text": "Complete sentence"},
+        ]
+
+        output = resolve_timeline_overlaps(segments)
+
+        self.assertEqual(len(output), 1)
+        self.assertEqual(output[0]["text"], "Complete sentence")
+
+    def test_prompt_contains_duration_aware_readability_budgets(self) -> None:
+        segment = {"id": 0, "start": 0.0, "end": 1.0, "text": "A readable line"}
+
+        text = audio_to_subtitle.format_prompt_segment(
+            0,
+            segment,
+            next_start=2.0,
+            include_readability_limits=True,
+        )
+
+        self.assertIn("ZH_MAX=13", text)
+        self.assertIn("SOURCE_MAX=30", text)
+
+    def test_prompt_budget_is_capped_before_overlapping_next_subtitle(self) -> None:
+        segment = {"id": 0, "start": 0.0, "end": 2.0, "text": "An overlapping line"}
+
+        text = audio_to_subtitle.format_prompt_segment(
+            0,
+            segment,
+            next_start=1.0,
+            include_readability_limits=True,
+        )
+
+        self.assertIn("ZH_MAX=8", text)
+        self.assertIn("SOURCE_MAX=18", text)
 
     def test_output_keeps_short_or_distant_repeated_dialogue(self) -> None:
         segments = [
@@ -1628,7 +1813,15 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertIn('id="runMessage"', page)
         self.assertIn("data.outcome === 'failed'", page)
         self.assertIn("data.checkpoint_exists", page)
-        self.assertIn("从中断继续", page)
+        self.assertIn("继续任务", page)
+
+    def test_frontend_exposes_three_cache_aware_run_modes(self) -> None:
+        page = subtitle_frontend.html_page()
+
+        self.assertIn('value="resume" checked>继续任务', page)
+        self.assertIn('value="reprocess">重新校对（保留识别）', page)
+        self.assertIn('value="restart">完全重建', page)
+        self.assertIn("base.run_mode = document.querySelector", page)
 
     def test_frontend_launcher_does_not_open_an_unrelated_service(self) -> None:
         frontend_source = (ROOT / "src" / "subtitle_frontend.py").read_text(encoding="utf-8")
@@ -1636,8 +1829,12 @@ class DisplayCleanupTests(unittest.TestCase):
 
         self.assertIn('parsed.path == "/api/health"', frontend_source)
         self.assertIn('"app": "bilingual-subtitle-pipeline"', frontend_source)
+        self.assertIn('"source_sha256": FRONTEND_SOURCE_SHA256', frontend_source)
         self.assertIn('Invoke-RestMethod -Uri "$url/api/health"', launcher)
         self.assertIn("foreach ($port in 8765..8775)", launcher)
+        self.assertIn("$expectedSourceSha256", launcher)
+        self.assertIn("$health.source_sha256", launcher)
+        self.assertIn("Skipping stale subtitle frontend", launcher)
 
 
 if __name__ == "__main__":

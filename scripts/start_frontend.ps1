@@ -2,6 +2,8 @@ $ErrorActionPreference = "Stop"
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $appName = "bilingual-subtitle-pipeline"
+$frontendSource = Join-Path $projectRoot "src\subtitle_frontend.py"
+$expectedSourceSha256 = (Get-FileHash -LiteralPath $frontendSource -Algorithm SHA256).Hash.ToLowerInvariant()
 $selectedPort = $null
 
 function Test-TcpPort {
@@ -31,10 +33,16 @@ foreach ($port in 8765..8775) {
     if (Test-TcpPort -HostName "127.0.0.1" -Port $port) {
         try {
             $health = Invoke-RestMethod -Uri "$url/api/health" -TimeoutSec 1
-            if ($health.app -eq $appName) {
+            if (
+                $health.app -eq $appName -and
+                "$($health.source_sha256)".ToLowerInvariant() -eq $expectedSourceSha256
+            ) {
                 Start-Process $url
                 Write-Host "Frontend is already running at $url"
                 exit 0
+            }
+            if ($health.app -eq $appName) {
+                Write-Host "Skipping stale subtitle frontend at $url"
             }
         }
         catch {

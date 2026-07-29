@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -39,6 +40,7 @@ RUNS: Dict[int, Dict[str, Any]] = {}
 RUNS_LOCK = threading.Lock()
 NAME_CACHE: Dict[str, Dict[str, str]] = {}
 USER_STOP_MARKER = "Frontend task stopped by user"
+FRONTEND_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
 def normalize_space(text: str) -> str:
@@ -589,10 +591,9 @@ def choose_folder() -> str:
     return path
 
 
-def remove_resume_files(out_dir: Path, movie_name: str) -> None:
+def remove_translation_outputs(out_dir: Path, movie_name: str) -> None:
     names = [
         f"{movie_name}.segments.checkpoint.json",
-        f"{movie_name}.segments.source.json",
         f"{movie_name}.en.ass",
         f"{movie_name}.zh.ass",
         f"{movie_name}.bilingual.ass",
@@ -602,12 +603,20 @@ def remove_resume_files(out_dir: Path, movie_name: str) -> None:
         if path.exists():
             path.unlink()
     remove_run_state(run_state_path(out_dir, movie_name))
-            
+
+
+def remove_resume_files(out_dir: Path, movie_name: str) -> None:
+    remove_translation_outputs(out_dir, movie_name)
+    source_segments_path = out_dir / f"{movie_name}.segments.source.json"
+    if source_segments_path.exists():
+        source_segments_path.unlink()
+
     import shutil
+
     embedded_dir = out_dir / "embedded"
     if embedded_dir.exists():
         shutil.rmtree(embedded_dir, ignore_errors=True)
-        
+
     if out_dir.exists():
         prefix = f".{movie_name}.subtitle-audio."
         for temp_audio in out_dir.iterdir():
@@ -617,6 +626,13 @@ def remove_resume_files(out_dir: Path, movie_name: str) -> None:
                 temp_audio.unlink()
             except OSError:
                 pass
+
+
+def resolve_run_mode(payload: Dict[str, Any]) -> str:
+    run_mode = str(payload.get("run_mode") or "").strip().lower()
+    if run_mode in {"resume", "reprocess", "restart"}:
+        return run_mode
+    return "restart" if bool(payload.get("restart")) else "resume"
 
 
 def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -635,7 +651,7 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
         series_name,
         movie_name,
     )
-    restart = bool(payload.get("restart"))
+    run_mode = resolve_run_mode(payload)
     source_mode = payload.get("source") or "auto"
     sidecar_path = payload.get("subtitle_file")
     merge_existing_subtitles = bool(payload.get("merge_existing_subtitles", True))
@@ -741,7 +757,9 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
             if info.get("series_name") == series_name and info.get("movie_name") == movie_name:
                 raise RuntimeError(f"任务已在运行，PID {pid}。请先等待完成或终止现有任务。")
 
-        if restart:
+        if run_mode == "reprocess":
+            remove_translation_outputs(out_dir, movie_name)
+        elif run_mode == "restart":
             remove_resume_files(out_dir, movie_name)
         for path in (log_path, err_path):
             if path.exists():
@@ -769,6 +787,7 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
             "process": process,
             "series_name": series_name,
             "movie_name": movie_name,
+            "run_mode": run_mode,
         }
         RUNS[process.pid] = run_info
         persisted_info = {key: value for key, value in run_info.items() if key != "process"}
@@ -783,6 +802,7 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
         "output_dir": str(out_dir),
         "series_name": series_name,
         "movie_name": movie_name,
+        "run_mode": run_mode,
         "command": " ".join(args),
     }
 
@@ -1066,7 +1086,7 @@ def html_page() -> str:
     th, td { border-bottom: 1px solid #e5e7eb; text-align: left; padding: 8px; vertical-align: top; }
     th { color: #4f5a66; font-weight: 600; background: #fafbfc; }
     .inline { display: flex; gap: 8px; align-items: center; }
-    .radio { display: flex; gap: 16px; height: 38px; align-items: center; }
+    .radio { display: flex; flex-wrap: wrap; gap: 8px 16px; min-height: 38px; align-items: center; }
     .radio label { margin: 0; color: #20242a; }
     .radio input { width: auto; height: auto; margin-right: 6px; }
     .stage-container { display: flex; align-items: center; justify-content: space-between; padding: 16px 24px; background: white; border: 1px solid #dde1e7; border-radius: 8px; margin-bottom: 16px; }
@@ -1324,8 +1344,9 @@ def html_page() -> str:
     <p class="status-message" id="runMessage" role="alert" aria-live="polite" hidden></p>
     <div class="inline">
       <div class="radio">
-        <label><input type="radio" name="runMode" value="resume" checked>从中断继续</label>
-        <label><input type="radio" name="runMode" value="restart">从头开始</label>
+        <label><input type="radio" name="runMode" value="resume" checked>继续任务</label>
+        <label><input type="radio" name="runMode" value="reprocess">重新校对（保留识别）</label>
+        <label><input type="radio" name="runMode" value="restart">完全重建</label>
       </div>
       <button id="runBtn" onclick="startRun()">运行程序</button>
       <button id="stopBtn" class="danger" onclick="stopRun()" disabled>终止运行</button>
@@ -1521,7 +1542,8 @@ async function startRun() {
   runBtn.disabled = true;
   try {
     const base = payload();
-    base.restart = document.querySelector('input[name="runMode"]:checked').value === 'restart';
+    base.run_mode = document.querySelector('input[name="runMode"]:checked').value;
+    base.restart = base.run_mode === 'restart';
     const data = await api('/api/start', base);
     state.pid = data.pid;
     document.getElementById('outputRoot').value = data.output_root || document.getElementById('outputRoot').value;
@@ -1699,14 +1721,14 @@ function render(data) {
   if (data.outcome === 'failed') {
     const detail = data.error_summary || '程序异常退出，请查看下方日志。';
     const recovery = data.checkpoint_exists
-      ? 'Checkpoint 已保留，可选择“从中断继续”后重新运行。'
+      ? 'Checkpoint 已保留，可选择“继续任务”后重新运行。'
       : '请检查日志中的最后一条错误后重新运行。';
     runMessage.textContent = `运行失败：${detail} ${recovery}`;
     runMessage.className = 'status-message error';
     runMessage.hidden = false;
   } else if (data.outcome === 'interrupted') {
     runMessage.textContent = data.checkpoint_exists
-      ? '上次运行未正常完成。Checkpoint 已保留，可选择“从中断继续”恢复。'
+      ? '上次运行未正常完成。Checkpoint 已保留，可选择“继续任务”恢复。'
       : '上次运行未正常完成，请查看日志后重新运行。';
     runMessage.className = 'status-message';
     runMessage.hidden = false;
@@ -2056,7 +2078,13 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/":
             self.send_text(html_page(), "text/html; charset=utf-8")
         elif parsed.path == "/api/health":
-            self.send_json({"app": "bilingual-subtitle-pipeline", "status": "ok"})
+            self.send_json(
+                {
+                    "app": "bilingual-subtitle-pipeline",
+                    "status": "ok",
+                    "source_sha256": FRONTEND_SOURCE_SHA256,
+                }
+            )
         else:
             self.send_json({"error": "Not found"}, status=404)
 

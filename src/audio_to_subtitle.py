@@ -21,6 +21,15 @@ VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m2ts", ".ts", ".mov", ".wmv"}
 SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt"}
 UNKNOWN_SOURCE_LANGUAGE_TAGS = {"", "auto", "source", "cached source", "subtitle", "embedded subtitle"}
 SOURCE_CACHE_VERSION = 2
+TARGET_CHINESE_CPS = 9.0
+TARGET_ENGLISH_CPS = 20.0
+MIN_SUBTITLE_DURATION = 20 / 24
+MAX_READING_EXTENSION = 0.5
+MIN_SUBTITLE_GAP = 2 / 24
+MIN_OVERLAP_RETAIN_DURATION = 0.4
+CHINESE_CHARS_PER_LINE = 16
+ENGLISH_CHARS_PER_LINE = 42
+MAX_SUBTITLE_LINES = 2
 
 
 def configure_output_encoding() -> None:
@@ -1421,8 +1430,12 @@ def prepare_segments_for_output(
         item.pop("display_end", None)
         if item["end"] > item["start"]:
             visible.append(item)
-    split = split_segments_for_subtitles(visible, max_words, max_chars, max_duration)
-    return apply_timing_sanity_rules(split, max_duration=max_duration)
+    timeline_cleaned = resolve_timeline_overlaps(visible)
+    split = split_segments_for_subtitles(timeline_cleaned, max_words, max_chars, max_duration)
+    sanitized = apply_timing_sanity_rules(split, max_duration=max_duration)
+    ordered = sorted(sanitized, key=lambda item: (float(item["start"]), float(item["end"])))
+    non_overlapping = resolve_timeline_overlaps(ordered)
+    return optimize_readability_timing(non_overlapping, max_duration=max_duration)
 
 
 def apply_timing_sanity_rules(segments: List[Segment], max_duration: float = 6.0) -> List[Segment]:
@@ -1438,6 +1451,129 @@ def apply_timing_sanity_rules(segments: List[Segment], max_duration: float = 6.0
     return output
 
 
+def subtitle_character_count(text: Any, *, collapse_spaces: bool = False) -> int:
+    cleaned = clean_subtitle_text(str(text or ""))
+    if collapse_spaces:
+        cleaned = re.sub(r"\s+", "", cleaned)
+    return len(cleaned)
+
+
+def required_reading_duration(segment: Segment) -> float:
+    english = clean_english_track_text(str(segment.get("en") or ""))
+    chinese = to_simplified_text(clean_subtitle_text(str(segment.get("zh") or "")))
+    if not english and not chinese:
+        text = clean_subtitle_text(str(segment.get("text") or ""))
+        if contains_cjk(text):
+            chinese = text
+        else:
+            english = text
+
+    required = MIN_SUBTITLE_DURATION
+    if chinese:
+        required = max(
+            required,
+            subtitle_character_count(chinese, collapse_spaces=True) / TARGET_CHINESE_CPS,
+        )
+    if english:
+        required = max(required, subtitle_character_count(english) / TARGET_ENGLISH_CPS)
+    return required
+
+
+def optimize_readability_timing(
+    segments: List[Segment],
+    max_duration: float = 5.5,
+) -> List[Segment]:
+    output = [dict(segment) for segment in segments]
+    for index, segment in enumerate(output):
+        start = float(segment["start"])
+        current_end = float(segment["end"])
+        required_end = start + required_reading_duration(segment)
+        if required_end <= current_end:
+            continue
+
+        latest_end = min(current_end + MAX_READING_EXTENSION, start + max_duration)
+        if index + 1 < len(output):
+            next_start = float(output[index + 1]["start"])
+            latest_end = min(latest_end, next_start - MIN_SUBTITLE_GAP)
+        extended_end = min(required_end, latest_end)
+        if extended_end > current_end:
+            segment["end"] = extended_end
+    return output
+
+
+def resolve_timeline_overlaps(segments: List[Segment]) -> List[Segment]:
+    output: List[Segment] = []
+    for source in segments:
+        item = dict(source)
+        while output and float(output[-1]["end"]) > float(item["start"]):
+            previous = output[-1]
+            if float(item["end"]) <= float(previous["start"]):
+                break
+            shortened_end = float(item["start"]) - MIN_SUBTITLE_GAP
+            retained_duration = shortened_end - float(previous["start"])
+            if retained_duration >= MIN_OVERLAP_RETAIN_DURATION:
+                previous["end"] = shortened_end
+                break
+            output.pop()
+        item["id"] = len(output)
+        output.append(item)
+    for index, item in enumerate(output):
+        item["id"] = index
+    return output
+
+
+def readability_stats(segments: List[Segment]) -> Dict[str, float | int]:
+    stats: Dict[str, float | int] = {
+        "chinese_events": 0,
+        "english_events": 0,
+        "chinese_max_cps": 0.0,
+        "english_max_cps": 0.0,
+        "chinese_over_target": 0,
+        "english_over_target": 0,
+        "chinese_over_single_line": 0,
+        "english_over_single_line": 0,
+    }
+    for segment in segments:
+        duration = max(0.01, float(segment["end"]) - float(segment["start"]))
+        chinese = to_simplified_text(clean_subtitle_text(str(segment.get("zh") or "")))
+        english = clean_english_track_text(str(segment.get("en") or ""))
+        if not chinese and not english:
+            text = clean_subtitle_text(str(segment.get("text") or ""))
+            if contains_cjk(text):
+                chinese = text
+            else:
+                english = text
+
+        if chinese:
+            count = subtitle_character_count(chinese, collapse_spaces=True)
+            cps = count / duration
+            stats["chinese_events"] += 1
+            stats["chinese_max_cps"] = max(float(stats["chinese_max_cps"]), cps)
+            stats["chinese_over_target"] += int(cps > TARGET_CHINESE_CPS + 1e-9)
+            stats["chinese_over_single_line"] += int(count > CHINESE_CHARS_PER_LINE)
+        if english:
+            count = subtitle_character_count(english)
+            cps = count / duration
+            stats["english_events"] += 1
+            stats["english_max_cps"] = max(float(stats["english_max_cps"]), cps)
+            stats["english_over_target"] += int(cps > TARGET_ENGLISH_CPS + 1e-9)
+            stats["english_over_single_line"] += int(count > ENGLISH_CHARS_PER_LINE)
+    return stats
+
+
+def print_readability_report(segments: List[Segment]) -> None:
+    stats = readability_stats(segments)
+    print(
+        "Readability report: "
+        f"zh_max_cps={float(stats['chinese_max_cps']):.2f}, "
+        f"zh>{TARGET_CHINESE_CPS:g}cps={stats['chinese_over_target']}, "
+        f"zh>{CHINESE_CHARS_PER_LINE}chars={stats['chinese_over_single_line']}, "
+        f"en_max_cps={float(stats['english_max_cps']):.2f}, "
+        f"en>{TARGET_ENGLISH_CPS:g}cps={stats['english_over_target']}, "
+        f"en>{ENGLISH_CHARS_PER_LINE}chars={stats['english_over_single_line']}"
+    )
+
+
 def build_context_text(segments: List[Segment], start: int, end: int, context_lines: int) -> Tuple[str, str]:
     before_start = max(0, start - context_lines)
     after_end = min(len(segments), end + context_lines)
@@ -1446,17 +1582,75 @@ def build_context_text(segments: List[Segment], start: int, end: int, context_li
     return before, after
 
 
-def format_prompt_segment(index: int, segment: Segment) -> str:
-    return f"[{index}] {float(segment['start']):.2f}->{float(segment['end']):.2f} {segment['text']}"
+def available_reading_duration(
+    segment: Segment,
+    next_start: Optional[float] = None,
+    max_duration: float = 5.5,
+) -> float:
+    start = float(segment["start"])
+    end = float(segment["end"])
+    latest_end = min(end + MAX_READING_EXTENSION, start + max_duration)
+    if next_start is not None:
+        latest_end = min(latest_end, float(next_start) - MIN_SUBTITLE_GAP)
+    return max(0.01, latest_end - start)
 
 
-def format_bilingual_prompt_segment(index: int, segment: Segment) -> str:
+def reading_budgets(
+    segment: Segment,
+    next_start: Optional[float] = None,
+) -> Tuple[int, int]:
+    duration = available_reading_duration(segment, next_start)
+    chinese_budget = max(
+        4,
+        min(
+            CHINESE_CHARS_PER_LINE * MAX_SUBTITLE_LINES,
+            math.floor(duration * TARGET_CHINESE_CPS),
+        ),
+    )
+    english_budget = max(
+        4,
+        min(
+            ENGLISH_CHARS_PER_LINE * MAX_SUBTITLE_LINES,
+            math.floor(duration * TARGET_ENGLISH_CPS),
+        ),
+    )
+    return chinese_budget, english_budget
+
+
+def format_prompt_segment(
+    index: int,
+    segment: Segment,
+    *,
+    next_start: Optional[float] = None,
+    include_readability_limits: bool = False,
+) -> str:
+    suffix = ""
+    if include_readability_limits:
+        chinese_budget, english_budget = reading_budgets(segment, next_start)
+        suffix = f" | LIMITS: ZH_MAX={chinese_budget}, SOURCE_MAX={english_budget}"
+    return (
+        f"[{index}] {float(segment['start']):.2f}->{float(segment['end']):.2f} "
+        f"{segment['text']}{suffix}"
+    )
+
+
+def format_bilingual_prompt_segment(
+    index: int,
+    segment: Segment,
+    *,
+    next_start: Optional[float] = None,
+    include_readability_limits: bool = False,
+) -> str:
     text = str(segment.get("text", ""))
     en_text = clean_english_track_text(str(segment.get("en") or ("" if contains_cjk(text) else text)))
     zh_text = to_simplified_text(clean_subtitle_text(str(segment.get("zh") or (text if contains_cjk(text) else ""))))
+    suffix = ""
+    if include_readability_limits:
+        chinese_budget, english_budget = reading_budgets(segment, next_start)
+        suffix = f" | LIMITS: ZH_MAX={chinese_budget}, EN_MAX={english_budget}"
     return (
         f"[{index}] {float(segment['start']):.2f}->{float(segment['end']):.2f} "
-        f"EN: {en_text or '-'} | ZH: {zh_text or '-'}"
+        f"EN: {en_text or '-'} | ZH: {zh_text or '-'}{suffix}"
     )
 
 
@@ -1567,6 +1761,7 @@ def retry_single_segment_llm(
     segment: Segment,
     before_text: str,
     after_text: str,
+    next_start: Optional[float],
     context_start: float,
     context_end: float,
     system_prompt: str,
@@ -1576,7 +1771,12 @@ def retry_single_segment_llm(
 ) -> Dict[str, Any]:
     print(f"检测到语言异常，正在重试单句: {segment.get('text', '')}")
     if is_proofread:
-        batch_text = format_bilingual_prompt_segment(0, segment)
+        batch_text = format_bilingual_prompt_segment(
+            0,
+            segment,
+            next_start=next_start,
+            include_readability_limits=True,
+        )
         prompt = f"""
 You will proofread only the TARGET LINE(S).
 
@@ -1615,6 +1815,8 @@ Rules:
 - IMPORTANT: The `corrected_english` field MUST be purely English. If the input `English:` field contains Chinese characters, you MUST translate them into English, or leave the field empty. Do not put Chinese characters in `corrected_english`.
 - If English contains SDH/non-speech cues such as music, applause, laughter, or speaker labels and the Chinese line lacks that information, add only that missing cue in concise Simplified Chinese.
 - You MUST translate uppercase descriptive text in parentheses or brackets (e.g. "(SIGHS)" or "[MUSIC]") into Simplified Chinese.
+- LIMITS are maximum visible character budgets calculated from the available display time. If Chinese exceeds ZH_MAX, condense it without losing the intended meaning. Otherwise preserve the existing Chinese meaning and wording as much as possible.
+- Keep each Chinese line within 16 characters and each English line within 42 characters where the text permits.
 - Keep names and recurring terminology consistent across the context. Do not translate a name in one line and leave the same name untranslated in another unless the context clearly requires it.
 - Never output or change timestamps. Timing is enforced by the subtitle pipeline.
 - Keep corrected_english empty only when no English source exists or when the original English text contains no useful translatable English.
@@ -1622,7 +1824,12 @@ Rules:
 - Do not add explanations, markdown, notes, or extra keys.
 """
     else:
-        batch_text = format_prompt_segment(0, segment)
+        batch_text = format_prompt_segment(
+            0,
+            segment,
+            next_start=next_start,
+            include_readability_limits=True,
+        )
         prompt = f"""
 You will correct and translate only the TARGET LINE(S).
 
@@ -1659,6 +1866,8 @@ Rules:
 - Correct obvious ASR/OCR/subtitle errors in the source text before translating.
 - Keep corrected_text in the original source language.
 - Translate into natural Simplified Chinese.
+- LIMITS are maximum visible character budgets calculated from the available display time. Keep chinese_translation within ZH_MAX by using concise natural Chinese without dropping the intended meaning.
+- Keep each Chinese line within 16 characters and each source line within 42 characters where the text permits.
 - Keep personal names and recurring terminology consistent across the context. Do not translate a name in one line and leave the same name untranslated in another unless the context clearly requires it.
 """
     
@@ -1735,7 +1944,19 @@ def translate_and_correct_segments(
 
         before_text, after_text = build_context_text(segments, i, i + len(batch), context_lines)
         approved_output_context = build_approved_output_context(processed_segments, context_lines)
-        batch_text = "\n".join(format_prompt_segment(j, segment) for j, segment in enumerate(batch))
+        batch_text = "\n".join(
+            format_prompt_segment(
+                j,
+                segment,
+                next_start=(
+                    float(segments[i + j + 1]["start"])
+                    if i + j + 1 < len(segments)
+                    else None
+                ),
+                include_readability_limits=True,
+            )
+            for j, segment in enumerate(batch)
+        )
         context_start_index = max(0, i - context_lines)
         context_end_index = min(len(segments), i + len(batch) + context_lines)
         context_start = float(segments[context_start_index]["start"])
@@ -1785,6 +2006,8 @@ Rules:
 - Keep corrected_text in the original source language.
 - Translate into natural Simplified Chinese.
 - You MUST translate uppercase descriptive text in parentheses or brackets (e.g. "(SIGHS)" or "[MUSIC]") into Simplified Chinese.
+- LIMITS are maximum visible character budgets calculated from the available display time. Keep chinese_translation within ZH_MAX by using concise natural Chinese without dropping the intended meaning.
+- Keep each Chinese line within 16 characters and each source line within 42 characters where the text permits.
 - Keep personal names and recurring terminology consistent across the context. Do not translate a name in one line and leave the same name untranslated in another unless the context clearly requires it.
 """
 
@@ -1827,6 +2050,11 @@ Rules:
                         segment,
                         f"{before_text}\n\nPREVIOUS APPROVED OUTPUT:\n{approved_output_context}",
                         after_text,
+                        (
+                            float(segments[i + j + 1]["start"])
+                            if i + j + 1 < len(segments)
+                            else None
+                        ),
                         context_start,
                         context_end,
                         system_prompt,
@@ -1927,7 +2155,19 @@ def proofread_existing_chinese_segments(
 
         before_text, after_text = build_bilingual_context_text(segments, i, i + len(batch), context_lines)
         approved_output_context = build_approved_output_context(processed_segments, context_lines)
-        batch_text = "\n".join(format_bilingual_prompt_segment(j, segment) for j, segment in enumerate(batch))
+        batch_text = "\n".join(
+            format_bilingual_prompt_segment(
+                j,
+                segment,
+                next_start=(
+                    float(segments[i + j + 1]["start"])
+                    if i + j + 1 < len(segments)
+                    else None
+                ),
+                include_readability_limits=True,
+            )
+            for j, segment in enumerate(batch)
+        )
         context_start_index = max(0, i - context_lines)
         context_end_index = min(len(segments), i + len(batch) + context_lines)
         context_start = float(segments[context_start_index]["start"])
@@ -1974,6 +2214,8 @@ Rules:
 - IMPORTANT: The `corrected_english` field MUST be purely English. If the input `English:` field contains Chinese characters, you MUST translate them into English, or leave the field empty. Do not put Chinese characters in `corrected_english`.
 - If English contains SDH/non-speech cues such as music, applause, laughter, or speaker labels and the Chinese line lacks that information, add only that missing cue in concise Simplified Chinese.
 - You MUST translate uppercase descriptive text in parentheses or brackets (e.g. "(SIGHS)" or "[MUSIC]") into Simplified Chinese.
+- LIMITS are maximum visible character budgets calculated from the available display time. If Chinese exceeds ZH_MAX, condense it without losing the intended meaning. Otherwise preserve the existing Chinese meaning and wording as much as possible.
+- Keep each Chinese line within 16 characters and each English line within 42 characters where the text permits.
 - Keep names and recurring terminology consistent across the context. Do not translate a name in one line and leave the same name untranslated in another unless the context clearly requires it.
 - If adjacent TARGET lines are repeated, overlapping, or fragments of the same subtitle, keep the earliest suitable object visible and set only later redundant objects to "display": false.
 - Never output or change timestamps. Timing is enforced by the subtitle pipeline.
@@ -2027,6 +2269,11 @@ Rules:
                         segment,
                         f"{before_text}\n\nPREVIOUS APPROVED OUTPUT:\n{approved_output_context}",
                         after_text,
+                        (
+                            float(segments[i + j + 1]["start"])
+                            if i + j + 1 < len(segments)
+                            else None
+                        ),
                         context_start,
                         context_end,
                         system_prompt,
@@ -2214,12 +2461,18 @@ def print_timing_report(segments: List[Segment]) -> None:
         float(segments[index]["start"]) - float(segments[index - 1]["end"])
         for index in range(1, len(segments))
     ]
+    out_of_order = sum(
+        float(segments[index]["start"]) < float(segments[index - 1]["start"])
+        for index in range(1, len(segments))
+    )
     print(
         "Timing report: "
         f"events={len(segments)}, "
         f"max_duration={max(durations):.2f}s, "
         f">6s={sum(duration > 6 for duration in durations)}, "
         f">8s={sum(duration > 8 for duration in durations)}, "
+        f"overlaps={sum(gap < 0 for gap in gaps)}, "
+        f"out_of_order={out_of_order}, "
         f"gaps>5s={sum(gap > 5 for gap in gaps)}, "
         f"max_gap={max(gaps) if gaps else 0:.2f}s"
     )
@@ -2549,6 +2802,7 @@ def main() -> None:
             write_json_atomic(checkpoint_path, processed_segments)
 
         print_timing_report(output_segments)
+        print_readability_report(output_segments)
         print(f"Success! Subtitles saved to {out_dir}")
     finally:
         if temp_audio.exists():
