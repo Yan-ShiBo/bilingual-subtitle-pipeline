@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -84,6 +85,82 @@ def source_cache_uses_current_timing_policy(segments: List[Segment]) -> bool:
     if not has_merged_existing_subtitles:
         return True
     return all(int(segment.get("source_cache_version") or 0) >= SOURCE_CACHE_VERSION for segment in segments)
+
+
+def source_path_identity(path: Optional[Path]) -> Optional[Dict[str, Any]]:
+    if path is None:
+        return None
+    try:
+        resolved = path.expanduser().resolve()
+    except OSError:
+        resolved = path.expanduser().absolute()
+    identity: Dict[str, Any] = {"path": str(resolved)}
+    if resolved.is_dir():
+        identity["kind"] = "directory"
+        return identity
+    try:
+        stat = resolved.stat()
+        identity.update({"size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
+    except OSError:
+        identity["missing"] = True
+    return identity
+
+
+def build_source_request_fingerprint(
+    video_path: Path,
+    input_path: Path,
+    args: Any,
+    sidecar_path: Optional[Path] = None,
+    chinese_sidecar_path: Optional[Path] = None,
+    english_sidecar_path: Optional[Path] = None,
+) -> str:
+    source_mode = str(getattr(args, "source", "auto") or "auto")
+    discovered_sidecars: List[Dict[str, Any]] = []
+    if source_mode in {"auto", "sidecar", "srt"}:
+        for candidate in likely_sidecar_subtitles(video_path, input_path):
+            identity = source_path_identity(candidate)
+            if identity is not None:
+                discovered_sidecars.append(identity)
+
+    descriptor = {
+        "version": 1,
+        "video": source_path_identity(video_path),
+        "input": source_path_identity(input_path),
+        "source": source_mode,
+        "merge_existing_subtitles": str(getattr(args, "merge_existing_subtitles", "yes")),
+        "sidecar": source_path_identity(sidecar_path),
+        "chinese_sidecar": source_path_identity(chinese_sidecar_path),
+        "english_sidecar": source_path_identity(english_sidecar_path),
+        "discovered_sidecars": discovered_sidecars,
+        "subtitle_stream": getattr(args, "subtitle_stream", None),
+        "chinese_subtitle_stream": getattr(args, "chinese_subtitle_stream", None),
+        "english_subtitle_stream": getattr(args, "english_subtitle_stream", None),
+        "audio_stream": getattr(args, "audio_stream", None),
+        "source_language": str(getattr(args, "source_language", "auto") or "auto"),
+        "asr_language": str(getattr(args, "asr_language", "source") or "source"),
+        "subtitle_ocr_lang": str(getattr(args, "subtitle_ocr_lang", "auto") or "auto"),
+        "device": str(getattr(args, "device", "gpu:0") or "gpu:0"),
+        "ocr_scale": float(getattr(args, "ocr_scale", 2.0) or 2.0),
+        "crop_pad": int(getattr(args, "crop_pad", 8) or 8),
+        "fast_ocr": bool(getattr(args, "fast_ocr", False)),
+    }
+    serialized = json.dumps(descriptor, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def source_cache_matches_request(
+    segments: List[Segment],
+    request_fingerprint: str,
+    allow_legacy: bool = False,
+) -> bool:
+    cached_fingerprints = {
+        str(segment.get("source_request_fingerprint") or "")
+        for segment in segments
+    }
+    cached_fingerprints.discard("")
+    if not cached_fingerprints:
+        return allow_legacy
+    return cached_fingerprints == {request_fingerprint}
 
 
 def dominant_source_language(segments: List[Segment]) -> str:
@@ -325,6 +402,33 @@ def parse_json_response(text: str) -> Any:
         if end <= start:
             raise
         return json.loads(cleaned[start : end + 1])
+
+
+def validate_indexed_batch_response(data: Any, expected_count: int) -> Dict[int, Dict[str, Any]]:
+    if not isinstance(data, list):
+        raise ValueError("LLM did not return a JSON list")
+    if len(data) != expected_count:
+        raise ValueError(f"LLM returned {len(data)} objects; expected {expected_count}")
+
+    lookup: Dict[int, Dict[str, Any]] = {}
+    for position, item in enumerate(data):
+        if not isinstance(item, dict):
+            raise ValueError(f"LLM response item {position} is not an object")
+        try:
+            index = int(item["index"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"LLM response item {position} has no valid index") from exc
+        if index < 0 or index >= expected_count:
+            raise ValueError(f"LLM response index {index} is outside 0..{expected_count - 1}")
+        if index in lookup:
+            raise ValueError(f"LLM response contains duplicate index {index}")
+        lookup[index] = item
+
+    expected_indexes = set(range(expected_count))
+    if set(lookup) != expected_indexes:
+        missing = sorted(expected_indexes - set(lookup))
+        raise ValueError(f"LLM response is missing indexes: {missing}")
+    return lookup
 
 
 def parse_movie_name(filename: str, llm_model: str) -> Tuple[str, str]:
@@ -601,7 +705,6 @@ def find_sidecar_subtitles(video_path: Path, selected_path: Optional[Path] = Non
     roots = [video_path.parent]
     if selected_path and selected_path.is_dir() and selected_path not in roots:
         roots.append(selected_path)
-    direct_stems = {video_path.stem.lower()}
     for ext in SUBTITLE_EXTENSIONS:
         direct = video_path.with_suffix(ext)
         if direct.exists():
@@ -615,11 +718,7 @@ def find_sidecar_subtitles(video_path: Path, selected_path: Optional[Path] = Non
     scored: List[tuple[int, str, Path]] = []
     for candidate in candidates:
         stem = candidate.stem.lower()
-        score = 0
-        if stem in direct_stems:
-            score += 100
-        if video_path.stem.lower() in stem or stem in video_path.stem.lower():
-            score += 50
+        score = sidecar_match_score(video_path, candidate)
         if any(token in stem for token in ("en", "eng", "english")):
             score += 10
         scored.append((score, candidate.name.lower(), candidate))
@@ -630,8 +729,26 @@ def find_sidecar_subtitles(video_path: Path, selected_path: Optional[Path] = Non
     return [item[2] for item in sorted(unique.values(), key=lambda item: (item[0], item[1]), reverse=True)]
 
 
+def sidecar_match_score(video_path: Path, subtitle_path: Path) -> int:
+    video_stem = video_path.stem.casefold()
+    subtitle_stem = subtitle_path.stem.casefold()
+    if subtitle_stem == video_stem:
+        return 100
+    if video_stem in subtitle_stem or subtitle_stem in video_stem:
+        return 50
+    return 0
+
+
+def likely_sidecar_subtitles(video_path: Path, selected_path: Optional[Path] = None) -> List[Path]:
+    candidates = find_sidecar_subtitles(video_path, selected_path)
+    matched = [candidate for candidate in candidates if sidecar_match_score(video_path, candidate) > 0]
+    if matched:
+        return matched
+    return candidates if len(candidates) == 1 else []
+
+
 def find_sidecar_subtitle(video_path: Path, selected_path: Optional[Path] = None) -> Optional[Path]:
-    subtitles = find_sidecar_subtitles(video_path, selected_path)
+    subtitles = likely_sidecar_subtitles(video_path, selected_path)
     return subtitles[0] if subtitles else None
 
 
@@ -644,7 +761,7 @@ def sidecar_candidates(
 ) -> List[Path]:
     candidates: List[Path] = []
     candidates.extend(path for path in (explicit_path, explicit_zh_path, explicit_en_path) if path)
-    candidates.extend(find_sidecar_subtitles(video_path, selected_path))
+    candidates.extend(likely_sidecar_subtitles(video_path, selected_path))
 
     unique: List[Path] = []
     seen = set()
@@ -1299,6 +1416,20 @@ def build_bilingual_context_text(segments: List[Segment], start: int, end: int, 
     return before, after
 
 
+def build_approved_output_context(segments: List[Segment], context_lines: int) -> str:
+    if context_lines <= 0:
+        return "(none)"
+    rows: List[str] = []
+    for segment in segments[-context_lines:]:
+        if segment.get("display", True) is False:
+            continue
+        source_text = clean_subtitle_text(str(segment.get("en") or segment.get("text") or ""))
+        chinese_text = clean_subtitle_text(str(segment.get("zh") or ""))
+        if source_text or chinese_text:
+            rows.append(f"EN/SOURCE: {source_text or '-'} | ZH: {chinese_text or '-'}")
+    return "\n".join(rows) or "(none)"
+
+
 def parse_display_flag(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -1354,7 +1485,17 @@ def sanitize_checkpoint_display_timing(segments: List[Segment]) -> List[Segment]
     return sanitized
 
 
-def is_language_valid(original_text: str, corrected: str, translated: str) -> bool:
+def is_language_valid(
+    original_text: str,
+    corrected: str,
+    translated: str,
+    require_corrected: bool = True,
+) -> bool:
+    if require_corrected and not normalize_space(corrected):
+        return False
+    if not normalize_space(translated):
+        return False
+
     orig_cjk_count = len(CJK_RE.findall(original_text))
     corr_cjk_count = len(CJK_RE.findall(corrected))
     trans_has_cjk = contains_cjk(translated)
@@ -1364,7 +1505,7 @@ def is_language_valid(original_text: str, corrected: str, translated: str) -> bo
         return False
         
     # 中文不是中文：译文无中文字符，但包含多个字母（说明可能是生硬复制了外文句子或根本没翻译）
-    if not trans_has_cjk and re.search(r'[a-zA-Z]{3,}', translated):
+    if not trans_has_cjk and any(character.isalpha() for character in translated):
         return False
         
     return True
@@ -1474,11 +1615,18 @@ Rules:
             data = parse_json_response(call_llm(prompt, system_prompt, llm_model))
             if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
                 item = data[0]
+                if not parse_display_flag(item.get("display", True)):
+                    return item
                 if is_proofread:
-                    orig_en, _ = original_en_zh(segment)
+                    orig_en, orig_zh = original_en_zh(segment)
                     corrected = clean_english_track_text(str(item.get("corrected_english") or orig_en))
                     translated = str(item.get("corrected_chinese") or item.get("chinese_translation") or "")
-                    if is_language_valid(orig_en, corrected, translated):
+                    if is_language_valid(
+                        orig_en or orig_zh,
+                        corrected,
+                        translated,
+                        require_corrected=bool(orig_en),
+                    ):
                         return item
                 else:
                     corrected = str(item.get("corrected_text") or item.get("corrected_source") or segment.get("text", ""))
@@ -1489,7 +1637,7 @@ Rules:
         except Exception as exc:
             print(f"重试单句请求异常: {exc}")
     
-    print("10次重试均失败，将采用原始字幕。")
+    print("10次重试均失败，将中断当前批次并保留最近 checkpoint。")
     return {}
 
 
@@ -1520,19 +1668,21 @@ def translate_and_correct_segments(
                 processed_segments = sanitize_checkpoint_display_timing(cached)
                 print(f"Resuming from checkpoint with {len(processed_segments)} completed segments.")
             else:
-                print(f"Ignoring checkpoint because it does not match the current subtitle segmentation.")
+                print("Ignoring checkpoint because it does not match the current subtitle segmentation.")
         except Exception as exc:
             print(f"Ignoring unreadable checkpoint {checkpoint_path}: {exc}")
 
     start_index = len(processed_segments)
-    start_index -= start_index % batch_size
-    processed_segments = processed_segments[:start_index]
+    if start_index < len(segments):
+        start_index -= start_index % batch_size
+        processed_segments = processed_segments[:start_index]
 
     for i in range(start_index, len(segments), batch_size):
         batch = segments[i : i + batch_size]
         print(f"Processing segments {i + 1} to {i + len(batch)} of {len(segments)}...")
 
         before_text, after_text = build_context_text(segments, i, i + len(batch), context_lines)
+        approved_output_context = build_approved_output_context(processed_segments, context_lines)
         batch_text = "\n".join(format_prompt_segment(j, segment) for j, segment in enumerate(batch))
         context_start_index = max(0, i - context_lines)
         context_end_index = min(len(segments), i + len(batch) + context_lines)
@@ -1548,6 +1698,9 @@ The source subtitle/audio language is: {language_label}.
 
 === PREVIOUS CONTEXT, REFERENCE ONLY ===
 {before_text}
+
+=== PREVIOUS APPROVED OUTPUT, MATCH NAMES AND TERMINOLOGY ===
+{approved_output_context}
 
 === TARGET LINE(S) TO OUTPUT ===
 {batch_text}
@@ -1584,10 +1737,11 @@ Rules:
 """
 
         try:
-            data = None
+            lookup: Optional[Dict[int, Dict[str, Any]]] = None
             for attempt in range(3):
                 try:
                     data = parse_json_response(call_llm(prompt, system_prompt, llm_model))
+                    lookup = validate_indexed_batch_response(data, len(batch))
                     break
                 except Exception as exc:
                     print(f"LLM request failed (attempt {attempt+1}/3): {exc}")
@@ -1595,24 +1749,16 @@ Rules:
                         import time
                         time.sleep(2)
                     else:
-                        print("网络或大模型服务异常，连续重试失败，已中断翻译。再次运行可从断点继续。")
-                        import sys
-                        sys.exit(1)
-                        
-            if not isinstance(data, list):
-                raise ValueError("LLM did not return a JSON list")
-
-            lookup: Dict[int, Dict[str, Any]] = {}
-            for item in data:
-                if isinstance(item, dict) and "index" in item:
-                    try:
-                        lookup[int(item["index"])] = item
-                    except (TypeError, ValueError):
-                        pass
+                        raise RuntimeError(
+                            "网络、大模型服务或响应格式连续失败，已中断翻译；"
+                            "修复后再次运行可从最近 checkpoint 继续。"
+                        ) from exc
+            if lookup is None:
+                raise RuntimeError("LLM response validation did not produce a complete batch")
 
             batch_processed: List[Segment] = []
             for j, segment in enumerate(batch):
-                item = lookup.get(j, {})
+                item = lookup[j]
                 corrected_val = str(
                     item.get("corrected_text")
                     or item.get("corrected_source")
@@ -1622,30 +1768,35 @@ Rules:
                 corrected = clean_subtitle_text(corrected_val)
                 translated_val = str(item.get("chinese_translation") or "")
                 translated = clean_subtitle_text(translated_val)
-                
-                if not is_language_valid(segment["text"], corrected, translated):
+                display = parse_display_flag(item.get("display", True))
+
+                if display and not is_language_valid(segment["text"], corrected, translated):
                     retry_item = retry_single_segment_llm(
-                        segment, before_text, after_text, context_start, context_end,
-                        system_prompt, llm_model, language_label, is_proofread=False
+                        segment,
+                        f"{before_text}\n\nPREVIOUS APPROVED OUTPUT:\n{approved_output_context}",
+                        after_text,
+                        context_start,
+                        context_end,
+                        system_prompt,
+                        llm_model,
+                        language_label,
+                        is_proofread=False,
                     )
-                    if retry_item:
-                        item.update(retry_item)
-                        corrected_val = str(
-                            item.get("corrected_text")
-                            or item.get("corrected_source")
-                            or item.get("corrected_english")
-                            or segment["text"]
-                        )
-                        corrected = clean_subtitle_text(corrected_val)
-                        translated_val = str(item.get("chinese_translation") or "")
-                        translated = clean_subtitle_text(translated_val)
-                        
-                        if not is_language_valid(segment["text"], corrected, translated):
-                            corrected = clean_subtitle_text(segment["text"])
-                            translated = clean_subtitle_text(segment["text"])
-                    else:
-                        corrected = clean_subtitle_text(segment["text"])
-                        translated = clean_subtitle_text(segment["text"])
+                    if not retry_item:
+                        raise RuntimeError(f"LLM could not produce a valid translation for segment {i + j}")
+                    item.update(retry_item)
+                    corrected_val = str(
+                        item.get("corrected_text")
+                        or item.get("corrected_source")
+                        or item.get("corrected_english")
+                        or segment["text"]
+                    )
+                    corrected = clean_subtitle_text(corrected_val)
+                    translated_val = str(item.get("chinese_translation") or "")
+                    translated = clean_subtitle_text(translated_val)
+                    display = parse_display_flag(item.get("display", True))
+                    if display and not is_language_valid(segment["text"], corrected, translated):
+                        raise RuntimeError(f"LLM returned an invalid translation for segment {i + j}")
 
                 batch_processed.append(
                     apply_display_timing(
@@ -1661,17 +1812,10 @@ Rules:
                     )
                 )
         except Exception as exc:
-            print(f"Warning: failed to process batch via LLM ({exc}). Falling back to original text.")
-            batch_processed = [
-                {
-                    **segment,
-                    "en": segment["text"],
-                    "zh": segment["text"],
-                    "display": True,
-                    "processing_mode": "translate",
-                }
-                for segment in batch
-            ]
+            raise RuntimeError(
+                f"Failed to process subtitle batch {i + 1}-{i + len(batch)}; "
+                "the last valid checkpoint was preserved."
+            ) from exc
 
         validate_timing_preserved(batch, batch_processed, i)
         processed_segments.extend(batch_processed)
@@ -1721,14 +1865,16 @@ def proofread_existing_chinese_segments(
             print(f"Ignoring unreadable checkpoint {checkpoint_path}: {exc}")
 
     start_index = len(processed_segments)
-    start_index -= start_index % batch_size
-    processed_segments = processed_segments[:start_index]
+    if start_index < len(segments):
+        start_index -= start_index % batch_size
+        processed_segments = processed_segments[:start_index]
 
     for i in range(start_index, len(segments), batch_size):
         batch = segments[i : i + batch_size]
         print(f"Proofreading segments {i + 1} to {i + len(batch)} of {len(segments)}...")
 
         before_text, after_text = build_bilingual_context_text(segments, i, i + len(batch), context_lines)
+        approved_output_context = build_approved_output_context(processed_segments, context_lines)
         batch_text = "\n".join(format_bilingual_prompt_segment(j, segment) for j, segment in enumerate(batch))
         context_start_index = max(0, i - context_lines)
         context_end_index = min(len(segments), i + len(batch) + context_lines)
@@ -1744,6 +1890,9 @@ Do not retranslate a non-empty Chinese line. Translate from English only when th
 
 === PREVIOUS CONTEXT, REFERENCE ONLY ===
 {before_text}
+
+=== PREVIOUS APPROVED OUTPUT, MATCH NAMES AND TERMINOLOGY ===
+{approved_output_context}
 
 === TARGET LINE(S) TO OUTPUT ===
 {batch_text}
@@ -1782,10 +1931,11 @@ Rules:
 """
 
         try:
-            data = None
+            lookup: Optional[Dict[int, Dict[str, Any]]] = None
             for attempt in range(3):
                 try:
                     data = parse_json_response(call_llm(prompt, system_prompt, llm_model))
+                    lookup = validate_indexed_batch_response(data, len(batch))
                     break
                 except Exception as exc:
                     print(f"LLM request failed (attempt {attempt+1}/3): {exc}")
@@ -1793,24 +1943,16 @@ Rules:
                         import time
                         time.sleep(2)
                     else:
-                        print("网络或大模型服务异常，连续重试失败，已中断翻译。再次运行可从断点继续。")
-                        import sys
-                        sys.exit(1)
-
-            if not isinstance(data, list):
-                raise ValueError("LLM did not return a JSON list")
-
-            lookup: Dict[int, Dict[str, Any]] = {}
-            for item in data:
-                if isinstance(item, dict) and "index" in item:
-                    try:
-                        lookup[int(item["index"])] = item
-                    except (TypeError, ValueError):
-                        pass
+                        raise RuntimeError(
+                            "网络、大模型服务或响应格式连续失败，已中断校对；"
+                            "修复后再次运行可从最近 checkpoint 继续。"
+                        ) from exc
+            if lookup is None:
+                raise RuntimeError("LLM response validation did not produce a complete batch")
 
             batch_processed: List[Segment] = []
             for j, segment in enumerate(batch):
-                item = lookup.get(j, {})
+                item = lookup[j]
                 original_en, original_zh = original_en_zh(segment)
                 corrected_en_val = str(item.get("corrected_english") or item.get("en") or original_en)
                 corrected_en = clean_english_track_text(corrected_en_val)
@@ -1821,30 +1963,45 @@ Rules:
                     or original_zh
                 )
                 corrected_zh = to_simplified_text(clean_subtitle_text(corrected_zh_val))
-                
-                if not is_language_valid(original_en, corrected_en, corrected_zh):
+                display = parse_display_flag(item.get("display", True))
+
+                if display and not is_language_valid(
+                    original_en or original_zh,
+                    corrected_en,
+                    corrected_zh,
+                    require_corrected=bool(original_en),
+                ):
                     retry_item = retry_single_segment_llm(
-                        segment, before_text, after_text, context_start, context_end,
-                        system_prompt, llm_model, "", is_proofread=True
+                        segment,
+                        f"{before_text}\n\nPREVIOUS APPROVED OUTPUT:\n{approved_output_context}",
+                        after_text,
+                        context_start,
+                        context_end,
+                        system_prompt,
+                        llm_model,
+                        "",
+                        is_proofread=True,
                     )
-                    if retry_item:
-                        item.update(retry_item)
-                        corrected_en_val = str(item.get("corrected_english") or item.get("en") or original_en)
-                        corrected_en = clean_english_track_text(corrected_en_val)
-                        corrected_zh_val = str(
-                            item.get("corrected_chinese")
-                            or item.get("chinese")
-                            or item.get("zh")
-                            or original_zh
-                        )
-                        corrected_zh = to_simplified_text(clean_subtitle_text(corrected_zh_val))
-                        
-                        if not is_language_valid(original_en, corrected_en, corrected_zh):
-                            corrected_en = clean_english_track_text(original_en)
-                            corrected_zh = to_simplified_text(clean_subtitle_text(original_zh))
-                    else:
-                        corrected_en = clean_english_track_text(original_en)
-                        corrected_zh = to_simplified_text(clean_subtitle_text(original_zh))
+                    if not retry_item:
+                        raise RuntimeError(f"LLM could not produce a valid proofread result for segment {i + j}")
+                    item.update(retry_item)
+                    corrected_en_val = str(item.get("corrected_english") or item.get("en") or original_en)
+                    corrected_en = clean_english_track_text(corrected_en_val)
+                    corrected_zh_val = str(
+                        item.get("corrected_chinese")
+                        or item.get("chinese")
+                        or item.get("zh")
+                        or original_zh
+                    )
+                    corrected_zh = to_simplified_text(clean_subtitle_text(corrected_zh_val))
+                    display = parse_display_flag(item.get("display", True))
+                    if display and not is_language_valid(
+                        original_en or original_zh,
+                        corrected_en,
+                        corrected_zh,
+                        require_corrected=bool(original_en),
+                    ):
+                        raise RuntimeError(f"LLM returned an invalid proofread result for segment {i + j}")
 
                 batch_processed.append(
                     apply_display_timing(
@@ -1860,19 +2017,10 @@ Rules:
                     )
                 )
         except Exception as exc:
-            print(f"Warning: failed to process batch via LLM ({exc}). Falling back to original text.")
-            batch_processed = []
-            for segment in batch:
-                original_en, original_zh = original_en_zh(segment)
-                batch_processed.append(
-                    {
-                        **segment,
-                        "en": clean_english_track_text(original_en),
-                        "zh": original_zh,
-                        "display": True,
-                        "processing_mode": "proofread_existing_chinese",
-                    }
-                )
+            raise RuntimeError(
+                f"Failed to proofread subtitle batch {i + 1}-{i + len(batch)}; "
+                "the last valid checkpoint was preserved."
+            ) from exc
 
         validate_timing_preserved(batch, batch_processed, i)
         processed_segments.extend(batch_processed)
@@ -1898,6 +2046,14 @@ def checkpoint_matches_segments(
             print(
                 "Ignoring checkpoint because it was generated by a different processing mode "
                 f"at item {index}: expected {expected_mode}, got {cached_segment.get('processing_mode')!r}."
+            )
+            return False
+        current_fingerprint = str(current.get("source_request_fingerprint") or "")
+        cached_fingerprint = str(cached_segment.get("source_request_fingerprint") or "")
+        if current_fingerprint and cached_fingerprint != current_fingerprint:
+            print(
+                "Ignoring checkpoint because its source request fingerprint does not match "
+                f"the current source at item {index}."
             )
             return False
         same_start = abs(float(cached_segment["start"]) - float(current["start"])) <= 0.02
@@ -2059,6 +2215,7 @@ def main() -> None:
     parser.add_argument("--max-words", type=int, default=12, help="Maximum English words per subtitle event")
     parser.add_argument("--max-chars", type=int, default=56, help="Maximum English characters per subtitle event")
     parser.add_argument("--max-duration", type=float, default=5.5, help="Maximum seconds per subtitle event before splitting")
+    parser.add_argument("--run-state-file", type=str, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     input_path = Path(args.video)
@@ -2079,6 +2236,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = out_dir / f"{movie_name}.segments.checkpoint.json"
     source_segments_path = out_dir / f"{movie_name}.segments.source.json"
+    run_state_file = Path(args.run_state_file) if args.run_state_file else None
 
     sidecar_path = Path(args.subtitle_file or args.srt) if (args.subtitle_file or args.srt) else None
     chinese_sidecar_path = Path(args.chinese_subtitle_file) if args.chinese_subtitle_file else None
@@ -2088,6 +2246,32 @@ def main() -> None:
     merge_existing_subtitles = args.merge_existing_subtitles == "yes"
     if args.source in ("auto", "sidecar", "srt") and not sidecar_path:
         sidecar_path = find_sidecar_subtitle(video_path, input_path)
+    source_request_fingerprint = build_source_request_fingerprint(
+        video_path,
+        input_path,
+        args,
+        sidecar_path=sidecar_path,
+        chinese_sidecar_path=chinese_sidecar_path,
+        english_sidecar_path=english_sidecar_path,
+    )
+    has_explicit_source_selection = any(
+        value is not None and value != ""
+        for value in (
+            args.subtitle_file,
+            args.srt,
+            args.chinese_subtitle_file,
+            args.english_subtitle_file,
+            args.subtitle_stream,
+            args.chinese_subtitle_stream,
+            args.english_subtitle_stream,
+            args.audio_stream,
+        )
+    )
+    allow_legacy_source_cache = (
+        args.source in ("auto", "audio")
+        and not has_explicit_source_selection
+        and not (args.source == "auto" and sidecar_path is not None)
+    )
 
     temp_audio = out_dir / f".{movie_name}.subtitle-audio.{os.getpid()}.wav"
     try:
@@ -2095,16 +2279,30 @@ def main() -> None:
         source_language = args.source_language
         asr_language = resolve_asr_language(args.asr_language, args.source_language)
         subtitle_segments: Optional[List[Segment]] = None
+        loaded_legacy_source_cache = False
         if source_segments_path.exists():
             try:
                 cached_segments = load_cached_source_segments(source_segments_path)
-                if not source_cache_uses_current_timing_policy(cached_segments):
+                if not source_cache_matches_request(
+                    cached_segments,
+                    source_request_fingerprint,
+                    allow_legacy=allow_legacy_source_cache,
+                ):
+                    print(
+                        "Ignoring cached source segments because the selected source, file, stream, "
+                        f"or input video changed: {source_segments_path}"
+                    )
+                elif not source_cache_uses_current_timing_policy(cached_segments):
                     print(
                         "Ignoring legacy merged-subtitle source cache because it predates the current "
                         f"timing-anchor policy: {source_segments_path}"
                     )
                 elif source_cache_matches_requested_language(cached_segments, args.source_language, args.asr_language):
                     subtitle_segments = cached_segments
+                    loaded_legacy_source_cache = not any(
+                        segment.get("source_request_fingerprint")
+                        for segment in cached_segments
+                    )
                     actual_source = "cached source segments"
                     source_language = infer_source_language_from_segments(subtitle_segments, source_language)
                     print(f"Reusing cached source segments from {source_segments_path} ({len(subtitle_segments)} events).")
@@ -2204,6 +2402,8 @@ def main() -> None:
         subtitle_segments = apply_timing_sanity_rules(subtitle_segments, max_duration=args.max_duration)
         for segment in subtitle_segments:
             segment["source_cache_version"] = SOURCE_CACHE_VERSION
+            if not loaded_legacy_source_cache:
+                segment["source_request_fingerprint"] = source_request_fingerprint
         write_json_atomic(source_segments_path, subtitle_segments)
 
         print(f"Actual subtitle source: {actual_source}")
@@ -2242,6 +2442,14 @@ def main() -> None:
         generate_ass(output_segments, zh_ass, "zh")
         generate_ass(output_segments, bi_ass, "bilingual")
 
+        if loaded_legacy_source_cache:
+            for segment in subtitle_segments:
+                segment["source_request_fingerprint"] = source_request_fingerprint
+            for segment in processed_segments:
+                segment["source_request_fingerprint"] = source_request_fingerprint
+            write_json_atomic(source_segments_path, subtitle_segments)
+            write_json_atomic(checkpoint_path, processed_segments)
+
         print_timing_report(output_segments)
         print(f"Success! Subtitles saved to {out_dir}")
     finally:
@@ -2250,6 +2458,11 @@ def main() -> None:
                 temp_audio.unlink()
             except OSError as exc:
                 print(f"Warning: could not remove temporary audio {temp_audio}: {exc}", file=sys.stderr)
+        if run_state_file and run_state_file.exists():
+            try:
+                run_state_file.unlink()
+            except OSError as exc:
+                print(f"Warning: could not remove run state {run_state_file}: {exc}", file=sys.stderr)
 
 
 if __name__ == "__main__":

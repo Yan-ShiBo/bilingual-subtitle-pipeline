@@ -13,6 +13,11 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 try:
+    import psutil
+except ImportError:
+    psutil = None
+
+try:
     from ssh_tunnel import tunnel_manager
 except ImportError:
     tunnel_manager = None
@@ -229,6 +234,16 @@ def resolve_video_path(input_path: Path) -> Path:
     raise FileNotFoundError(f"Unsupported video input: {input_path}")
 
 
+def sidecar_match_score(video_path: Path, subtitle_path: Path) -> int:
+    video_stem = video_path.stem.casefold()
+    subtitle_stem = subtitle_path.stem.casefold()
+    if subtitle_stem == video_stem:
+        return 100
+    if video_stem in subtitle_stem or subtitle_stem in video_stem:
+        return 50
+    return 0
+
+
 def list_sidecar_subtitles(selected_path: Path, video_path: Path) -> List[Dict[str, Any]]:
     roots = [video_path.parent]
     if selected_path.is_dir() and selected_path not in roots:
@@ -240,15 +255,14 @@ def list_sidecar_subtitles(selected_path: Path, video_path: Path) -> List[Dict[s
             if direct.exists():
                 paths[direct] = max(paths.get(direct, 0), 100)
             for candidate in root.glob(f"*{ext}"):
-                score = 10
+                match_score = sidecar_match_score(video_path, candidate)
+                score = match_score
                 lower = candidate.stem.lower()
-                if lower == video_path.stem.lower():
-                    score += 100
-                if video_path.stem.lower() in lower or lower in video_path.stem.lower():
-                    score += 50
                 if any(token in lower for token in ("en", "eng", "english")):
                     score += 10
                 paths[candidate] = max(paths.get(candidate, 0), score)
+    has_matched_candidate = any(sidecar_match_score(video_path, path) > 0 for path in paths)
+    allow_single_fallback = len(paths) == 1 and not has_matched_candidate
     return [
         {
             "path": str(path),
@@ -256,6 +270,7 @@ def list_sidecar_subtitles(selected_path: Path, video_path: Path) -> List[Dict[s
             "extension": path.suffix.lower(),
             "size_kb": round(path.stat().st_size / 1024, 1),
             "score": score,
+            "likely_match": sidecar_match_score(video_path, path) > 0 or allow_single_fallback,
         }
         for path, score in sorted(paths.items(), key=lambda item: (item[1], item[0].name.lower()), reverse=True)
     ]
@@ -316,6 +331,96 @@ def default_names(input_path: Path, video_path: Path, llm_model: str = "qwen3:14
 
 def output_dir(output_root: Path, series_name: str, movie_name: str) -> Path:
     return output_root / series_name / movie_name
+
+
+def run_state_path(out_dir: Path, movie_name: str) -> Path:
+    return out_dir / f".{safe_file_part(movie_name)}.subtitle-run.json"
+
+
+def write_run_state(path: Path, data: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f"{path.name}.tmp")
+    temp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(path)
+
+
+def remove_run_state(path: Optional[Path]) -> None:
+    if path is None:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def process_create_time(pid: int) -> Optional[float]:
+    if psutil is None or pid <= 0:
+        return None
+    try:
+        return float(psutil.Process(pid).create_time())
+    except (psutil.Error, OSError):
+        return None
+
+
+def process_matches_run(info: Dict[str, Any]) -> bool:
+    process = info.get("process")
+    if process is not None:
+        return process.poll() is None
+
+    pid = int(info.get("pid") or 0)
+    if pid <= 0 or psutil is None:
+        return False
+    try:
+        current = psutil.Process(pid)
+        expected_create_time = info.get("process_create_time")
+        if expected_create_time is not None and abs(current.create_time() - float(expected_create_time)) > 1.0:
+            return False
+        command = [str(part) for part in current.cmdline()]
+    except (psutil.Error, OSError, ValueError):
+        return False
+
+    expected_script = str((APP_DIR / "audio_to_subtitle.py").resolve()).casefold()
+    normalized_command = [str(Path(part).resolve()).casefold() if part.lower().endswith(".py") else part.casefold() for part in command]
+    if expected_script not in normalized_command:
+        return False
+
+    expected_series = str(info.get("series_name") or "")
+    expected_movie = str(info.get("movie_name") or "")
+    expected_output_root = str(info.get("output_root") or "")
+    expected_state_path = str(info.get("state_path") or "")
+    expected_options = (
+        ("--series-name", expected_series),
+        ("--movie-name", expected_movie),
+        ("--output-root", expected_output_root),
+        ("--run-state-file", expected_state_path),
+    )
+    for option, expected in expected_options:
+        if not expected:
+            return False
+        try:
+            option_index = command.index(option)
+        except ValueError:
+            return False
+        if option_index + 1 >= len(command) or command[option_index + 1] != expected:
+            return False
+    return True
+
+
+def load_active_run(out_dir: Path, movie_name: str) -> Optional[Dict[str, Any]]:
+    state_path = run_state_path(out_dir, movie_name)
+    if not state_path.exists():
+        return None
+    try:
+        info = read_json(state_path)
+        if not isinstance(info, dict):
+            raise ValueError("run state is not an object")
+        info["state_path"] = str(state_path)
+        if process_matches_run(info):
+            return info
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    remove_run_state(state_path)
+    return None
 
 
 def read_json(path: Path) -> Any:
@@ -394,7 +499,7 @@ def analyze_input(payload: Dict[str, Any]) -> Dict[str, Any]:
     embedded_audio = list_embedded_audio(video)
     embedded_tracks = [item for item in embedded if "error" not in item]
     audio_tracks = [item for item in embedded_audio if "error" not in item]
-    if sidecars:
+    if any(item.get("likely_match") for item in sidecars):
         auto_source = "sidecar"
     elif embedded_tracks:
         auto_source = "embedded"
@@ -466,6 +571,7 @@ def remove_resume_files(out_dir: Path, movie_name: str) -> None:
         path = out_dir / name
         if path.exists():
             path.unlink()
+    remove_run_state(run_state_path(out_dir, movie_name))
             
     import shutil
     embedded_dir = out_dir / "embedded"
@@ -515,6 +621,7 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     out_dir = output_dir(output_root, series_name, movie_name)
     out_dir.mkdir(parents=True, exist_ok=True)
+    state_path = run_state_path(out_dir, movie_name)
 
     log_path, err_path = frontend_log_paths(series_name, movie_name)
 
@@ -551,6 +658,8 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
         str(max_duration),
         "--merge-existing-subtitles",
         "yes" if merge_existing_subtitles else "no",
+        "--run-state-file",
+        str(state_path),
     ]
     if sidecar_path:
         args.extend(["--subtitle-file", sidecar_path])
@@ -572,10 +681,16 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
     env["PYTHONUTF8"] = "1"
     env["PYTHONUNBUFFERED"] = "1"
     with RUNS_LOCK:
+        persisted_run = load_active_run(out_dir, movie_name)
+        if persisted_run is not None:
+            pid = int(persisted_run["pid"])
+            RUNS[pid] = persisted_run
+            raise RuntimeError(f"任务已在运行，PID {pid}。请先等待完成或终止现有任务。")
+
         for pid, info in list(RUNS.items()):
-            existing = info.get("process")
-            if existing is None or existing.poll() is not None:
+            if not process_matches_run(info):
                 RUNS.pop(pid, None)
+                remove_run_state(Path(info["state_path"]) if info.get("state_path") else None)
                 continue
             if info.get("series_name") == series_name and info.get("movie_name") == movie_name:
                 raise RuntimeError(f"任务已在运行，PID {pid}。请先等待完成或终止现有任务。")
@@ -593,11 +708,25 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
         finally:
             stdout.close()
             stderr.close()
-        RUNS[process.pid] = {
+        run_info = {
+            "version": 1,
+            "pid": process.pid,
+            "process_create_time": process_create_time(process.pid),
+            "started_at": time.time(),
+            "input_path": str(selected),
+            "output_root": str(output_root),
+            "output_dir": str(out_dir),
+            "stdout_log": str(log_path),
+            "stderr_log": str(err_path),
+            "state_path": str(state_path),
+            "command": args,
             "process": process,
             "series_name": series_name,
-            "movie_name": movie_name
+            "movie_name": movie_name,
         }
+        RUNS[process.pid] = run_info
+        persisted_info = {key: value for key, value in run_info.items() if key != "process"}
+        write_run_state(state_path, persisted_info)
 
     return {
         "pid": process.pid,
@@ -608,18 +737,15 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def stop_process_tree(pid: int) -> bool:
+def stop_process_tree(pid: int, recovered_info: Optional[Dict[str, Any]] = None) -> bool:
     if pid <= 0:
         return False
     with RUNS_LOCK:
-        info = RUNS.get(pid)
-    process = info["process"] if info else None
-    if not process:
+        info = RUNS.get(pid) or recovered_info
+    if not info or not process_matches_run(info):
+        remove_run_state(Path(info["state_path"]) if info and info.get("state_path") else None)
         return False
-    if process.poll() is not None:
-        with RUNS_LOCK:
-            RUNS.pop(pid, None)
-        return False
+    process = info.get("process")
 
     if os.name == "nt":
         result = subprocess.run(
@@ -630,22 +756,41 @@ def stop_process_tree(pid: int) -> bool:
         )
         with RUNS_LOCK:
             RUNS.pop(pid, None)
+        remove_run_state(Path(info["state_path"]) if info.get("state_path") else None)
         return result.returncode == 0
 
-    process.terminate()
-    try:
-        process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=10)
+    if process is not None:
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=10)
+    elif psutil is not None:
+        recovered_process = psutil.Process(pid)
+        recovered_process.terminate()
+        try:
+            recovered_process.wait(timeout=10)
+        except psutil.TimeoutExpired:
+            recovered_process.kill()
+            recovered_process.wait(timeout=10)
     with RUNS_LOCK:
         RUNS.pop(pid, None)
+    remove_run_state(Path(info["state_path"]) if info.get("state_path") else None)
     return True
 
 
 def stop_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
     pid = int(payload.get("pid") or 0)
-    stopped = stop_process_tree(pid)
+    output_root = Path(payload.get("output_root") or DEFAULT_OUTPUT_ROOT)
+    series_name = payload["series_name"]
+    movie_name = payload["movie_name"]
+    recovered_info = load_active_run(output_dir(output_root, series_name, movie_name), movie_name)
+    if pid == 0 and recovered_info is not None:
+        pid = int(recovered_info["pid"])
+    if recovered_info is not None and int(recovered_info["pid"]) != pid:
+        recovered_info = None
+    stopped = stop_process_tree(pid, recovered_info=recovered_info)
     status = run_status(payload)
     status.update(
         {
@@ -701,14 +846,23 @@ def run_status(payload: Dict[str, Any]) -> Dict[str, Any]:
     if pid == 0:
         for p_pid, info in run_items:
             if info["series_name"] == series_name and info["movie_name"] == movie_name:
-                proc = info["process"]
-                if proc.poll() is None:
+                if process_matches_run(info):
                     pid = p_pid
                     break
 
     info_proc = dict(run_items).get(pid)
-    process = info_proc["process"] if info_proc else None
-    running = process.poll() is None if process else process_is_running(pid)
+    if info_proc is None:
+        recovered = load_active_run(out_dir, movie_name)
+        if recovered is not None and (pid == 0 or int(recovered["pid"]) == pid):
+            pid = int(recovered["pid"])
+            info_proc = recovered
+            with RUNS_LOCK:
+                RUNS[pid] = recovered
+    running = process_matches_run(info_proc) if info_proc else False
+    if not running and info_proc:
+        with RUNS_LOCK:
+            RUNS.pop(pid, None)
+        remove_run_state(Path(info_proc["state_path"]) if info_proc.get("state_path") else None)
     log_path, err_path = frontend_log_paths(series_name, movie_name)
 
     info = checkpoint_info(output_root, series_name, movie_name)
@@ -1663,6 +1817,8 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/":
             self.send_text(html_page(), "text/html; charset=utf-8")
+        elif parsed.path == "/api/health":
+            self.send_json({"app": "bilingual-subtitle-pipeline", "status": "ok"})
         else:
             self.send_json({"error": "Not found"}, status=404)
 

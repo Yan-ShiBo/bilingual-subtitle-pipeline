@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -14,8 +15,10 @@ import subtitle_frontend  # noqa: E402
 from subtitle_pipeline import SubtitleEvent, pair_events  # noqa: E402
 from audio_to_subtitle import (  # noqa: E402
     apply_display_timing,
+    build_source_request_fingerprint,
     checkpoint_matches_segments,
     extend_display_over_hidden_segments,
+    find_sidecar_subtitle,
     generate_ass,
     load_cached_source_segments,
     merge_existing_subtitle_segments,
@@ -24,6 +27,7 @@ from audio_to_subtitle import (  # noqa: E402
     segments_have_chinese,
     split_segments_for_subtitles,
     source_cache_uses_current_timing_policy,
+    source_cache_matches_request,
     translate_and_correct_segments,
 )
 
@@ -170,6 +174,32 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertFalse(output[2]["display"])
         self.assertEqual(output[0]["zh"], "\u5408\u5e76\u540e\u7684\u7ffb\u8bd1")
 
+    def test_translation_reuses_approved_name_terminology_across_batches(self) -> None:
+        source = [
+            {"id": 0, "start": 1.0, "end": 2.0, "text": "John arrived."},
+            {"id": 1, "start": 2.0, "end": 3.0, "text": "John sat down."},
+        ]
+        prompts = []
+
+        def call_llm(prompt, *_args, **_kwargs):
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                return '[{"index":0,"corrected_text":"John arrived.","chinese_translation":"\u7ea6\u7ff0\u5230\u4e86\u3002","display":true}]'
+            self.assertIn("PREVIOUS APPROVED OUTPUT", prompt)
+            self.assertIn("\u7ea6\u7ff0\u5230\u4e86", prompt)
+            return '[{"index":0,"corrected_text":"John sat down.","chinese_translation":"\u7ea6\u7ff0\u5750\u4e0b\u4e86\u3002","display":true}]'
+
+        with patch.object(audio_to_subtitle, "call_llm", side_effect=call_llm):
+            output = translate_and_correct_segments(
+                source,
+                llm_model="qwen3:30b",
+                batch_size=1,
+                context_lines=2,
+                source_language="en",
+            )
+
+        self.assertEqual(output[1]["zh"], "\u7ea6\u7ff0\u5750\u4e0b\u4e86\u3002")
+
     def test_main_reuses_source_cache_without_audio_extraction(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -218,6 +248,167 @@ class DisplayCleanupTests(unittest.TestCase):
                 audio_to_subtitle.main()
 
             self.assertTrue((out_dir / "Episode.bilingual.ass").exists())
+            upgraded_cache = json.loads(source_cache.read_text(encoding="utf-8"))
+            self.assertTrue(upgraded_cache[0]["source_request_fingerprint"])
+
+    def test_source_cache_fingerprint_changes_with_selected_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video = root / "movie.mkv"
+            first = root / "movie.en.srt"
+            second = root / "movie.zh.srt"
+            video.write_bytes(b"video")
+            first.write_text("first", encoding="utf-8")
+            second.write_text("second", encoding="utf-8")
+            args = SimpleNamespace(
+                source="sidecar",
+                merge_existing_subtitles="no",
+                subtitle_stream=None,
+                chinese_subtitle_stream=None,
+                english_subtitle_stream=None,
+                audio_stream=None,
+                source_language="en",
+                asr_language="source",
+                subtitle_ocr_lang="auto",
+                device="gpu:0",
+                ocr_scale=2.0,
+                crop_pad=8,
+                fast_ocr=False,
+            )
+
+            first_fingerprint = build_source_request_fingerprint(
+                video,
+                video,
+                args,
+                sidecar_path=first,
+            )
+            second_fingerprint = build_source_request_fingerprint(
+                video,
+                video,
+                args,
+                sidecar_path=second,
+            )
+            cached = [
+                {
+                    "id": 0,
+                    "start": 1.0,
+                    "end": 2.0,
+                    "text": "cached",
+                    "source_request_fingerprint": first_fingerprint,
+                }
+            ]
+
+            self.assertNotEqual(first_fingerprint, second_fingerprint)
+            self.assertFalse(source_cache_matches_request(cached, second_fingerprint))
+
+    def test_auto_source_does_not_select_another_episodes_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video = root / "Show.S01E01.mkv"
+            video.write_bytes(b"video")
+            (root / "Show.S01E02.en.srt").write_text("English", encoding="utf-8")
+            (root / "Show.S01E02.zh.srt").write_text("\u4e2d\u6587", encoding="utf-8")
+
+            selected = find_sidecar_subtitle(video, video)
+            frontend_items = subtitle_frontend.list_sidecar_subtitles(video, video)
+
+        self.assertIsNone(selected)
+        self.assertTrue(frontend_items)
+        self.assertFalse(any(item["likely_match"] for item in frontend_items))
+
+    def test_checkpoint_rejects_changed_existing_chinese_track(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 1.0,
+                "end": 2.0,
+                "text": "Hello",
+                "en": "Hello",
+                "zh": "\u65b0\u4e2d\u6587",
+                "source_request_fingerprint": "new-request",
+            }
+        ]
+        cached = [
+            {
+                **source[0],
+                "zh": "\u65e7\u4e2d\u6587",
+                "source_request_fingerprint": "old-request",
+                "display": True,
+                "processing_mode": "proofread_existing_chinese",
+            }
+        ]
+
+        self.assertFalse(
+            checkpoint_matches_segments(
+                cached,
+                source,
+                expected_mode="proofread_existing_chinese",
+            )
+        )
+
+    def test_incomplete_llm_batch_preserves_last_good_checkpoint(self) -> None:
+        source = [
+            {"id": 0, "start": 1.0, "end": 2.0, "text": "First line"},
+            {"id": 1, "start": 2.0, "end": 3.0, "text": "Second line"},
+        ]
+        responses = [
+            '[{"index":0,"corrected_text":"First line","chinese_translation":"\u7b2c\u4e00\u53e5","display":true}]',
+            "[]",
+            "[]",
+            "[]",
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint = Path(tmpdir) / "checkpoint.json"
+            with (
+                patch.object(audio_to_subtitle, "call_llm", side_effect=responses),
+                patch("time.sleep", return_value=None),
+                self.assertRaises(RuntimeError),
+            ):
+                translate_and_correct_segments(
+                    source,
+                    llm_model="qwen3:30b",
+                    batch_size=1,
+                    context_lines=0,
+                    source_language="en",
+                    checkpoint_path=checkpoint,
+                )
+
+            saved = json.loads(checkpoint.read_text(encoding="utf-8"))
+
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["zh"], "\u7b2c\u4e00\u53e5")
+
+    def test_complete_partial_batch_checkpoint_is_not_reprocessed(self) -> None:
+        source = [{"id": 0, "start": 1.0, "end": 2.0, "text": "Complete"}]
+        cached = [
+            {
+                **source[0],
+                "en": "Complete",
+                "zh": "\u5df2\u5b8c\u6210",
+                "display": True,
+                "processing_mode": "translate",
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint = Path(tmpdir) / "checkpoint.json"
+            checkpoint.write_text(json.dumps(cached, ensure_ascii=False), encoding="utf-8")
+            with patch.object(
+                audio_to_subtitle,
+                "call_llm",
+                side_effect=AssertionError("complete checkpoint was reprocessed"),
+            ):
+                output = translate_and_correct_segments(
+                    source,
+                    llm_model="qwen3:30b",
+                    batch_size=5,
+                    context_lines=0,
+                    source_language="en",
+                    checkpoint_path=checkpoint,
+                )
+
+        self.assertEqual(output[0]["zh"], "\u5df2\u5b8c\u6210")
 
     def test_main_uses_output_scoped_temp_audio_and_preserves_sibling_wav(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -309,6 +500,78 @@ class DisplayCleanupTests(unittest.TestCase):
                     subtitle_frontend.start_processing(payload)
                     with self.assertRaisesRegex(RuntimeError, "任务已在运行"):
                         subtitle_frontend.start_processing(payload)
+            finally:
+                subtitle_frontend.RUNS.clear()
+
+    def test_frontend_recovers_active_run_after_registry_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_root = Path(tmpdir) / "out"
+            out_dir = output_root / "Series" / "Episode"
+            state_path = subtitle_frontend.run_state_path(out_dir, "Episode")
+            subtitle_frontend.write_run_state(
+                state_path,
+                {
+                    "version": 1,
+                    "pid": 4321,
+                    "series_name": "Series",
+                    "movie_name": "Episode",
+                    "state_path": str(state_path),
+                },
+            )
+            subtitle_frontend.RUNS.clear()
+            try:
+                with patch.object(subtitle_frontend, "process_matches_run", return_value=True):
+                    status = subtitle_frontend.run_status(
+                        {
+                            "pid": 0,
+                            "output_root": str(output_root),
+                            "series_name": "Series",
+                            "movie_name": "Episode",
+                        }
+                    )
+            finally:
+                subtitle_frontend.RUNS.clear()
+
+        self.assertTrue(status["running"])
+        self.assertEqual(status["pid"], 4321)
+
+    def test_frontend_rejects_persisted_duplicate_after_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video = root / "video.mp4"
+            video.write_bytes(b"placeholder")
+            output_root = root / "out"
+            out_dir = output_root / "Series" / "Episode"
+            state_path = subtitle_frontend.run_state_path(out_dir, "Episode")
+            subtitle_frontend.write_run_state(
+                state_path,
+                {
+                    "version": 1,
+                    "pid": 9876,
+                    "series_name": "Series",
+                    "movie_name": "Episode",
+                    "state_path": str(state_path),
+                },
+            )
+            payload = {
+                "path": str(video),
+                "output_root": str(output_root),
+                "series_name": "Series",
+                "movie_name": "Episode",
+                "source": "audio",
+            }
+            subtitle_frontend.RUNS.clear()
+            try:
+                with (
+                    patch.object(subtitle_frontend, "process_matches_run", return_value=True),
+                    patch.object(
+                        subtitle_frontend.subprocess,
+                        "Popen",
+                        side_effect=AssertionError("duplicate process was launched"),
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "9876"),
+                ):
+                    subtitle_frontend.start_processing(payload)
             finally:
                 subtitle_frontend.RUNS.clear()
 
@@ -927,6 +1190,15 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertIn("subtitle_file: usesSidecar && !mergeExisting", page)
         self.assertIn("chinese_subtitle_stream: usesEmbedded && mergeExisting", page)
         self.assertIn("audio_stream: usesAudio ?", page)
+
+    def test_frontend_launcher_does_not_open_an_unrelated_service(self) -> None:
+        frontend_source = (ROOT / "src" / "subtitle_frontend.py").read_text(encoding="utf-8")
+        launcher = (ROOT / "scripts" / "start_frontend.ps1").read_text(encoding="utf-8")
+
+        self.assertIn('parsed.path == "/api/health"', frontend_source)
+        self.assertIn('"app": "bilingual-subtitle-pipeline"', frontend_source)
+        self.assertIn('Invoke-RestMethod -Uri "$url/api/health"', launcher)
+        self.assertIn("foreach ($port in 8765..8775)", launcher)
 
 
 if __name__ == "__main__":

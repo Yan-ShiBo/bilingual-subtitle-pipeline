@@ -97,7 +97,7 @@ class SSHTunnelManager:
             
             try:
                 chan = transport.open_channel("direct-tcpip", (self.remote_host, self.remote_port), addr)
-            except Exception as e:
+            except Exception:
                 client.close()
                 continue
                 
