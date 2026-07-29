@@ -18,6 +18,8 @@ from typing import Any, Iterable
 
 from PIL import Image, ImageFilter
 
+from ass_styles import STYLE_PROFILE_NAMES, ass_style_header, probe_video_play_resolution
+
 
 def configure_output_encoding() -> None:
     for stream in (sys.stdout, sys.stderr):
@@ -1323,22 +1325,22 @@ def ass_escape(text: str) -> str:
     return text
 
 
-def write_bilingual_ass(pairs: list[tuple[SubtitleEvent | None, SubtitleEvent | None]], out_path: Path) -> None:
+def write_bilingual_ass(
+    pairs: list[tuple[SubtitleEvent | None, SubtitleEvent | None]],
+    out_path: Path,
+    *,
+    play_resolution: tuple[int, int] = (1920, 1080),
+    style_profile: str = "adaptive",
+    font_name: str = "",
+    font_scale: int | float = 100,
+) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    header = """[Script Info]
-ScriptType: v4.00+
-WrapStyle: 0
-ScaledBorderAndShadow: yes
-PlayResX: 1920
-PlayResY: 1080
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Bilingual,Microsoft YaHei,46,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,2.2,0.7,2,80,80,58,1
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-"""
+    header = ass_style_header(
+        *play_resolution,
+        profile_name=style_profile,
+        font_name=font_name,
+        font_scale=font_scale,
+    )
     with out_path.open("w", encoding="utf-8-sig", newline="\n") as f:
         f.write(header)
         for en, zh in pairs:
@@ -1348,15 +1350,18 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             zh_text = ass_escape(zh.text) if zh and zh.text else ""
             en_text = ass_escape(en.text) if en and en.text else ""
             if zh_text and en_text:
-                text = f"{zh_text}\\N{{\\fs34}}{en_text}"
+                text = f"{{\\rChinese}}{zh_text}\\N{{\\rSource}}{en_text}"
+                style = "Chinese"
             elif zh_text:
                 text = zh_text
+                style = "Chinese"
             else:
-                text = f"{{\\fs38}}{en_text}"
+                text = en_text
+                style = "SourceOnly"
             f.write(
                 "Dialogue: 0,"
                 f"{seconds_to_ass_time(base.start)},{seconds_to_ass_time(base.end)},"
-                f"Bilingual,,0,0,0,,{text}\n"
+                f"{style},,0,0,0,,{text}\n"
             )
 
 
@@ -1543,6 +1548,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--list-streams", action="store_true")
     parser.add_argument("--batch-size", type=int, default=5, help="LLM batch size in subtitle sentence units.")
     parser.add_argument("--context-lines", type=int, default=30, help="Reference this many subtitle lines before and after each target batch.")
+    parser.add_argument(
+        "--subtitle-style-profile",
+        choices=STYLE_PROFILE_NAMES,
+        default="adaptive",
+        help="ASS display profile: adaptive, mobile, or compact.",
+    )
+    parser.add_argument("--subtitle-font-name", default="", help="ASS font family name. Defaults to Arial.")
+    parser.add_argument("--subtitle-font-scale", type=int, default=100, help="ASS font scale percentage.")
     return parser
 
 
@@ -1615,7 +1628,15 @@ def main() -> int:
     pairs = pair_events(en_events, zh_events)
     ass_path = base_dir / f"{safe_stem(video)}.bilingual.ass"
     log("Generating bilingual subtitles...")
-    write_bilingual_ass(pairs, ass_path)
+    play_resolution = probe_video_play_resolution(video)
+    write_bilingual_ass(
+        pairs,
+        ass_path,
+        play_resolution=play_resolution,
+        style_profile=args.subtitle_style_profile,
+        font_name=args.subtitle_font_name,
+        font_scale=args.subtitle_font_scale,
+    )
     matched = sum(1 for en, zh in pairs if en and zh and zh.text.strip())
     zh_total = sum(1 for _, zh in pairs if zh and zh.text.strip())
     log(f"Bilingual ASS: {ass_path}")

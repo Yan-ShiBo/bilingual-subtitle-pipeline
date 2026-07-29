@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from openai import OpenAI
 
+from ass_styles import STYLE_PROFILE_NAMES, ass_style_header, probe_video_play_resolution
 from output_paths import OUTPUT_DIRECTORY_NAME, resolve_output_root, suggested_output_root
 
 
@@ -2150,20 +2151,22 @@ def escape_ass_text(text: str) -> str:
     return text
 
 
-def generate_ass(segments: List[Segment], out_path: Path, mode: str) -> None:
-    header = """[Script Info]
-ScriptType: v4.00+
-PlayResX: 1920
-PlayResY: 1080
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Microsoft YaHei,48,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,20,1
-Style: English,Arial,36,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,15,1
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-"""
+def generate_ass(
+    segments: List[Segment],
+    out_path: Path,
+    mode: str,
+    *,
+    play_resolution: tuple[int, int] = (1920, 1080),
+    style_profile: str = "adaptive",
+    font_name: str = "",
+    font_scale: int | float = 100,
+) -> None:
+    header = ass_style_header(
+        *play_resolution,
+        profile_name=style_profile,
+        font_name=font_name,
+        font_scale=font_scale,
+    )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8") as handle:
         handle.write(header)
@@ -2185,11 +2188,20 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 continue
 
             if mode == "en":
-                handle.write(f"Dialogue: 0,{start},{end},English,,0,0,0,,{en_text}\n")
+                handle.write(f"Dialogue: 0,{start},{end},SourceOnly,,0,0,0,,{en_text}\n")
             elif mode == "zh":
-                handle.write(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{zh_text}\n")
+                handle.write(f"Dialogue: 0,{start},{end},Chinese,,0,0,0,,{zh_text}\n")
             elif mode == "bilingual":
-                handle.write(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{zh_text}{{\\rEnglish}}\\N{en_text}\n")
+                if zh_text and en_text:
+                    text = f"{{\\rChinese}}{zh_text}\\N{{\\rSource}}{en_text}"
+                    style = "Chinese"
+                elif zh_text:
+                    text = zh_text
+                    style = "Chinese"
+                else:
+                    text = en_text
+                    style = "SourceOnly"
+                handle.write(f"Dialogue: 0,{start},{end},{style},,0,0,0,,{text}\n")
 
 
 def print_timing_report(segments: List[Segment]) -> None:
@@ -2271,6 +2283,19 @@ def main() -> None:
     parser.add_argument("--max-words", type=int, default=12, help="Maximum English words per subtitle event")
     parser.add_argument("--max-chars", type=int, default=56, help="Maximum English characters per subtitle event")
     parser.add_argument("--max-duration", type=float, default=5.5, help="Maximum seconds per subtitle event before splitting")
+    parser.add_argument(
+        "--subtitle-style-profile",
+        choices=STYLE_PROFILE_NAMES,
+        default="adaptive",
+        help="ASS display profile: adaptive, mobile, or compact.",
+    )
+    parser.add_argument("--subtitle-font-name", default="", help="ASS font family name. Defaults to Arial.")
+    parser.add_argument(
+        "--subtitle-font-scale",
+        type=int,
+        default=100,
+        help="ASS font scale percentage from 70 to 160.",
+    )
     parser.add_argument("--run-state-file", type=str, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
@@ -2497,9 +2522,23 @@ def main() -> None:
         bi_ass = out_dir / f"{movie_name}.bilingual.ass"
 
         print("Generating bilingual subtitles...", flush=True)
-        generate_ass(output_segments, en_ass, "en")
-        generate_ass(output_segments, zh_ass, "zh")
-        generate_ass(output_segments, bi_ass, "bilingual")
+        play_resolution = probe_video_play_resolution(video_path)
+        print(
+            "ASS display: "
+            f"profile={args.subtitle_style_profile}, "
+            f"font={args.subtitle_font_name or 'Arial'}, "
+            f"scale={args.subtitle_font_scale}%, "
+            f"PlayRes={play_resolution[0]}x{play_resolution[1]}"
+        )
+        ass_options = {
+            "play_resolution": play_resolution,
+            "style_profile": args.subtitle_style_profile,
+            "font_name": args.subtitle_font_name,
+            "font_scale": args.subtitle_font_scale,
+        }
+        generate_ass(output_segments, en_ass, "en", **ass_options)
+        generate_ass(output_segments, zh_ass, "zh", **ass_options)
+        generate_ass(output_segments, bi_ass, "bilingual", **ass_options)
 
         if loaded_legacy_source_cache:
             for segment in subtitle_segments:

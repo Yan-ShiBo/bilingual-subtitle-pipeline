@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+from ass_styles import STYLE_PROFILE_NAMES
 from output_paths import resolve_output_root
 
 try:
@@ -652,6 +653,11 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
     max_words = int(payload.get("max_words") or 12)
     max_chars = int(payload.get("max_chars") or 56)
     max_duration = float(payload.get("max_duration") or 5.5)
+    subtitle_style_profile = str(payload.get("subtitle_style_profile") or "adaptive")
+    if subtitle_style_profile not in STYLE_PROFILE_NAMES:
+        subtitle_style_profile = "adaptive"
+    subtitle_font_name = str(payload.get("subtitle_font_name") or "").strip()
+    subtitle_font_scale = max(70, min(160, int(payload.get("subtitle_font_scale") or 100)))
 
     out_dir = output_dir(output_root, series_name, movie_name)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -690,11 +696,17 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
         str(max_chars),
         "--max-duration",
         str(max_duration),
+        "--subtitle-style-profile",
+        subtitle_style_profile,
+        "--subtitle-font-scale",
+        str(subtitle_font_scale),
         "--merge-existing-subtitles",
         "yes" if merge_existing_subtitles else "no",
         "--run-state-file",
         str(state_path),
     ]
+    if subtitle_font_name:
+        args.extend(["--subtitle-font-name", subtitle_font_name])
     if sidecar_path:
         args.extend(["--subtitle-file", sidecar_path])
     if chinese_sidecar_path:
@@ -1268,6 +1280,31 @@ def html_page() -> str:
           </div>
         </div>
       </details>
+      <details class="advanced" id="subtitleAppearance">
+        <summary>字幕外观</summary>
+        <div class="workflow-grid">
+          <div class="span-4">
+            <label for="subtitleStyleProfile">显示方案</label>
+            <select id="subtitleStyleProfile">
+              <option value="adaptive" selected>自适应画面</option>
+              <option value="mobile">手机大字</option>
+              <option value="compact">紧凑</option>
+            </select>
+          </div>
+          <div class="span-4">
+            <label for="subtitleFontName">字体族</label>
+            <input
+              id="subtitleFontName"
+              placeholder="Arial / Noto Sans CJK SC"
+              title="填写字体内部的 family name；外置 ASS 不会自动携带字体文件"
+            >
+          </div>
+          <div class="span-4">
+            <label for="subtitleFontScale">字号比例</label>
+            <input id="subtitleFontScale" type="number" value="100" min="70" max="160" step="5">
+          </div>
+        </div>
+      </details>
       <div class="actions-row"><button id="analyzeBtn" onclick="analyze()">分析视频</button></div>
     </div>
   </section>
@@ -1434,7 +1471,10 @@ function payload() {
     context_lines: Number(document.getElementById('contextLines').value || 30),
     max_words: Number(document.getElementById('maxWords').value || 12),
     max_chars: Number(document.getElementById('maxChars').value || 56),
-    max_duration: Number(document.getElementById('maxDuration').value || 5.5)
+    max_duration: Number(document.getElementById('maxDuration').value || 5.5),
+    subtitle_style_profile: document.getElementById('subtitleStyleProfile').value,
+    subtitle_font_name: document.getElementById('subtitleFontName').value.trim(),
+    subtitle_font_scale: Number(document.getElementById('subtitleFontScale').value || 100)
   };
 }
 
@@ -1805,7 +1845,8 @@ const INPUT_IDS = [
   'mergeExistingSubtitles', 'sidecarPath', 'chineseSidecarPath', 'englishSidecarPath',
   'subtitleStream', 'chineseSubtitleStream', 'englishSubtitleStream', 'audioStream',
   'source_language', 'asrLanguage', 'subtitleOcrLang', 'llmModel',
-  'batchSize', 'contextLines', 'maxWords', 'maxChars', 'maxDuration'
+  'batchSize', 'contextLines', 'maxWords', 'maxChars', 'maxDuration',
+  'subtitleStyleProfile', 'subtitleFontName', 'subtitleFontScale'
 ];
 
 const REMOTE_STORAGE_KEY = 'sub_remote_config';
