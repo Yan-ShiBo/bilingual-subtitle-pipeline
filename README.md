@@ -84,7 +84,7 @@ python .\src\subtitle_frontend.py --host 127.0.0.1 --port 8765
 密钥文件：留空，读取 ~/.ssh/config
 ```
 
-后端会解析 OpenSSH 的 `HostName`、`User`、`IdentityFile`、`IdentitiesOnly` 和 keepalive 设置，并使用 `known_hosts` 校验服务器身份。连接成功后，本地 `127.0.0.1:11435` 转发到远端 `127.0.0.1:11434`；选择 `remote:<连接名>:<模型>` 时不会调用本地 Ollama。
+后端会解析 OpenSSH 的 `HostName`、`User`、`IdentityFile`、`IdentitiesOnly` 和 keepalive 设置，并使用 `known_hosts` 校验服务器身份。连接成功后优先用本地 `127.0.0.1:11435` 转发到远端 `127.0.0.1:11434`；端口已被另一个前端占用时会自动选择空闲端口，并把该实例自己的地址传给翻译子进程。选择 `remote:<连接名>:<模型>` 时不会调用本地 Ollama；模型默认在最后一次请求后保留 10 分钟，可通过 `OLLAMA_KEEP_ALIVE` 调整。
 
 密钥模式只在浏览器保存服务器配置和可选的密钥路径，不读取或保存私钥内容。密码模式仍可按需把密码保存在当前浏览器 `localStorage`；共享电脑不应启用。
 

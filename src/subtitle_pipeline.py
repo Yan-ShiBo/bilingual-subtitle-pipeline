@@ -1245,6 +1245,52 @@ def join_subtitle_events(events: list[SubtitleEvent], language: str) -> Subtitle
     )
 
 
+def pair_ambiguous_component(
+    en_events: list[SubtitleEvent],
+    zh_events: list[SubtitleEvent],
+    component_en: set[int],
+    component_zh: set[int],
+    en_edges: dict[int, set[int]],
+) -> list[tuple[SubtitleEvent | None, SubtitleEvent | None]]:
+    candidates: list[tuple[float, float, float, float, int, int]] = []
+    for en_idx in component_en:
+        en = en_events[en_idx]
+        en_duration = max(0.01, en.end - en.start)
+        en_center = (en.start + en.end) / 2
+        for zh_idx in en_edges.get(en_idx, set()) & component_zh:
+            zh = zh_events[zh_idx]
+            overlap = max(0.0, min(en.end, zh.end) - max(en.start, zh.start))
+            shorter_duration = min(en_duration, max(0.01, zh.end - zh.start))
+            overlap_ratio = overlap / shorter_duration
+            center_distance = abs(en_center - (zh.start + zh.end) / 2)
+            start_distance = abs(en.start - zh.start)
+            candidates.append(
+                (
+                    -overlap_ratio,
+                    -overlap,
+                    center_distance,
+                    start_distance,
+                    en_idx,
+                    zh_idx,
+                )
+            )
+
+    matched_en: set[int] = set()
+    matched_zh: set[int] = set()
+    pairs: list[tuple[SubtitleEvent | None, SubtitleEvent | None]] = []
+    for _ratio, _overlap, _center, _start, en_idx, zh_idx in sorted(candidates):
+        if en_idx in matched_en or zh_idx in matched_zh:
+            continue
+        matched_en.add(en_idx)
+        matched_zh.add(zh_idx)
+        pairs.append((en_events[en_idx], zh_events[zh_idx]))
+
+    pairs.extend((en_events[idx], None) for idx in sorted(component_en - matched_en))
+    pairs.extend((None, zh_events[idx]) for idx in sorted(component_zh - matched_zh))
+    pairs.sort(key=lambda item: min(event.start for event in item if event is not None))
+    return pairs
+
+
 def pair_events(en_events: list[SubtitleEvent], zh_events: list[SubtitleEvent]) -> list[tuple[SubtitleEvent | None, SubtitleEvent | None]]:
     paired: list[tuple[SubtitleEvent | None, SubtitleEvent | None]] = []
     en_edges: dict[int, set[int]] = {}
@@ -1282,12 +1328,23 @@ def pair_events(en_events: list[SubtitleEvent], zh_events: list[SubtitleEvent]) 
                     pending_en.extend(zh_edges.get(zh_idx, set()) - component_en)
         used_en.update(component_en)
         used_zh.update(component_zh)
-        paired.append(
-            (
-                join_subtitle_events([en_events[idx] for idx in component_en], "en"),
-                join_subtitle_events([zh_events[idx] for idx in component_zh], "zh"),
+        if len(component_en) > 1 and len(component_zh) > 1:
+            paired.extend(
+                pair_ambiguous_component(
+                    en_events,
+                    zh_events,
+                    component_en,
+                    component_zh,
+                    en_edges,
+                )
             )
-        )
+        else:
+            paired.append(
+                (
+                    join_subtitle_events([en_events[idx] for idx in component_en], "en"),
+                    join_subtitle_events([zh_events[idx] for idx in component_zh], "zh"),
+                )
+            )
 
     start = 0
     for en_idx, en in enumerate(en_events):
@@ -1463,7 +1520,7 @@ Rules:
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
             "think": False,
-            "keep_alive": -1,
+            "keep_alive": os.environ.get("OLLAMA_KEEP_ALIVE", "10m"),
             "options": {"temperature": 0.1},
         }
         

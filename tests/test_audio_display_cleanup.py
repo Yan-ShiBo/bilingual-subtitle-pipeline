@@ -683,6 +683,137 @@ class DisplayCleanupTests(unittest.TestCase):
         full_cleanup.assert_not_called()
         self.assertEqual(result["run_mode"], "reprocess")
 
+    def test_frontend_remote_run_uses_its_own_tunnel_port(self) -> None:
+        class FakeProcess:
+            pid = 54322
+
+            @staticmethod
+            def poll():
+                return None
+
+        class FakeTunnel:
+            @staticmethod
+            def status():
+                return {"connected": True, "local_port": 32123}
+
+        captured_env = {}
+
+        def popen(_args, **kwargs):
+            captured_env.update(kwargs["env"])
+            return FakeProcess()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video = root / "movie.mp4"
+            video.write_bytes(b"video")
+            log_path = root / "run.log"
+            err_path = root / "run.err.log"
+            payload = {
+                "path": str(video),
+                "output_root": str(root / "out"),
+                "series_name": "Series",
+                "movie_name": "Episode",
+                "source": "audio",
+                "llm_model": "remote:AI Server:qwen3:30b",
+            }
+            subtitle_frontend.RUNS.clear()
+            try:
+                with (
+                    patch.object(subtitle_frontend, "tunnel_manager", FakeTunnel()),
+                    patch.object(subtitle_frontend, "frontend_log_paths", return_value=(log_path, err_path)),
+                    patch.object(subtitle_frontend.subprocess, "Popen", side_effect=popen),
+                ):
+                    subtitle_frontend.start_processing(payload)
+            finally:
+                subtitle_frontend.RUNS.clear()
+
+        self.assertEqual(captured_env["SUBTITLE_REMOTE_OLLAMA_URL"], "http://127.0.0.1:32123")
+
+    def test_frontend_rejects_remote_run_without_its_own_tunnel(self) -> None:
+        class DisconnectedTunnel:
+            @staticmethod
+            def status():
+                return {"connected": False, "local_port": None}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video = root / "movie.mp4"
+            video.write_bytes(b"video")
+            payload = {
+                "path": str(video),
+                "output_root": str(root / "out"),
+                "series_name": "Series",
+                "movie_name": "Episode",
+                "source": "audio",
+                "llm_model": "remote:AI Server:qwen3:30b",
+            }
+            with (
+                patch.object(subtitle_frontend, "tunnel_manager", DisconnectedTunnel()),
+                patch.object(
+                    subtitle_frontend.subprocess,
+                    "Popen",
+                    side_effect=AssertionError("remote process was launched without a tunnel"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "尚未连接远程服务器"),
+            ):
+                subtitle_frontend.start_processing(payload)
+
+    def test_remote_llm_uses_frontend_owned_tunnel_url(self) -> None:
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+        )
+        with (
+            patch.dict(
+                audio_to_subtitle.os.environ,
+                {"SUBTITLE_REMOTE_OLLAMA_URL": "http://127.0.0.1:32123"},
+                clear=False,
+            ),
+            patch.object(audio_to_subtitle, "OpenAI") as openai_class,
+        ):
+            openai_class.return_value.chat.completions.create.return_value = response
+            result = audio_to_subtitle.call_llm(
+                "prompt",
+                model="remote:AI Server:qwen3:30b",
+            )
+
+        self.assertEqual(result, "ok")
+        openai_class.assert_called_once_with(
+            base_url="http://127.0.0.1:32123/v1",
+            api_key="ollama",
+        )
+
+    def test_transcribe_audio_unloads_whisper_from_local_gpu(self) -> None:
+        unloaded = []
+
+        class FakeRuntimeModel:
+            @staticmethod
+            def unload_model():
+                unloaded.append(True)
+
+        class FakeWhisperModel:
+            def __init__(self, *_args, **_kwargs):
+                self.model = FakeRuntimeModel()
+
+            @staticmethod
+            def transcribe(*_args, **_kwargs):
+                segment = SimpleNamespace(
+                    start=1.0,
+                    end=2.0,
+                    text="Recognized line",
+                    words=[],
+                )
+                info = SimpleNamespace(language="en", language_probability=0.99)
+                return iter([segment]), info
+
+        with patch.dict(
+            sys.modules,
+            {"faster_whisper": SimpleNamespace(WhisperModel=FakeWhisperModel)},
+        ):
+            output = audio_to_subtitle.transcribe_audio(Path("audio.wav"), language="en")
+
+        self.assertEqual(output[0]["text"], "Recognized line")
+        self.assertEqual(unloaded, [True])
+
     def test_frontend_rejects_duplicate_run_for_same_output(self) -> None:
         class FakeProcess:
             pid = 43210
@@ -1298,6 +1429,27 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertEqual(len(pairs), 2)
         self.assertEqual([pair[0].text for pair in pairs if pair[0]], ["First.", "Second."])
         self.assertEqual([pair[1].text for pair in pairs if pair[1]], ["\u7b2c\u4e00\u53e5\u3002", "\u7b2c\u4e8c\u53e5\u3002"])
+
+    def test_pair_events_does_not_transitively_merge_a_shifted_sequence(self) -> None:
+        pairs = pair_events(
+            [
+                SubtitleEvent(0.0, 2.0, "First."),
+                SubtitleEvent(2.0, 4.0, "Second."),
+                SubtitleEvent(4.0, 6.0, "Third."),
+            ],
+            [
+                SubtitleEvent(1.0, 3.0, "\u7b2c\u4e00\u53e5\u3002"),
+                SubtitleEvent(3.0, 5.0, "\u7b2c\u4e8c\u53e5\u3002"),
+                SubtitleEvent(5.0, 7.0, "\u7b2c\u4e09\u53e5\u3002"),
+            ],
+        )
+
+        self.assertEqual(len(pairs), 3)
+        self.assertEqual([pair[0].text for pair in pairs if pair[0]], ["First.", "Second.", "Third."])
+        self.assertEqual(
+            [pair[1].text for pair in pairs if pair[1]],
+            ["\u7b2c\u4e00\u53e5\u3002", "\u7b2c\u4e8c\u53e5\u3002", "\u7b2c\u4e09\u53e5\u3002"],
+        )
 
     def test_extracted_subtitle_cache_is_bound_to_video_stream_and_codec(self) -> None:
         calls: list[tuple[int, str]] = []

@@ -305,68 +305,83 @@ def extract_audio(video_path: Path, temp_audio_path: Path, audio_stream: Optiona
 def transcribe_audio(audio_path: Path, language: Optional[str] = "auto") -> List[Segment]:
     print("Loading faster-whisper large-v3 model with FP16...")
     from faster_whisper import WhisperModel
+
     model = WhisperModel(
         "large-v3",
         device="cuda",
         compute_type="float16",
     )
 
-    print("Transcribing audio with word timestamps...")
-    requested_language = None if not language or language == "auto" else language
-    segments, info = model.transcribe(
-        str(audio_path),
-        beam_size=5,
-        language=requested_language,
-        word_timestamps=True,
-        vad_filter=True,
-        vad_parameters={
-            "min_silence_duration_ms": 500,
-            "speech_pad_ms": 200,
-        },
-    )
+    try:
+        print("Transcribing audio with word timestamps...")
+        requested_language = None if not language or language == "auto" else language
+        segments, info = model.transcribe(
+            str(audio_path),
+            beam_size=5,
+            language=requested_language,
+            word_timestamps=True,
+            vad_filter=True,
+            vad_parameters={
+                "min_silence_duration_ms": 500,
+                "speech_pad_ms": 200,
+            },
+        )
 
-    detected_language = str(getattr(info, "language", "") or requested_language or language or "auto")
-    print(f"Detected language '{detected_language}' with probability {info.language_probability}")
+        detected_language = str(getattr(info, "language", "") or requested_language or language or "auto")
+        print(f"Detected language '{detected_language}' with probability {info.language_probability}")
 
-    results: List[Segment] = []
-    for segment in segments:
-        words = []
-        for word in getattr(segment, "words", None) or []:
-            text = getattr(word, "word", "").strip()
-            if text:
-                words.append(
-                    {
-                        "start": float(getattr(word, "start", segment.start)),
-                        "end": float(getattr(word, "end", segment.end)),
-                        "word": text,
-                    }
-                )
+        results: List[Segment] = []
+        for segment in segments:
+            words = []
+            for word in getattr(segment, "words", None) or []:
+                text = getattr(word, "word", "").strip()
+                if text:
+                    words.append(
+                        {
+                            "start": float(getattr(word, "start", segment.start)),
+                            "end": float(getattr(word, "end", segment.end)),
+                            "word": text,
+                        }
+                    )
 
-        text = normalize_space(segment.text)
-        if not text:
-            continue
-        item = {
-            "id": len(results),
-            "start": float(segment.start),
-            "end": float(segment.end),
-            "text": text,
-            "source_language": detected_language,
-        }
-        if words:
-            item["words"] = words
-        results.append(item)
-        print(f"[{segment.start:.2f}s -> {segment.end:.2f}s] {text}")
+            text = normalize_space(segment.text)
+            if not text:
+                continue
+            item = {
+                "id": len(results),
+                "start": float(segment.start),
+                "end": float(segment.end),
+                "text": text,
+                "source_language": detected_language,
+            }
+            if words:
+                item["words"] = words
+            results.append(item)
+            print(f"[{segment.start:.2f}s -> {segment.end:.2f}s] {text}")
 
-    return results
+        return results
+    finally:
+        runtime_model = getattr(model, "model", None)
+        unload_model = getattr(runtime_model, "unload_model", None)
+        if callable(unload_model):
+            try:
+                unload_model()
+                print("Released faster-whisper model from the local GPU.")
+            except Exception as exc:
+                print(f"Warning: could not unload faster-whisper from the local GPU: {exc}", file=sys.stderr)
 
 
 def call_llm(prompt: str, system_prompt: str = "", model: str = "qwen3:14b") -> str:
     base_url = "http://localhost:11434/v1"
     if model.startswith("remote:"):
         parts = model.split(":", 2)
-        if len(parts) == 3:
-            base_url = "http://localhost:11435/v1"
-            model = parts[2]
+        if len(parts) != 3:
+            raise ValueError("Invalid remote model identifier; reconnect the remote server.")
+        remote_base_url = os.environ.get("SUBTITLE_REMOTE_OLLAMA_URL", "").rstrip("/")
+        if not remote_base_url:
+            raise RuntimeError("Remote model selected without a tunnel owned by this frontend process.")
+        base_url = f"{remote_base_url}/v1"
+        model = parts[2]
 
     client = OpenAI(
         base_url=base_url,
@@ -384,7 +399,7 @@ def call_llm(prompt: str, system_prompt: str = "", model: str = "qwen3:14b") -> 
         temperature=0.2,
         extra_body={
             "think": False,
-            "keep_alive": -1,
+            "keep_alive": os.environ.get("OLLAMA_KEEP_ALIVE", "10m"),
         },
     )
     return response.choices[0].message.content

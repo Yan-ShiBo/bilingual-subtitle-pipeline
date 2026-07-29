@@ -122,10 +122,16 @@ def call_ollama_json(prompt: str, system_prompt: str, model: str = "qwen3:14b", 
     base_url = "http://127.0.0.1:11434"
     if model.startswith("remote:"):
         parts = model.split(":", 2)
-        if len(parts) == 3:
-            base_url = "http://127.0.0.1:11435"
-            model = parts[2]
-            
+        if len(parts) != 3:
+            raise ValueError("远程模型标识无效，请重新连接远程服务器。")
+        if not tunnel_manager:
+            raise RuntimeError("当前网页实例没有 SSH 隧道管理器。")
+        remote_status = tunnel_manager.status()
+        if not remote_status.get("connected") or not remote_status.get("local_port"):
+            raise RuntimeError("当前网页实例尚未连接远程服务器，请先点击“远程”连接。")
+        base_url = f"http://127.0.0.1:{int(remote_status['local_port'])}"
+        model = parts[2]
+
     payload = {
         "model": model,
         "messages": [
@@ -135,7 +141,7 @@ def call_ollama_json(prompt: str, system_prompt: str, model: str = "qwen3:14b", 
         "stream": False,
         "format": "json",
         "think": False,
-        "keep_alive": -1,
+        "keep_alive": os.environ.get("OLLAMA_KEEP_ALIVE", "10m"),
         "options": {"temperature": 0},
     }
     request = Request(
@@ -652,6 +658,16 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
     series_name = payload.get("series_name") or ""
     movie_name = payload.get("movie_name") or ""
     llm_model = payload.get("llm_model") or "qwen3:14b"
+    remote_ollama_url = ""
+    if llm_model.startswith("remote:"):
+        if len(llm_model.split(":", 2)) != 3:
+            raise ValueError("远程模型标识无效，请重新连接远程服务器。")
+        if not tunnel_manager:
+            raise RuntimeError("当前网页实例没有 SSH 隧道管理器。")
+        remote_status = tunnel_manager.status()
+        if not remote_status.get("connected") or not remote_status.get("local_port"):
+            raise RuntimeError("当前网页实例尚未连接远程服务器，请先点击“远程”连接。")
+        remote_ollama_url = f"http://127.0.0.1:{int(remote_status['local_port'])}"
     video = resolve_video_path(selected)
     if not series_name or not movie_name:
         names = default_names(selected, video, llm_model)
@@ -754,6 +770,8 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
     env["PYTHONUNBUFFERED"] = "1"
+    if remote_ollama_url:
+        env["SUBTITLE_REMOTE_OLLAMA_URL"] = remote_ollama_url
     with RUNS_LOCK:
         persisted_run = load_active_run(out_dir, movie_name)
         if persisted_run is not None:
@@ -1984,13 +2002,15 @@ function updateLlmModels(remoteModels, remoteName) {
     const saved = JSON.parse(localStorage.getItem(FORM_STORAGE_KEY) || '{}');
     if (saved.llmModel) current = saved.llmModel;
   } catch (e) {}
-  let html = `<option value="qwen3:14b">[Local] qwen3:14b</option>`;
+  const safeRemoteName = String(remoteName || 'Remote').replaceAll(':', ' ').replace(/\s+/g, ' ').trim() || 'Remote';
+  select.replaceChildren(new Option('[Local] qwen3:14b', 'qwen3:14b'));
   if (remoteModels && remoteModels.length) {
     remoteModels.forEach(m => {
-      html += `<option value="remote:${remoteName}:${m}">[Remote: ${remoteName}] ${m}</option>`;
+      const modelName = String(m || '').trim();
+      if (!modelName) return;
+      select.add(new Option(`[Remote: ${safeRemoteName}] ${modelName}`, `remote:${safeRemoteName}:${modelName}`));
     });
   }
-  select.innerHTML = html;
   if ([...select.options].some(o => o.value === current)) {
     select.value = current;
   }

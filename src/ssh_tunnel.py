@@ -1,3 +1,4 @@
+import errno
 import json
 import os
 import select
@@ -67,6 +68,7 @@ class SSHTunnelManager:
     def __init__(self, local_port: int = 11435) -> None:
         self.ssh_client: Optional[paramiko.SSHClient] = None
         self.tunnel_thread: Optional[threading.Thread] = None
+        self.preferred_local_port = local_port
         self.local_port = local_port
         self.remote_host = "127.0.0.1"
         self.remote_port = 11434
@@ -91,9 +93,10 @@ class SSHTunnelManager:
         key_filename: str = "",
     ) -> bool:
         self.disconnect()
-        self.remote_name = str(name or "remote")
+        self.remote_name = " ".join(str(name or "remote").replace(":", " ").split()) or "remote"
         self.auth_method = normalize_auth_method(auth_method, password)
         self._tunnel_ready.clear()
+        client: Optional[paramiko.SSHClient] = None
 
         try:
             connection = resolve_ssh_connection(host, port, user, key_filename)
@@ -160,6 +163,8 @@ class SSHTunnelManager:
         except Exception as exc:
             self.last_error = str(exc)
             self.running = False
+            if client is not None and client is not self.ssh_client:
+                client.close()
             if self.ssh_client:
                 self.ssh_client.close()
                 self.ssh_client = None
@@ -219,9 +224,17 @@ class SSHTunnelManager:
             return
 
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         try:
-            server.bind(("127.0.0.1", self.local_port))
+            self.local_port = self.preferred_local_port
+            try:
+                server.bind(("127.0.0.1", self.local_port))
+            except OSError as exc:
+                if exc.errno != errno.EADDRINUSE:
+                    raise
+                server.bind(("127.0.0.1", 0))
+                self.local_port = int(server.getsockname()[1])
             server.listen(100)
             server.settimeout(1.0)
             self._server_socket = server

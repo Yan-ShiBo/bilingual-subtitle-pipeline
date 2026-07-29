@@ -1,3 +1,4 @@
+import socket
 import sys
 import tempfile
 import unittest
@@ -6,11 +7,38 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from ssh_tunnel import normalize_auth_method, resolve_ssh_connection  # noqa: E402
+from ssh_tunnel import SSHTunnelManager, normalize_auth_method, resolve_ssh_connection  # noqa: E402
 from subtitle_frontend import html_page  # noqa: E402
 
 
 class SshTunnelTests(unittest.TestCase):
+    def test_tunnel_falls_back_to_a_free_port_when_preferred_port_is_busy(self) -> None:
+        class FakeTransport:
+            @staticmethod
+            def is_active() -> bool:
+                return False
+
+        class FakeClient:
+            @staticmethod
+            def get_transport():
+                return FakeTransport()
+
+        occupied = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        occupied.bind(("127.0.0.1", 0))
+        occupied.listen(1)
+        preferred_port = int(occupied.getsockname()[1])
+        manager = SSHTunnelManager(local_port=preferred_port)
+        manager.ssh_client = FakeClient()
+
+        try:
+            manager._forward_local_port()
+        finally:
+            occupied.close()
+
+        self.assertNotEqual(manager.local_port, preferred_port)
+        self.assertGreater(manager.local_port, 0)
+        self.assertTrue(manager._tunnel_ready.is_set())
+
     def test_resolve_ssh_connection_uses_openssh_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -79,6 +107,9 @@ class SshTunnelTests(unittest.TestCase):
         self.assertIn("updateRemoteAuthVisibility()", page)
         self.assertIn("auth_method: document.getElementById('remoteAuthMethod').value", page)
         self.assertIn("key_filename: document.getElementById('remoteKeyPath').value", page)
+        self.assertIn("select.replaceChildren(new Option('[Local] qwen3:14b'", page)
+        self.assertIn("select.add(new Option(`[Remote: ${safeRemoteName}] ${modelName}`", page)
+        self.assertNotIn("html += `<option value=\"remote:", page)
 
 
 if __name__ == "__main__":
