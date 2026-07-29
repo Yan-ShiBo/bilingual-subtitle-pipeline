@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+from output_paths import resolve_output_root
+
 try:
     import psutil
 except ImportError:
@@ -25,10 +27,11 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = APP_DIR.parent
-MOVIE_ROOT = PROJECT_ROOT.parent
 RUNTIME_DIR = PROJECT_ROOT / "runtime"
 LOG_DIR = RUNTIME_DIR / "logs"
-DEFAULT_OUTPUT_ROOT = MOVIE_ROOT / ("1 " + "\u5b57\u5e55")
+LEGACY_DEFAULT_OUTPUT_ROOT = PROJECT_ROOT.parent / ("1 " + "\u5b57\u5e55")
+CONFIGURED_OUTPUT_ROOT = Path(os.environ["SUBTITLE_OUTPUT_ROOT"]).expanduser() if os.environ.get("SUBTITLE_OUTPUT_ROOT") else None
+DEFAULT_OUTPUT_ROOT = CONFIGURED_OUTPUT_ROOT or LEGACY_DEFAULT_OUTPUT_ROOT
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m2ts", ".ts", ".mov", ".wmv"}
 SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt"}
 RUNS: Dict[int, Dict[str, Any]] = {}
@@ -334,6 +337,25 @@ def output_dir(output_root: Path, series_name: str, movie_name: str) -> Path:
     return output_root / series_name / movie_name
 
 
+def resolve_request_output_root(
+    payload: Dict[str, Any],
+    video: Path,
+    series_name: str,
+    movie_name: str,
+) -> tuple[Path, str]:
+    raw_requested = str(payload.get("output_root") or "").strip()
+    if not raw_requested and CONFIGURED_OUTPUT_ROOT is not None:
+        return CONFIGURED_OUTPUT_ROOT, "configured"
+    requested = Path(raw_requested).expanduser() if raw_requested else None
+    return resolve_output_root(
+        video,
+        series_name,
+        movie_name,
+        requested=requested,
+        legacy_default=LEGACY_DEFAULT_OUTPUT_ROOT,
+    )
+
+
 def run_state_path(out_dir: Path, movie_name: str) -> Path:
     return out_dir / f".{safe_file_part(movie_name)}.subtitle-run.json"
 
@@ -488,11 +510,16 @@ def analyze_input(payload: Dict[str, Any]) -> Dict[str, Any]:
         raise FileNotFoundError(f"Path not found: {selected}")
 
     video = resolve_video_path(selected)
-    output_root = Path(payload.get("output_root") or DEFAULT_OUTPUT_ROOT)
     llm_model = payload.get("llm_model") or "qwen3:14b"
     names = default_names(selected, video, llm_model)
     series_name = names["series_name"]
     movie_name = names["movie_name"]
+    output_root, output_root_source = resolve_request_output_root(
+        payload,
+        video,
+        series_name,
+        movie_name,
+    )
 
     info = checkpoint_info(output_root, series_name, movie_name)
     sidecars = list_sidecar_subtitles(selected, video)
@@ -513,6 +540,7 @@ def analyze_input(payload: Dict[str, Any]) -> Dict[str, Any]:
             "video_path": str(video),
             "video_size_gb": round(video.stat().st_size / 1024 / 1024 / 1024, 2),
             "output_root": str(output_root),
+            "output_root_source": output_root_source,
             "series_name": series_name,
             "movie_name": movie_name,
             "default_series_name": names["series_name"],
@@ -592,7 +620,6 @@ def remove_resume_files(out_dir: Path, movie_name: str) -> None:
 
 def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
     selected = Path(payload["path"]).expanduser()
-    output_root = Path(payload.get("output_root") or DEFAULT_OUTPUT_ROOT)
     series_name = payload.get("series_name") or ""
     movie_name = payload.get("movie_name") or ""
     llm_model = payload.get("llm_model") or "qwen3:14b"
@@ -601,6 +628,12 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
         names = default_names(selected, video, llm_model)
         series_name = series_name or names["series_name"]
         movie_name = movie_name or names["movie_name"]
+    output_root, output_root_source = resolve_request_output_root(
+        payload,
+        video,
+        series_name,
+        movie_name,
+    )
     restart = bool(payload.get("restart"))
     source_mode = payload.get("source") or "auto"
     sidecar_path = payload.get("subtitle_file")
@@ -733,7 +766,11 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
         "pid": process.pid,
         "stdout_log": str(log_path),
         "stderr_log": str(err_path),
+        "output_root": str(output_root),
+        "output_root_source": output_root_source,
         "output_dir": str(out_dir),
+        "series_name": series_name,
+        "movie_name": movie_name,
         "command": " ".join(args),
     }
 
@@ -1089,7 +1126,7 @@ def html_page() -> str:
       <div class="span-2"><button class="secondary" onclick="selectFolder()">选择文件夹</button></div>
       <div class="span-4">
         <label for="outputRoot">输出根目录</label>
-        <input id="outputRoot">
+        <input id="outputRoot" placeholder="自动查找已有输出，或使用视频附近的 1 字幕目录">
       </div>
       <div class="span-4">
         <label for="seriesName">系列名</label>
@@ -1287,8 +1324,11 @@ def html_page() -> str:
 const FORM_STORAGE_KEY = 'subtitleFormState';
 const ANALYSIS_STORAGE_KEY = 'subtitleLastAnalysis';
 const DISPLAY_LIMITS_VERSION_KEY = 'subtitleDisplayLimitsVersion';
+const OUTPUT_ROOT_MIGRATION_VERSION_KEY = 'subtitleOutputRootMigrationVersion';
+const LEGACY_DEFAULT_OUTPUT_ROOT = __LEGACY_DEFAULT_OUTPUT_ROOT_JSON__;
+const CONFIGURED_OUTPUT_ROOT = __INITIAL_OUTPUT_ROOT_JSON__;
 const state = { pid: 0, lastAnalysis: null, analyzing: false };
-document.getElementById('outputRoot').value = String.raw`__DEFAULT_OUTPUT_ROOT__`;
+document.getElementById('outputRoot').value = CONFIGURED_OUTPUT_ROOT;
 
 async function api(path, body = {}) {
   const res = await fetch(path, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
@@ -1415,13 +1455,18 @@ async function analyze() {
     base.movie_name = '';
     const data = await api('/api/analyze', base);
     setLastAnalysis(data);
+    document.getElementById('outputRoot').value = data.output_root || '';
     document.getElementById('seriesName').value = data.series_name;
     document.getElementById('movieName').value = data.movie_name;
     render(data);
+    saveFormState();
+    const outputNote = data.output_root_source === 'existing'
+      ? `已找到已有输出：${data.output_root}`
+      : `输出根目录：${data.output_root}`;
     if (data.name_source && data.name_source.includes('heuristic (')) {
-      document.getElementById('log').textContent = `大模型提取片名失败，已回退到基础识别。报错信息: ${data.name_source}`;
+      document.getElementById('log').textContent = `${outputNote}\n大模型提取片名失败，已回退到基础识别。报错信息: ${data.name_source}`;
     } else {
-      document.getElementById('log').textContent = '分析完成。';
+      document.getElementById('log').textContent = `分析完成。${outputNote}`;
     }
   } catch (e) {
     document.getElementById('log').textContent = `分析失败: ${e.message}`;
@@ -1439,9 +1484,13 @@ async function startRun() {
     base.restart = document.querySelector('input[name="runMode"]:checked').value === 'restart';
     const data = await api('/api/start', base);
     state.pid = data.pid;
+    document.getElementById('outputRoot').value = data.output_root || document.getElementById('outputRoot').value;
+    document.getElementById('seriesName').value = data.series_name || document.getElementById('seriesName').value;
+    document.getElementById('movieName').value = data.movie_name || document.getElementById('movieName').value;
     const merged = mergeWithAnalysis({...data, running: true, stage: '启动中', stage_index: 0});
     render(merged);
     setLastAnalysis(merged);
+    saveFormState();
     document.getElementById('log').textContent = `已启动 PID ${data.pid}\n${data.command || ''}`;
     setTimeout(refreshStatus, 1500);
   } catch (e) {
@@ -1599,6 +1648,7 @@ function render(data) {
     data.video_path ? `主视频：${data.video_path}` : '',
     data.name_source ? `片名识别：${data.name_source}` : '',
     data.auto_source ? `自动判断：${sourceLabel(data.auto_source)}` : '',
+    data.output_root ? `输出根目录：${data.output_root}${data.output_root_source === 'existing' ? '（已找到旧任务）' : ''}` : '',
     data.sidecar_subtitles ? `已有字幕：${subtitleListLabel(data.sidecar_subtitles)}` : '',
     data.embedded_subtitles ? `内封字幕：${subtitleListLabel(data.embedded_subtitles)}` : '',
     data.output_dir ? `输出：${data.output_dir}` : '',
@@ -1880,6 +1930,7 @@ function restoreFormState() {
           else el.value = data[id];
         }
       });
+      migrateOutputRootDefault();
       migrateRecognitionLanguageState();
       const analysis = getMatchingAnalysis();
       if (analysis) render(analysis);
@@ -1888,6 +1939,23 @@ function restoreFormState() {
       }
     }
   } catch (e) {}
+}
+
+function migrateOutputRootDefault() {
+  const outputRoot = document.getElementById('outputRoot');
+  let changed = false;
+  if (
+    !normalizePathForCompare(CONFIGURED_OUTPUT_ROOT)
+    && normalizePathForCompare(outputRoot.value) === normalizePathForCompare(LEGACY_DEFAULT_OUTPUT_ROOT)
+  ) {
+    outputRoot.value = '';
+    changed = true;
+  }
+  if (Number(localStorage.getItem(OUTPUT_ROOT_MIGRATION_VERSION_KEY) || 0) < 2) {
+    localStorage.setItem(OUTPUT_ROOT_MIGRATION_VERSION_KEY, '2');
+    changed = true;
+  }
+  if (changed) saveFormState();
 }
 
 function migrateRecognitionLanguageState() {
@@ -1913,6 +1981,7 @@ function migrateDisplayLimitDefaults() {
 
 document.addEventListener('DOMContentLoaded', () => {
   restoreFormState();
+  migrateOutputRootDefault();
   migrateRecognitionLanguageState();
   migrateDisplayLimitDefaults();
   const source = document.getElementById('source');
@@ -1931,7 +2000,13 @@ document.addEventListener('change', saveFormState);
 setInterval(() => { if (state.pid) refreshStatus().catch(() => {}); }, 5000);
 </script>
 </body>
-</html>""".replace("__DEFAULT_OUTPUT_ROOT__", str(DEFAULT_OUTPUT_ROOT).replace("\\", "\\\\"))
+</html>""".replace(
+    "__INITIAL_OUTPUT_ROOT_JSON__",
+    json.dumps(str(CONFIGURED_OUTPUT_ROOT or ""), ensure_ascii=False),
+).replace(
+    "__LEGACY_DEFAULT_OUTPUT_ROOT_JSON__",
+    json.dumps(str(LEGACY_DEFAULT_OUTPUT_ROOT), ensure_ascii=False),
+)
 
 
 class Handler(BaseHTTPRequestHandler):

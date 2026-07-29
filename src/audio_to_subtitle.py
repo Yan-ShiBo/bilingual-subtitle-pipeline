@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from openai import OpenAI
 
+from output_paths import OUTPUT_DIRECTORY_NAME, resolve_output_root, suggested_output_root
+
 
 Segment = Dict[str, Any]
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m2ts", ".ts", ".mov", ".wmv"}
@@ -1247,12 +1249,21 @@ def split_segment_by_words(segment: Segment, max_words: int, max_chars: int, max
     current: List[Dict[str, Any]] = []
 
     for word in words:
-        current.append(word)
-        text_now = join_words(current)
-        duration = float(current[-1]["end"]) - float(current[0]["start"])
+        candidate = [*current, word]
+        candidate_text = join_words(candidate)
+        candidate_duration = float(candidate[-1]["end"]) - float(candidate[0]["start"])
+        exceeds_limit = (
+            len(candidate) > max_words
+            or len(candidate_text) > max_chars
+            or candidate_duration > max_duration
+        )
+        if current and exceeds_limit:
+            chunks.append(current)
+            current = [word]
+        else:
+            current = candidate
         sentence_end = bool(re.search(r"[.!?]$", word.get("word", "")))
-        hard_limit = len(current) >= max_words or len(text_now) >= max_chars or duration >= max_duration
-        if current and (sentence_end or hard_limit):
+        if current and sentence_end:
             chunks.append(current)
             current = []
 
@@ -1353,6 +1364,44 @@ def split_segments_for_subtitles(
     return output
 
 
+def duplicate_display_key(segment: Segment) -> str:
+    text = clean_english_track_text(str(segment.get("en") or ""))
+    if not text:
+        text = to_simplified_text(clean_subtitle_text(str(segment.get("zh") or segment.get("text") or "")))
+    normalized = "".join(character.casefold() for character in text if character.isalnum())
+    if not normalized:
+        return ""
+    cjk_count = len(CJK_RE.findall(text))
+    word_count = len(text.split())
+    if cjk_count >= 8 or word_count >= 4 or len(normalized) >= 24:
+        return normalized
+    return ""
+
+
+def suppress_recent_exact_duplicates(
+    segments: List[Segment],
+    max_gap: float = 4.0,
+    max_duration: float = 5.5,
+) -> List[Segment]:
+    output = [dict(segment) for segment in segments]
+    last_visible_by_key: Dict[str, Segment] = {}
+    for segment in output:
+        if segment.get("display", True) is False:
+            continue
+        key = duplicate_display_key(segment)
+        if not key:
+            continue
+        previous = last_visible_by_key.get(key)
+        if previous is not None:
+            gap = float(segment["start"]) - float(previous["end"])
+            if gap <= max_gap:
+                segment["display"] = False
+                continue
+        last_visible_by_key[key] = segment
+    extend_display_over_hidden_segments(output, max_gap=2.0, max_duration=max_duration)
+    return output
+
+
 def prepare_segments_for_output(
     segments: List[Segment],
     max_words: int,
@@ -1360,7 +1409,8 @@ def prepare_segments_for_output(
     max_duration: float,
 ) -> List[Segment]:
     visible: List[Segment] = []
-    for segment in segments:
+    deduplicated = suppress_recent_exact_duplicates(segments, max_duration=max_duration)
+    for segment in deduplicated:
         if segment.get("display", True) is False:
             continue
         item = dict(segment)
@@ -1370,7 +1420,8 @@ def prepare_segments_for_output(
         item.pop("display_end", None)
         if item["end"] > item["start"]:
             visible.append(item)
-    return split_segments_for_subtitles(visible, max_words, max_chars, max_duration)
+    split = split_segments_for_subtitles(visible, max_words, max_chars, max_duration)
+    return apply_timing_sanity_rules(split, max_duration=max_duration)
 
 
 def apply_timing_sanity_rules(segments: List[Segment], max_duration: float = 6.0) -> List[Segment]:
@@ -2162,8 +2213,13 @@ def print_timing_report(segments: List[Segment]) -> None:
     )
 
 
-def default_output_root() -> Path:
-    return Path(__file__).resolve().parents[2] / ("1 " + "\u5b57\u5e55")
+def default_output_root(video_path: Optional[Path] = None) -> Path:
+    configured = os.environ.get("SUBTITLE_OUTPUT_ROOT")
+    if configured:
+        return Path(configured).expanduser()
+    if video_path is not None:
+        return suggested_output_root(video_path)
+    return Path.cwd() / OUTPUT_DIRECTORY_NAME
 
 
 def segments_have_chinese(segments: List[Segment]) -> bool:
@@ -2231,7 +2287,10 @@ def main() -> None:
         series_name, movie_name = parse_movie_name(video_path.name, args.llm_model)
     print(f"Identified Series: {series_name}, Movie: {movie_name}")
 
-    output_root = Path(args.output_root) if args.output_root else default_output_root()
+    if args.output_root:
+        output_root = Path(args.output_root)
+    else:
+        output_root, _ = resolve_output_root(video_path, series_name, movie_name)
     out_dir = output_root / series_name / movie_name
     out_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = out_dir / f"{movie_name}.segments.checkpoint.json"

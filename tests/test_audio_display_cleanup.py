@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "src"))
 import audio_to_subtitle  # noqa: E402
 import subtitle_frontend  # noqa: E402
 import subtitle_pipeline  # noqa: E402
+from output_paths import find_existing_output_root, resolve_output_root  # noqa: E402
 from subtitle_pipeline import PgsImageEvent, SubtitleEvent, ocr_pgs_events, pair_events  # noqa: E402
 from audio_to_subtitle import (  # noqa: E402
     apply_display_timing,
@@ -23,6 +24,7 @@ from audio_to_subtitle import (  # noqa: E402
     generate_ass,
     load_cached_source_segments,
     merge_existing_subtitle_segments,
+    prepare_segments_for_output,
     proofread_existing_chinese_segments,
     sanitize_checkpoint_display_timing,
     segments_have_chinese,
@@ -34,6 +36,132 @@ from audio_to_subtitle import (  # noqa: E402
 
 
 class DisplayCleanupTests(unittest.TestCase):
+    def test_output_root_discovers_existing_central_subtitle_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video = root / "Movies" / "Film" / "film.mkv"
+            video.parent.mkdir(parents=True)
+            video.write_bytes(b"video")
+            output_root = root / "Movies" / "1 \u5b57\u5e55"
+            output_dir = output_root / "Film" / "Film"
+            output_dir.mkdir(parents=True)
+            (output_dir / "Film.segments.source.json").write_text("[]", encoding="utf-8")
+
+            discovered = find_existing_output_root(video, "Film", "Film")
+
+        self.assertEqual(discovered, output_root)
+
+    def test_output_root_discovers_existing_episode_with_spacing_difference(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            media_root = root / "\u7535\u5f71" / "21\u4e16\u7eaa\u6027\u7231\u6307\u5357"
+            video = media_root / "[21\u4e16\u7eaa\u6027\u7231\u6307\u5357].A.Girls.Guide.4of8.avi"
+            media_root.mkdir(parents=True)
+            video.write_bytes(b"video")
+            output_dir = (
+                media_root
+                / "21\u4e16\u7eaa\u6027\u7231\u6307\u5357 A Girl's Guide"
+                / "21\u4e16\u7eaa\u6027\u7231\u6307\u5357 A Girl's Guide 4 of 8"
+            )
+            output_dir.mkdir(parents=True)
+            (output_dir / "episode.segments.checkpoint.json").write_text("[]", encoding="utf-8")
+
+            discovered = find_existing_output_root(video, "A Girls Guide", "Episode 4")
+
+        self.assertEqual(discovered, media_root)
+
+    def test_output_root_discovers_standalone_movie_by_high_title_similarity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            movie_root = root / "Movies"
+            video = movie_root / "Oppenheimer.2023.2160p.UHD.BluRay.mkv"
+            movie_root.mkdir(parents=True)
+            video.write_bytes(b"video")
+            output_root = movie_root / "1 \u5b57\u5e55"
+            output_dir = output_root / "Oppenheimer" / "Oppenheimer"
+            output_dir.mkdir(parents=True)
+            (output_dir / "Oppenheimer.bilingual.ass").write_text("subtitle", encoding="utf-8")
+
+            discovered = find_existing_output_root(video, "Unknown", "Unknown")
+
+        self.assertEqual(discovered, output_root)
+
+    def test_output_root_respects_manual_directory_but_migrates_old_project_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video = root / "Movies" / "Show" / "show.4of8.mkv"
+            video.parent.mkdir(parents=True)
+            video.write_bytes(b"video")
+            existing_dir = video.parent / "Show" / "Show 4 of 8"
+            existing_dir.mkdir(parents=True)
+            (existing_dir / "Show 4 of 8.segments.source.json").write_text("[]", encoding="utf-8")
+            manual_root = root / "manual-output"
+            legacy_default = root / "Engineering" / "1 \u5b57\u5e55"
+
+            manual, manual_source = resolve_output_root(
+                video,
+                "Show",
+                "Show 4 of 8",
+                requested=manual_root,
+                legacy_default=legacy_default,
+            )
+            migrated, migrated_source = resolve_output_root(
+                video,
+                "Show",
+                "Show 4 of 8",
+                requested=legacy_default,
+                legacy_default=legacy_default,
+            )
+
+        self.assertEqual((manual, manual_source), (manual_root, "manual"))
+        self.assertEqual((migrated, migrated_source), (video.parent, "existing"))
+
+    def test_frontend_analysis_recovers_existing_output_from_legacy_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video = root / "Show" / "show.4of8.mkv"
+            video.parent.mkdir(parents=True)
+            video.write_bytes(b"video")
+            output_dir = video.parent / "Show" / "Show 4 of 8"
+            output_dir.mkdir(parents=True)
+            (output_dir / "Show 4 of 8.segments.source.json").write_text("[]", encoding="utf-8")
+            with (
+                patch.object(
+                    subtitle_frontend,
+                    "default_names",
+                    return_value={
+                        "series_name": "Show",
+                        "movie_name": "Show 4 of 8",
+                        "name_source": "test",
+                    },
+                ),
+                patch.object(subtitle_frontend, "list_sidecar_subtitles", return_value=[]),
+                patch.object(subtitle_frontend, "list_embedded_subtitles", return_value=[]),
+                patch.object(subtitle_frontend, "list_embedded_audio", return_value=[]),
+            ):
+                info = subtitle_frontend.analyze_input(
+                    {
+                        "path": str(video),
+                        "output_root": str(subtitle_frontend.LEGACY_DEFAULT_OUTPUT_ROOT),
+                    }
+                )
+
+        self.assertEqual(info["output_root"], str(video.parent))
+        self.assertEqual(info["output_root_source"], "existing")
+        self.assertTrue(info["source_segments_exists"])
+
+    def test_frontend_page_migrates_project_relative_output_default(self) -> None:
+        page = subtitle_frontend.html_page()
+
+        self.assertIn("自动查找已有输出", page)
+        self.assertIn("function migrateOutputRootDefault()", page)
+        self.assertIn("subtitleOutputRootMigrationVersion", page)
+        self.assertIn("< 2", page)
+        self.assertIn("document.getElementById('outputRoot').value = data.output_root || ''", page)
+        self.assertIn("已找到已有输出", page)
+        self.assertIn("已找到旧任务", page)
+        self.assertIn("output_root_source", subtitle_frontend.analyze_input.__code__.co_varnames)
+
     def test_hidden_duplicate_extends_previous_visible_subtitle(self) -> None:
         segments = [
             {"id": 0, "start": 10.0, "end": 11.0, "text": "hello", "en": "hello", "zh": "hello zh"},
@@ -816,6 +944,94 @@ class DisplayCleanupTests(unittest.TestCase):
             "".join(piece["zh"] for piece in pieces if piece.get("zh")),
             source[0]["zh"],
         )
+
+    def test_word_timed_split_checks_limits_before_adding_next_word(self) -> None:
+        words = [
+            {"start": 0.0, "end": 1.0, "word": "Alpha"},
+            {"start": 1.0, "end": 2.0, "word": "bravo"},
+            {"start": 2.0, "end": 3.0, "word": "charlie"},
+            {"start": 3.0, "end": 6.0, "word": "delta."},
+        ]
+        segments = [
+            {
+                "id": 0,
+                "start": 0.0,
+                "end": 6.0,
+                "text": "Alpha bravo charlie delta.",
+                "words": words,
+            }
+        ]
+
+        pieces = split_segments_for_subtitles(
+            segments,
+            max_words=3,
+            max_chars=18,
+            max_duration=4.0,
+        )
+
+        self.assertEqual(" ".join(piece["text"] for piece in pieces), "Alpha bravo charlie delta.")
+        self.assertTrue(all(len(piece["text"]) <= 18 for piece in pieces))
+        self.assertTrue(all(len(piece["text"].split()) <= 3 for piece in pieces))
+        self.assertTrue(all(piece["end"] - piece["start"] <= 4.0 for piece in pieces))
+
+    def test_output_suppresses_recent_long_exact_duplicate_missed_by_model(self) -> None:
+        repeated = "The same hallucinated sentence keeps repeating again."
+        segments = [
+            {"id": 0, "start": 10.0, "end": 11.0, "text": repeated, "en": repeated, "zh": "\u540c\u4e00\u53e5\u8bdd\u3002", "display": True},
+            {"id": 1, "start": 11.0, "end": 12.0, "text": repeated, "en": repeated, "zh": "\u540c\u4e00\u53e5\u8bdd\u3002", "display": True},
+        ]
+
+        output = prepare_segments_for_output(segments, max_words=12, max_chars=56, max_duration=5.5)
+
+        self.assertEqual(len(output), 1)
+        self.assertEqual(output[0]["start"], 10.0)
+        self.assertEqual(output[0]["end"], 12.0)
+
+    def test_output_caps_single_word_with_abnormal_long_timing(self) -> None:
+        segments = [
+            {
+                "id": 0,
+                "start": 10.0,
+                "end": 19.0,
+                "text": "Hello",
+                "words": [{"start": 10.0, "end": 19.0, "word": "Hello"}],
+                "display": True,
+            }
+        ]
+
+        output = prepare_segments_for_output(segments, max_words=12, max_chars=56, max_duration=5.5)
+
+        self.assertEqual(len(output), 1)
+        self.assertEqual(output[0]["start"], 10.0)
+        self.assertEqual(output[0]["end"], 15.5)
+
+    def test_output_keeps_short_or_distant_repeated_dialogue(self) -> None:
+        segments = [
+            {"id": 0, "start": 0.0, "end": 1.0, "text": "No.", "en": "No.", "zh": "\u4e0d\u3002", "display": True},
+            {"id": 1, "start": 1.0, "end": 2.0, "text": "No.", "en": "No.", "zh": "\u4e0d\u3002", "display": True},
+            {
+                "id": 2,
+                "start": 20.0,
+                "end": 21.0,
+                "text": "A deliberate repeated sentence.",
+                "en": "A deliberate repeated sentence.",
+                "zh": "\u4e00\u53e5\u6709\u610f\u91cd\u590d\u7684\u53f0\u8bcd\u3002",
+                "display": True,
+            },
+            {
+                "id": 3,
+                "start": 30.0,
+                "end": 31.0,
+                "text": "A deliberate repeated sentence.",
+                "en": "A deliberate repeated sentence.",
+                "zh": "\u4e00\u53e5\u6709\u610f\u91cd\u590d\u7684\u53f0\u8bcd\u3002",
+                "display": True,
+            },
+        ]
+
+        output = prepare_segments_for_output(segments, max_words=12, max_chars=56, max_duration=5.5)
+
+        self.assertEqual(len(output), 4)
 
     def test_merge_existing_subtitles_uses_spoken_track_timing(self) -> None:
         en_segments = [
