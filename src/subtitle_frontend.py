@@ -34,6 +34,7 @@ SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt"}
 RUNS: Dict[int, Dict[str, Any]] = {}
 RUNS_LOCK = threading.Lock()
 NAME_CACHE: Dict[str, Dict[str, str]] = {}
+USER_STOP_MARKER = "Frontend task stopped by user"
 
 
 def normalize_space(text: str) -> str:
@@ -791,12 +792,19 @@ def stop_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
     if recovered_info is not None and int(recovered_info["pid"]) != pid:
         recovered_info = None
     stopped = stop_process_tree(pid, recovered_info=recovered_info)
+    if stopped:
+        log_path, _ = frontend_log_paths(series_name, movie_name)
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(f"\n{USER_STOP_MARKER}\n")
     status = run_status(payload)
     status.update(
         {
             "pid": pid,
             "running": False if stopped else status.get("running", False),
             "stopped": stopped,
+            "outcome": "stopped" if stopped else status.get("outcome", "idle"),
+            "stage": status.get("stage", "已终止") if stopped else status.get("stage", "未运行"),
+            "error_summary": "",
             "message": "任务已终止" if stopped else "没有找到正在运行的前端任务",
         }
     )
@@ -810,12 +818,7 @@ def tail_text(path: Path, max_chars: int = 8000) -> str:
     return data[-max_chars:]
 
 
-def infer_stage_info(stdout_text: str, running: bool) -> tuple[str, int]:
-    if not running and "Success! Subtitles saved" in stdout_text:
-        return "完成", 3
-    if not running:
-        return "未运行", -1
-    
+def active_stage_info(stdout_text: str) -> tuple[str, int]:
     lines = stdout_text.strip().split("\n")
     for line in reversed(lines):
         if "Generating bilingual subtitles" in line:
@@ -833,6 +836,63 @@ def infer_stage_info(stdout_text: str, running: bool) -> tuple[str, int]:
         if "Using sidecar" in line:
             return "读取字幕文件中", 0
     return "启动中", 0
+
+
+def summarize_error(stderr_text: str, max_chars: int = 280) -> str:
+    lines = [line.strip() for line in stderr_text.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    summary = next(
+        (
+            line
+            for line in reversed(lines)
+            if re.search(r"(?:Error|Exception|Failure|Timeout)(?::|\b)", line)
+        ),
+        lines[-1],
+    )
+    if summary.startswith("During handling of the above exception"):
+        summary = "处理字幕时发生未知错误"
+    if len(summary) > max_chars:
+        summary = f"{summary[: max_chars - 3]}..."
+    return summary
+
+
+def infer_stage_info(
+    stdout_text: str,
+    stderr_text: str,
+    running: bool,
+    exit_code: int | None = None,
+) -> tuple[str, int, str]:
+    active_text, active_index = active_stage_info(stdout_text)
+    if running:
+        return active_text, active_index, "running"
+    if "Success! Subtitles saved" in stdout_text:
+        return "完成", 3, "success"
+    if USER_STOP_MARKER in stdout_text:
+        stopped_labels = {
+            0: "提取源已终止",
+            1: "内容识别已终止",
+            2: "翻译与校对已终止",
+        }
+        return stopped_labels.get(active_index, "已终止"), active_index, "stopped"
+    failure_markers = ("Traceback (most recent call last)", "RuntimeError:", "Error:", "FAILED")
+    failed = bool(stderr_text.strip()) or any(marker in stdout_text for marker in failure_markers)
+    failed = failed or (exit_code is not None and exit_code != 0)
+    if failed:
+        failed_labels = {
+            0: "提取源失败",
+            1: "内容识别失败",
+            2: "翻译与校对失败",
+        }
+        return failed_labels.get(active_index, "运行失败"), active_index, "failed"
+    if stdout_text.strip():
+        interrupted_labels = {
+            0: "提取源已中断",
+            1: "内容识别已中断",
+            2: "翻译与校对已中断",
+        }
+        return interrupted_labels.get(active_index, "运行已中断"), active_index, "interrupted"
+    return "未运行", -1, "idle"
 
 
 def run_status(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -858,6 +918,12 @@ def run_status(payload: Dict[str, Any]) -> Dict[str, Any]:
             info_proc = recovered
             with RUNS_LOCK:
                 RUNS[pid] = recovered
+    exit_code: int | None = None
+    if info_proc and info_proc.get("process") is not None:
+        try:
+            exit_code = info_proc["process"].poll()
+        except (AttributeError, OSError):
+            exit_code = None
     running = process_matches_run(info_proc) if info_proc else False
     if not running and info_proc:
         with RUNS_LOCK:
@@ -867,15 +933,24 @@ def run_status(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     info = checkpoint_info(output_root, series_name, movie_name)
     stdout_tail = tail_text(log_path)
-    stage_text, stage_index = infer_stage_info(stdout_tail, running)
+    stderr_tail = tail_text(err_path)
+    stage_text, stage_index, outcome = infer_stage_info(
+        stdout_tail,
+        stderr_tail,
+        running,
+        exit_code=exit_code,
+    )
     info.update(
         {
             "pid": pid,
             "running": running,
             "stage": stage_text,
             "stage_index": stage_index,
+            "outcome": outcome,
+            "exit_code": exit_code,
+            "error_summary": summarize_error(stderr_tail) if outcome == "failed" else "",
             "stdout_tail": stdout_tail,
-            "stderr_tail": tail_text(err_path),
+            "stderr_tail": stderr_tail,
             "checked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
     )
@@ -949,11 +1024,17 @@ def html_page() -> str:
     .stage-step { display: flex; align-items: center; gap: 8px; font-weight: 600; color: #4f5a66; }
     .stage-step.completed { color: #1f242b; }
     .stage-step.active { color: #1f242b; }
+    .stage-step.failed { color: #b42318; }
+    .stage-step.interrupted { color: #854d0e; }
     .dot { width: 14px; height: 14px; border-radius: 50%; background: #cfd6e4; transition: all 0.3s; }
     .stage-step.completed .dot { background: #2da44e; }
     .stage-step.active .dot { background: #bf8700; box-shadow: 0 0 6px rgba(191,135,0,0.6); }
-    .stage-step.pending .dot { background: #da3633; }
+    .stage-step.failed .dot { background: #da3633; }
+    .stage-step.interrupted .dot { background: #bf8700; }
+    .stage-step.pending .dot { background: #cfd6e4; }
     .stage-line { flex: 1; height: 2px; background: #dde1e7; margin: 0 16px; }
+    .status-message { margin: 14px 0 0; padding: 10px 12px; border-left: 4px solid #bf8700; background: #fff8c5; color: #633c01; line-height: 1.55; }
+    .status-message.error { border-left-color: #da3633; background: #ffebe9; color: #82071e; }
     @media (max-width: 800px) {
       main { padding: 14px; }
       .grid { grid-template-columns: 1fr; }
@@ -965,6 +1046,11 @@ def html_page() -> str:
       .stats { grid-template-columns: 1fr 1fr; }
       .stat:nth-child(4n) { border-right: 1px solid #e5e7eb; }
       .stat:nth-child(2n) { border-right: 0; }
+      .inline { flex-wrap: wrap; }
+      .inline .radio { flex-basis: 100%; }
+      .stage-container { overflow-x: auto; padding: 14px; gap: 6px; }
+      .stage-step { flex: 0 0 auto; white-space: nowrap; }
+      .stage-line { min-width: 24px; margin: 0 6px; }
     }
     .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); align-items: center; justify-content: center; z-index: 1000; }
     .modal { background: white; padding: 24px; border-radius: 8px; width: 100%; max-width: 400px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
@@ -1161,6 +1247,7 @@ def html_page() -> str:
       <div class="stat"><span class="muted">自动来源</span><b id="autoSourceState">-</b></div>
     </div>
     <p class="muted" id="paths"></p>
+    <p class="status-message" id="runMessage" role="alert" aria-live="polite" hidden></p>
     <div class="inline">
       <div class="radio">
         <label><input type="radio" name="runMode" value="resume" checked>从中断继续</label>
@@ -1451,9 +1538,9 @@ function analysisMatchesCurrentPath(analysis) {
   const selected = analysis?.selected_path;
   const video = analysis?.video_path;
   const normalizedCurrent = normalizePathForCompare(current);
-  return !normalizedCurrent
-    || normalizePathForCompare(selected) === normalizedCurrent
-    || normalizePathForCompare(video) === normalizedCurrent;
+  return Boolean(normalizedCurrent)
+    && (normalizePathForCompare(selected) === normalizedCurrent
+      || normalizePathForCompare(video) === normalizedCurrent);
 }
 
 function normalizePathForCompare(value) {
@@ -1493,7 +1580,15 @@ function render(data) {
   document.getElementById('videoSize').textContent = data.video_size_gb ? `${data.video_size_gb} GB` : '-';
   document.getElementById('totalCount').textContent = data.total_count ?? '未知';
   document.getElementById('completedCount').textContent = data.completed_count ?? 0;
-  document.getElementById('runningState').textContent = data.running ? '运行中' : '未运行';
+  const outcomeLabels = {
+    running: '运行中',
+    success: '已完成',
+    failed: '运行失败',
+    interrupted: '已中断',
+    stopped: '已终止',
+    idle: '未运行'
+  };
+  document.getElementById('runningState').textContent = outcomeLabels[data.outcome] || (data.running ? '运行中' : '未运行');
   document.getElementById('runBtn').disabled = Boolean(data.running);
   document.getElementById('stopBtn').disabled = !data.running;
   document.getElementById('sidecarState').textContent = data.has_sidecar_subtitles === undefined ? '未知' : (data.has_sidecar_subtitles ? `${(data.sidecar_subtitles || []).length} 个` : '无');
@@ -1507,11 +1602,33 @@ function render(data) {
     data.sidecar_subtitles ? `已有字幕：${subtitleListLabel(data.sidecar_subtitles)}` : '',
     data.embedded_subtitles ? `内封字幕：${subtitleListLabel(data.embedded_subtitles)}` : '',
     data.output_dir ? `输出：${data.output_dir}` : '',
-    data.checkpoint_path ? `checkpoint：${data.checkpoint_path}` : ''
+    data.checkpoint_exists && data.checkpoint_path ? `checkpoint：${data.checkpoint_path}` : ''
   ].filter(Boolean).join('  |  ');
+
+  const runMessage = document.getElementById('runMessage');
+  if (data.outcome === 'failed') {
+    const detail = data.error_summary || '程序异常退出，请查看下方日志。';
+    const recovery = data.checkpoint_exists
+      ? 'Checkpoint 已保留，可选择“从中断继续”后重新运行。'
+      : '请检查日志中的最后一条错误后重新运行。';
+    runMessage.textContent = `运行失败：${detail} ${recovery}`;
+    runMessage.className = 'status-message error';
+    runMessage.hidden = false;
+  } else if (data.outcome === 'interrupted') {
+    runMessage.textContent = data.checkpoint_exists
+      ? '上次运行未正常完成。Checkpoint 已保留，可选择“从中断继续”恢复。'
+      : '上次运行未正常完成，请查看日志后重新运行。';
+    runMessage.className = 'status-message';
+    runMessage.hidden = false;
+  } else {
+    runMessage.textContent = '';
+    runMessage.hidden = true;
+  }
 
   const stageIndex = data.stage_index ?? -1;
   const isCompleted = stageIndex === 3;
+  const isFailed = data.outcome === 'failed';
+  const isInterrupted = data.outcome === 'interrupted' || data.outcome === 'stopped';
   for (let i = 0; i <= 3; i++) {
     const stepEl = document.getElementById(`step-${i}`);
     if (!stepEl) continue;
@@ -1522,7 +1639,12 @@ function render(data) {
         if (i === 2) stepEl.querySelector('.step-text').textContent = '翻译与校对';
         if (i === 3) stepEl.querySelector('.step-text').textContent = '完成';
     } else {
-        stepEl.className = 'stage-step ' + (isCompleted || i < stageIndex ? 'completed' : (i === stageIndex ? 'active' : 'pending'));
+        const currentState = i === stageIndex && isFailed
+          ? 'failed'
+          : (i === stageIndex && isInterrupted
+            ? 'interrupted'
+            : (isCompleted || i < stageIndex ? 'completed' : (i === stageIndex ? 'active' : 'pending')));
+        stepEl.className = 'stage-step ' + currentState;
         if (i === stageIndex && data.stage) {
           stepEl.querySelector('.step-text').textContent = data.stage;
         } else {

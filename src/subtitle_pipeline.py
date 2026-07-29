@@ -44,6 +44,10 @@ TEXT_CODECS = {
     "text",
 }
 
+EXTRACT_CACHE_VERSION = 1
+PGS_IMAGE_CACHE_VERSION = 2
+OCR_CACHE_VERSION = 2
+
 
 @dataclass
 class StreamInfo:
@@ -903,11 +907,49 @@ def ocr_pgs_events(
     cache_path: Path,
     prefer_accuracy: bool,
 ) -> list[SubtitleEvent]:
+    config = {
+        "lang": lang,
+        "device": device,
+        "prefer_accuracy": prefer_accuracy,
+    }
+    image_signatures = [
+        {
+            "start": item.start,
+            "end": item.end,
+            "image_hash": item.image_hash,
+        }
+        for item in image_events
+    ]
+    out: list[SubtitleEvent] = []
     if cache_path.exists():
-        cached = json.loads(cache_path.read_text(encoding="utf-8"))
-        if len(cached) == len(image_events):
-            return [SubtitleEvent(float(x["start"]), float(x["end"]), str(x["text"])) for x in cached]
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            cached = None
+        if (
+            isinstance(cached, dict)
+            and cached.get("version") == OCR_CACHE_VERSION
+            and cached.get("config") == config
+            and cached.get("images") == image_signatures
+            and isinstance(cached.get("events"), list)
+            and len(cached["events"]) <= len(image_events)
+        ):
+            try:
+                out = [
+                    SubtitleEvent(float(item["start"]), float(item["end"]), str(item["text"]))
+                    for item in cached["events"]
+                ]
+            except (KeyError, TypeError, ValueError):
+                out = []
+            if len(out) == len(image_events):
+                log(f"Using validated OCR cache: {cache_path.name} ({len(out)} events)")
+                validate_ocr_results(out)
+                return out
+            if out:
+                log(f"Resuming OCR cache at image {len(out) + 1}/{len(image_events)}")
 
+    if len(out) >= len(image_events):
+        return out
     engine = PaddleOcrEngine(lang=lang, device=device, prefer_accuracy=prefer_accuracy)
     engine.assert_gpu()
     try:
@@ -915,17 +957,94 @@ def ocr_pgs_events(
     except Exception:
         tqdm = None
     iterator: Iterable[PgsImageEvent]
-    iterator = tqdm(image_events, desc=f"OCR {lang}", unit="line") if tqdm else image_events
-    out: list[SubtitleEvent] = []
+    remaining = image_events[len(out) :]
+    iterator = tqdm(remaining, desc=f"OCR {lang}", unit="line") if tqdm else remaining
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    for idx, item in enumerate(iterator, 1):
+    for idx, item in enumerate(iterator, len(out) + 1):
         text = engine.recognize(item.image_path)
         event = SubtitleEvent(item.start, item.end, text)
         out.append(event)
         if idx % 20 == 0:
-            write_json_atomic(cache_path, [e.__dict__ for e in out])
-    write_json_atomic(cache_path, [e.__dict__ for e in out])
+            write_json_atomic(
+                cache_path,
+                {
+                    "version": OCR_CACHE_VERSION,
+                    "config": config,
+                    "images": image_signatures,
+                    "events": [event.__dict__ for event in out],
+                },
+            )
+    write_json_atomic(
+        cache_path,
+        {
+            "version": OCR_CACHE_VERSION,
+            "config": config,
+            "images": image_signatures,
+            "events": [event.__dict__ for event in out],
+        },
+    )
+    validate_ocr_results(out)
     return out
+
+
+def validate_ocr_results(events: list[SubtitleEvent]) -> None:
+    recognized_count = sum(1 for event in events if clean_text(event.text))
+    log(f"OCR recognized text in {recognized_count}/{len(events)} images")
+    if events and recognized_count == 0:
+        raise RuntimeError(
+            f"OCR produced no text for {len(events)} images. Check the OCR language and source subtitle track."
+        )
+
+
+def file_cache_identity(path: Path) -> dict[str, Any]:
+    stat = path.stat()
+    return {
+        "path": str(path.resolve()),
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def extracted_stream_cache_matches(
+    meta_path: Path,
+    video: Path,
+    stream_index: int,
+    codec: str,
+) -> bool:
+    if not meta_path.exists():
+        return False
+    try:
+        payload = json.loads(meta_path.read_text(encoding="utf-8"))
+        return payload == {
+            "version": EXTRACT_CACHE_VERSION,
+            "video": file_cache_identity(video),
+            "stream_index": stream_index,
+            "codec": codec,
+        }
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def ensure_extracted_subtitle(
+    video: Path,
+    stream_index: int,
+    ffmpeg: str,
+    out_path: Path,
+    codec: str,
+) -> None:
+    meta_path = out_path.with_name(f"{out_path.name}.meta.json")
+    if out_path.exists() and extracted_stream_cache_matches(meta_path, video, stream_index, codec):
+        return
+    extract_subtitle(video, stream_index, ffmpeg, out_path, codec)
+    write_json_atomic(
+        meta_path,
+        {
+            "version": EXTRACT_CACHE_VERSION,
+            "video": file_cache_identity(video),
+            "stream_index": stream_index,
+            "codec": codec,
+        },
+    )
 
 
 def read_or_extract_text_events(
@@ -935,8 +1054,7 @@ def read_or_extract_text_events(
     work_dir: Path,
 ) -> list[SubtitleEvent]:
     srt_path = work_dir / f"stream_{stream.index:02d}.srt"
-    if not srt_path.exists():
-        extract_subtitle(video, stream.index, ffmpeg, srt_path, "srt")
+    ensure_extracted_subtitle(video, stream.index, ffmpeg, srt_path, "srt")
     return parse_srt(srt_path)
 
 
@@ -957,29 +1075,62 @@ def read_or_ocr_pgs_events(
     image_dir = work_dir / f"stream_{stream.index:02d}_images{cache_suffix}"
     image_events_path = work_dir / f"stream_{stream.index:02d}_image_events{cache_suffix}.json"
     ocr_cache_path = work_dir / f"stream_{stream.index:02d}_{ocr_lang}_ocr{cache_suffix}.json"
-    if not sup_path.exists():
+    sup_was_cached = sup_path.exists() and extracted_stream_cache_matches(
+        sup_path.with_name(f"{sup_path.name}.meta.json"),
+        video,
+        stream.index,
+        "copy",
+    )
+    if not sup_was_cached:
         log(f"Extracting PGS stream 0:{stream.index} -> {sup_path}")
-        extract_subtitle(video, stream.index, ffmpeg, sup_path, "copy")
+    ensure_extracted_subtitle(video, stream.index, ffmpeg, sup_path, "copy")
+    render_config = {
+        "sup": file_cache_identity(sup_path),
+        "scale": scale,
+        "pad": pad,
+        "limit": limit,
+    }
+    image_events: list[PgsImageEvent] | None = None
     if image_events_path.exists():
-        raw = json.loads(image_events_path.read_text(encoding="utf-8"))
-        image_events = [
-            PgsImageEvent(float(x["start"]), float(x["end"]), Path(x["image_path"]), str(x["image_hash"]))
-            for x in raw
-        ]
-    else:
+        try:
+            raw = json.loads(image_events_path.read_text(encoding="utf-8"))
+            if (
+                isinstance(raw, dict)
+                and raw.get("version") == PGS_IMAGE_CACHE_VERSION
+                and raw.get("render") == render_config
+                and isinstance(raw.get("events"), list)
+            ):
+                cached_events = [
+                    PgsImageEvent(
+                        float(item["start"]),
+                        float(item["end"]),
+                        Path(item["image_path"]),
+                        str(item["image_hash"]),
+                    )
+                    for item in raw["events"]
+                ]
+                if all(item.image_path.exists() for item in cached_events):
+                    image_events = cached_events
+        except (KeyError, OSError, TypeError, ValueError):
+            image_events = None
+    if image_events is None:
         log(f"Rendering PGS images from {sup_path.name}")
         image_events = parse_pgs_to_images(sup_path, image_dir, scale=scale, pad=pad, limit=limit)
         write_json_atomic(
             image_events_path,
-            [
-                {
-                    "start": e.start,
-                    "end": e.end,
-                    "image_path": str(e.image_path),
-                    "image_hash": e.image_hash,
-                }
-                for e in image_events
-            ],
+            {
+                "version": PGS_IMAGE_CACHE_VERSION,
+                "render": render_config,
+                "events": [
+                    {
+                        "start": event.start,
+                        "end": event.end,
+                        "image_path": str(event.image_path),
+                        "image_hash": event.image_hash,
+                    }
+                    for event in image_events
+                ],
+            },
         )
     log(f"OCR source images: {len(image_events)}")
     return ocr_pgs_events(image_events, ocr_lang, device, ocr_cache_path, prefer_accuracy)
@@ -1065,11 +1216,81 @@ def best_overlap(base: SubtitleEvent, candidates: list[tuple[int, SubtitleEvent]
     return best_idx, cand
 
 
+def strong_overlap(first: SubtitleEvent, second: SubtitleEvent) -> bool:
+    overlap = max(0.0, min(first.end, second.end) - max(first.start, second.start))
+    shorter_duration = min(
+        max(0.01, first.end - first.start),
+        max(0.01, second.end - second.start),
+    )
+    return overlap / shorter_duration >= 0.5
+
+
+def join_subtitle_events(events: list[SubtitleEvent], language: str) -> SubtitleEvent:
+    ordered = sorted(events, key=lambda event: (event.start, event.end))
+    texts: list[str] = []
+    previous = ""
+    for event in ordered:
+        text = clean_text(event.text)
+        normalized = re.sub(r"\s+", "", text).casefold()
+        if text and normalized != previous:
+            texts.append(text)
+            previous = normalized
+    separator = "" if language == "zh" else " "
+    return SubtitleEvent(
+        min(event.start for event in ordered),
+        max(event.end for event in ordered),
+        clean_text(separator.join(texts)),
+    )
+
+
 def pair_events(en_events: list[SubtitleEvent], zh_events: list[SubtitleEvent]) -> list[tuple[SubtitleEvent | None, SubtitleEvent | None]]:
     paired: list[tuple[SubtitleEvent | None, SubtitleEvent | None]] = []
+    en_edges: dict[int, set[int]] = {}
+    zh_edges: dict[int, set[int]] = {}
+    active_zh_start = 0
+    for en_idx, en in enumerate(en_events):
+        if is_sdh_sound_cue(en.text):
+            continue
+        while active_zh_start < len(zh_events) and zh_events[active_zh_start].end <= en.start:
+            active_zh_start += 1
+        for zh_idx in range(active_zh_start, len(zh_events)):
+            zh = zh_events[zh_idx]
+            if zh.start >= en.end:
+                break
+            if strong_overlap(en, zh):
+                en_edges.setdefault(en_idx, set()).add(zh_idx)
+                zh_edges.setdefault(zh_idx, set()).add(en_idx)
+
+    used_en: set[int] = set()
     used_zh: set[int] = set()
+    for initial_en_idx in sorted(en_edges):
+        if initial_en_idx in used_en:
+            continue
+        component_en: set[int] = set()
+        component_zh: set[int] = set()
+        pending_en = [initial_en_idx]
+        while pending_en:
+            en_idx = pending_en.pop()
+            if en_idx in component_en:
+                continue
+            component_en.add(en_idx)
+            for zh_idx in en_edges.get(en_idx, set()):
+                if zh_idx not in component_zh:
+                    component_zh.add(zh_idx)
+                    pending_en.extend(zh_edges.get(zh_idx, set()) - component_en)
+        used_en.update(component_en)
+        used_zh.update(component_zh)
+        paired.append(
+            (
+                join_subtitle_events([en_events[idx] for idx in component_en], "en"),
+                join_subtitle_events([zh_events[idx] for idx in component_zh], "zh"),
+            )
+        )
+
     start = 0
-    for en in en_events:
+    for en_idx, en in enumerate(en_events):
+        if en_idx in used_en:
+            continue
         while start < len(zh_events) and zh_events[start].end < en.start - 5:
             start += 1
         if is_sdh_sound_cue(en.text):

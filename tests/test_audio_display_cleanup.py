@@ -12,7 +12,8 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import audio_to_subtitle  # noqa: E402
 import subtitle_frontend  # noqa: E402
-from subtitle_pipeline import SubtitleEvent, pair_events  # noqa: E402
+import subtitle_pipeline  # noqa: E402
+from subtitle_pipeline import PgsImageEvent, SubtitleEvent, ocr_pgs_events, pair_events  # noqa: E402
 from audio_to_subtitle import (  # noqa: E402
     apply_display_timing,
     build_source_request_fingerprint,
@@ -843,6 +844,190 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertEqual(pairs[0], (SubtitleEvent(10.0, 11.0, "spoken"), None))
         self.assertEqual(pairs[1], (None, SubtitleEvent(12.0, 13.0, "\u8fdf\u5230\u5b57\u5e55")))
 
+    def test_pair_events_groups_two_english_events_with_one_chinese_event(self) -> None:
+        pairs = pair_events(
+            [
+                SubtitleEvent(10.0, 11.0, "First sentence."),
+                SubtitleEvent(11.0, 12.0, "Second sentence."),
+            ],
+            [SubtitleEvent(10.0, 12.0, "\u7b2c\u4e00\u53e5\u3002\u7b2c\u4e8c\u53e5\u3002")],
+        )
+
+        self.assertEqual(
+            pairs,
+            [
+                (
+                    SubtitleEvent(10.0, 12.0, "First sentence. Second sentence."),
+                    SubtitleEvent(10.0, 12.0, "\u7b2c\u4e00\u53e5\u3002\u7b2c\u4e8c\u53e5\u3002"),
+                )
+            ],
+        )
+
+    def test_pair_events_groups_one_english_event_with_two_chinese_events(self) -> None:
+        pairs = pair_events(
+            [SubtitleEvent(20.0, 22.0, "A complete sentence.")],
+            [
+                SubtitleEvent(20.0, 21.0, "\u4e00\u4e2a"),
+                SubtitleEvent(21.0, 22.0, "\u5b8c\u6574\u53e5\u5b50\u3002"),
+            ],
+        )
+
+        self.assertEqual(
+            pairs,
+            [
+                (
+                    SubtitleEvent(20.0, 22.0, "A complete sentence."),
+                    SubtitleEvent(20.0, 22.0, "\u4e00\u4e2a\u5b8c\u6574\u53e5\u5b50\u3002"),
+                )
+            ],
+        )
+
+    def test_pair_events_does_not_chain_normal_adjacent_shifted_subtitles(self) -> None:
+        pairs = pair_events(
+            [
+                SubtitleEvent(0.0, 2.0, "First."),
+                SubtitleEvent(2.0, 4.0, "Second."),
+            ],
+            [
+                SubtitleEvent(0.2, 2.2, "\u7b2c\u4e00\u53e5\u3002"),
+                SubtitleEvent(2.2, 4.2, "\u7b2c\u4e8c\u53e5\u3002"),
+            ],
+        )
+
+        self.assertEqual(len(pairs), 2)
+        self.assertEqual([pair[0].text for pair in pairs if pair[0]], ["First.", "Second."])
+        self.assertEqual([pair[1].text for pair in pairs if pair[1]], ["\u7b2c\u4e00\u53e5\u3002", "\u7b2c\u4e8c\u53e5\u3002"])
+
+    def test_extracted_subtitle_cache_is_bound_to_video_stream_and_codec(self) -> None:
+        calls: list[tuple[int, str]] = []
+
+        def fake_extract(_video, stream_index, _ffmpeg, out_path, codec):
+            calls.append((stream_index, codec))
+            out_path.write_text("subtitle", encoding="utf-8")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video = root / "movie.mkv"
+            video.write_bytes(b"video-v1")
+            extracted = root / "stream_03.srt"
+            with patch.object(subtitle_pipeline, "extract_subtitle", side_effect=fake_extract):
+                subtitle_pipeline.ensure_extracted_subtitle(video, 3, "ffmpeg", extracted, "srt")
+                subtitle_pipeline.ensure_extracted_subtitle(video, 3, "ffmpeg", extracted, "srt")
+                video.write_bytes(b"video-v2-with-different-size")
+                subtitle_pipeline.ensure_extracted_subtitle(video, 3, "ffmpeg", extracted, "srt")
+
+        self.assertEqual(calls, [(3, "srt"), (3, "srt")])
+
+    def test_ocr_cache_resumes_only_when_image_and_config_fingerprints_match(self) -> None:
+        class FakeOcrEngine:
+            recognized: list[Path] = []
+
+            def __init__(self, **_kwargs):
+                pass
+
+            @staticmethod
+            def assert_gpu() -> None:
+                pass
+
+            @classmethod
+            def recognize(cls, image_path: Path) -> str:
+                cls.recognized.append(image_path)
+                return "second"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            first_image = root / "first.png"
+            second_image = root / "second.png"
+            first_image.write_bytes(b"first")
+            second_image.write_bytes(b"second")
+            cache_path = root / "ocr.json"
+            cache_path.write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "config": {"lang": "en", "device": "gpu:0", "prefer_accuracy": True},
+                        "images": [
+                            {"start": 1.0, "end": 2.0, "image_hash": "hash-first"},
+                            {"start": 2.0, "end": 3.0, "image_hash": "hash-second"},
+                        ],
+                        "events": [{"start": 1.0, "end": 2.0, "text": "first"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            image_events = [
+                PgsImageEvent(1.0, 2.0, first_image, "hash-first"),
+                PgsImageEvent(2.0, 3.0, second_image, "hash-second"),
+            ]
+
+            with patch.object(subtitle_pipeline, "PaddleOcrEngine", FakeOcrEngine):
+                result = ocr_pgs_events(image_events, "en", "gpu:0", cache_path, True)
+
+        self.assertEqual([event.text for event in result], ["first", "second"])
+        self.assertEqual(FakeOcrEngine.recognized, [second_image])
+
+    def test_ocr_cache_rejects_same_length_with_different_image_hash(self) -> None:
+        class FakeOcrEngine:
+            recognized: list[Path] = []
+
+            def __init__(self, **_kwargs):
+                pass
+
+            @staticmethod
+            def assert_gpu() -> None:
+                pass
+
+            @classmethod
+            def recognize(cls, image_path: Path) -> str:
+                cls.recognized.append(image_path)
+                return image_path.stem
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image = root / "changed.png"
+            image.write_bytes(b"changed")
+            cache_path = root / "ocr.json"
+            cache_path.write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "config": {"lang": "en", "device": "gpu:0", "prefer_accuracy": True},
+                        "images": [{"start": 1.0, "end": 2.0, "image_hash": "old-hash"}],
+                        "events": [{"start": 1.0, "end": 2.0, "text": "stale"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            image_events = [PgsImageEvent(1.0, 2.0, image, "new-hash")]
+
+            with patch.object(subtitle_pipeline, "PaddleOcrEngine", FakeOcrEngine):
+                result = ocr_pgs_events(image_events, "en", "gpu:0", cache_path, True)
+
+        self.assertEqual([event.text for event in result], ["changed"])
+        self.assertEqual(FakeOcrEngine.recognized, [image])
+
+    def test_validated_ocr_cache_rejects_all_empty_results(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image = root / "empty.png"
+            image.write_bytes(b"empty")
+            cache_path = root / "ocr.json"
+            cache_path.write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "config": {"lang": "en", "device": "gpu:0", "prefer_accuracy": True},
+                        "images": [{"start": 1.0, "end": 2.0, "image_hash": "empty-hash"}],
+                        "events": [{"start": 1.0, "end": 2.0, "text": ""}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            image_events = [PgsImageEvent(1.0, 2.0, image, "empty-hash")]
+
+            with self.assertRaisesRegex(RuntimeError, "OCR produced no text"):
+                ocr_pgs_events(image_events, "en", "gpu:0", cache_path, True)
+
     def test_japanese_translate_rejects_old_unversioned_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             checkpoint_path = Path(tmpdir) / "checkpoint.json"
@@ -1190,6 +1375,44 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertIn("subtitle_file: usesSidecar && !mergeExisting", page)
         self.assertIn("chinese_subtitle_stream: usesEmbedded && mergeExisting", page)
         self.assertIn("audio_stream: usesAudio ?", page)
+
+    def test_frontend_reports_failed_run_with_last_active_stage(self) -> None:
+        stage, stage_index, outcome = subtitle_frontend.infer_stage_info(
+            "Processing segments: 8/20\n",
+            "Traceback (most recent call last):\nRuntimeError: remote model unavailable\n",
+            False,
+        )
+
+        self.assertEqual(stage, "翻译与校对失败")
+        self.assertEqual(stage_index, 2)
+        self.assertEqual(outcome, "failed")
+        self.assertEqual(
+            subtitle_frontend.summarize_error(
+                "Traceback (most recent call last):\n"
+                "RuntimeError: remote model unavailable\n"
+                "OCR progress: 40%\n"
+            ),
+            "RuntimeError: remote model unavailable",
+        )
+
+    def test_frontend_user_stop_marker_survives_status_refresh(self) -> None:
+        stage, stage_index, outcome = subtitle_frontend.infer_stage_info(
+            f"Processing segments: 8/20\n{subtitle_frontend.USER_STOP_MARKER}\n",
+            "warning emitted before termination\n",
+            False,
+        )
+
+        self.assertEqual(stage, "翻译与校对已终止")
+        self.assertEqual(stage_index, 2)
+        self.assertEqual(outcome, "stopped")
+
+    def test_frontend_failure_message_is_visible_and_actionable(self) -> None:
+        page = subtitle_frontend.html_page()
+
+        self.assertIn('id="runMessage"', page)
+        self.assertIn("data.outcome === 'failed'", page)
+        self.assertIn("data.checkpoint_exists", page)
+        self.assertIn("从中断继续", page)
 
     def test_frontend_launcher_does_not_open_an_unrelated_service(self) -> None:
         frontend_source = (ROOT / "src" / "subtitle_frontend.py").read_text(encoding="utf-8")
