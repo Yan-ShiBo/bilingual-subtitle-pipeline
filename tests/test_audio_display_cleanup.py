@@ -16,6 +16,7 @@ import subtitle_pipeline  # noqa: E402
 from output_paths import find_existing_output_root, resolve_output_root  # noqa: E402
 from subtitle_pipeline import PgsImageEvent, SubtitleEvent, ocr_pgs_events, pair_events  # noqa: E402
 from audio_to_subtitle import (  # noqa: E402
+    ExistingSubtitleTracks,
     apply_display_timing,
     build_source_request_fingerprint,
     checkpoint_matches_segments,
@@ -34,6 +35,7 @@ from audio_to_subtitle import (  # noqa: E402
     split_segments_for_subtitles,
     source_cache_uses_current_timing_policy,
     source_cache_matches_request,
+    synchronize_existing_subtitle_tracks,
     translate_and_correct_segments,
 )
 
@@ -512,6 +514,73 @@ class DisplayCleanupTests(unittest.TestCase):
             upgraded_cache = json.loads(source_cache.read_text(encoding="utf-8"))
             self.assertTrue(upgraded_cache[0]["source_request_fingerprint"])
 
+    def test_main_reuses_audio_cache_from_previous_sync_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video = root / "video.mp4"
+            video.write_bytes(b"placeholder")
+            output_root = root / "out"
+            out_dir = output_root / "Series" / "Episode"
+            out_dir.mkdir(parents=True)
+            previous_fingerprint = build_source_request_fingerprint(
+                video,
+                video,
+                SimpleNamespace(source="audio"),
+                sync_policy_version=5,
+            )
+            source_cache = out_dir / "Episode.segments.source.json"
+            source_cache.write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": 0,
+                            "start": 1.0,
+                            "end": 2.0,
+                            "text": "cached line",
+                            "source_language": "en",
+                            "timing_origin": "audio_asr",
+                            "source_cache_version": 3,
+                            "source_request_fingerprint": previous_fingerprint,
+                        }
+                    ],
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            argv = [
+                "audio_to_subtitle.py",
+                "--video",
+                str(video),
+                "--source",
+                "audio",
+                "--output-root",
+                str(output_root),
+                "--series-name",
+                "Series",
+                "--movie-name",
+                "Episode",
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(audio_to_subtitle, "extract_audio", side_effect=AssertionError("extract_audio called")),
+                patch.object(audio_to_subtitle, "transcribe_audio", side_effect=AssertionError("transcribe_audio called")),
+                patch.object(audio_to_subtitle, "translate_and_correct_segments", side_effect=lambda segments, **_: segments),
+            ):
+                audio_to_subtitle.main()
+
+            upgraded_cache = json.loads(source_cache.read_text(encoding="utf-8"))
+
+        self.assertNotEqual(
+            upgraded_cache[0]["source_request_fingerprint"],
+            previous_fingerprint,
+        )
+        self.assertEqual(
+            upgraded_cache[0]["source_cache_version"],
+            audio_to_subtitle.SOURCE_CACHE_VERSION,
+        )
+
     def test_source_cache_fingerprint_changes_with_selected_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -891,28 +960,58 @@ class DisplayCleanupTests(unittest.TestCase):
                 subtitle_frontend.start_processing(payload)
 
     def test_remote_llm_uses_frontend_owned_tunnel_url(self) -> None:
-        response = SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
-        )
+        captured = {}
+
+        def post_chat(base_url, payload):
+            captured["base_url"] = base_url
+            captured["payload"] = payload
+            return {"message": {"content": "ok"}}
+
         with (
             patch.dict(
                 audio_to_subtitle.os.environ,
                 {"SUBTITLE_REMOTE_OLLAMA_URL": "http://127.0.0.1:32123"},
                 clear=False,
             ),
-            patch.object(audio_to_subtitle, "OpenAI") as openai_class,
+            patch.object(audio_to_subtitle, "post_ollama_chat", side_effect=post_chat),
         ):
-            openai_class.return_value.chat.completions.create.return_value = response
             result = audio_to_subtitle.call_llm(
                 "prompt",
                 model="remote:AI Server:qwen3:30b",
             )
 
         self.assertEqual(result, "ok")
-        openai_class.assert_called_once_with(
-            base_url="http://127.0.0.1:32123/v1",
-            api_key="ollama",
-        )
+        self.assertEqual(captured["base_url"], "http://127.0.0.1:32123")
+        self.assertEqual(captured["payload"]["model"], "qwen3:30b")
+
+    def test_llm_role_applies_explicit_generation_profile_and_json_schema(self) -> None:
+        captured = {}
+
+        def post_chat(base_url, payload):
+            captured["base_url"] = base_url
+            captured["payload"] = payload
+            return {"message": {"content": "[]"}}
+
+        with patch.object(audio_to_subtitle, "post_ollama_chat", side_effect=post_chat):
+            audio_to_subtitle.call_llm(
+                "proofread",
+                model="qwen3:30b",
+                role="proofread",
+                response_schema=audio_to_subtitle.indexed_subtitle_schema(
+                    2,
+                    "proofread",
+                ),
+            )
+
+        request = captured["payload"]
+        self.assertEqual(captured["base_url"], "http://localhost:11434")
+        self.assertEqual(request["options"]["temperature"], 0.1)
+        self.assertEqual(request["options"]["top_p"], 0.8)
+        self.assertEqual(request["options"]["seed"], 43)
+        self.assertEqual(request["options"]["top_k"], 20)
+        self.assertEqual(request["options"]["num_ctx"], 65536)
+        self.assertFalse(request["think"])
+        self.assertEqual(request["format"]["maxItems"], 2)
 
     def test_transcribe_audio_unloads_whisper_from_local_gpu(self) -> None:
         unloaded = []
@@ -1082,7 +1181,7 @@ class DisplayCleanupTests(unittest.TestCase):
             ]
             with (
                 patch.object(sys, "argv", argv),
-                patch.object(audio_to_subtitle, "find_existing_embedded_subtitle_segments", return_value=None),
+                patch.object(audio_to_subtitle, "find_existing_embedded_subtitle_tracks", return_value=None),
                 patch.object(audio_to_subtitle, "load_embedded_subtitle_events", side_effect=load_embedded),
                 patch.object(audio_to_subtitle, "extract_audio", side_effect=AssertionError("extract_audio called")),
                 patch.object(audio_to_subtitle, "translate_and_correct_segments", side_effect=lambda segments, **_: segments),
@@ -1294,6 +1393,62 @@ class DisplayCleanupTests(unittest.TestCase):
             source[0]["zh"],
         )
 
+    def test_bilingual_output_uses_independent_one_line_limits(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 0.0,
+                "end": 6.0,
+                "text": "This deliberately long English subtitle must be split into readable professional cues.",
+                "en": "This deliberately long English subtitle must be split into readable professional cues.",
+                "zh": "这是一条故意写得很长而且必须拆成专业可读片段的中文字幕。",
+            }
+        ]
+
+        pieces = split_segments_for_subtitles(
+            source,
+            max_words=12,
+            max_chars=56,
+            max_duration=5.5,
+        )
+
+        self.assertGreater(len(pieces), 1)
+        self.assertTrue(all(len(piece["en"]) <= 42 for piece in pieces if piece.get("en")))
+        self.assertTrue(all(len(piece["zh"]) <= 16 for piece in pieces if piece.get("zh")))
+        self.assertEqual(" ".join(piece["en"] for piece in pieces), source[0]["en"])
+        self.assertEqual("".join(piece["zh"] for piece in pieces), source[0]["zh"])
+
+    def test_balanced_bilingual_split_prefers_punctuation_boundaries(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 0.0,
+                "end": 4.0,
+                "text": "We came home and waited, because the storm grew worse.",
+                "en": "We came home and waited, because the storm grew worse.",
+                "zh": "我们回到家里等待，因为暴风雨越来越猛烈。",
+            }
+        ]
+
+        pieces = split_segments_for_subtitles(
+            source,
+            max_words=12,
+            max_chars=42,
+            max_duration=5.5,
+        )
+
+        self.assertGreaterEqual(len(pieces), 2)
+        self.assertTrue(pieces[0]["en"].endswith(","))
+        self.assertTrue(pieces[0]["zh"].endswith("，"))
+
+    def test_reading_budget_caps_each_bilingual_language_to_one_line(self) -> None:
+        chinese_budget, english_budget = audio_to_subtitle.reading_budgets(
+            {"id": 0, "start": 0.0, "end": 10.0, "text": "Long subtitle"},
+        )
+
+        self.assertEqual(chinese_budget, 16)
+        self.assertEqual(english_budget, 42)
+
     def test_word_timed_split_checks_limits_before_adding_next_word(self) -> None:
         words = [
             {"start": 0.0, "end": 1.0, "word": "Alpha"},
@@ -1332,9 +1487,11 @@ class DisplayCleanupTests(unittest.TestCase):
 
         output = prepare_segments_for_output(segments, max_words=12, max_chars=56, max_duration=5.5)
 
-        self.assertEqual(len(output), 1)
+        self.assertEqual(len(output), 2)
         self.assertEqual(output[0]["start"], 10.0)
-        self.assertEqual(output[0]["end"], 12.5)
+        self.assertLessEqual(output[-1]["end"], 12.5)
+        self.assertEqual(" ".join(item["en"] for item in output), repeated)
+        self.assertTrue(all(len(item["en"]) <= 42 for item in output))
 
     def test_output_caps_single_word_with_abnormal_long_timing(self) -> None:
         segments = [
@@ -1524,6 +1681,95 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertEqual(len(merged), 1)
         self.assertEqual(merged[0]["start"], 30.0)
         self.assertEqual(merged[0]["end"], 32.0)
+
+    def test_existing_subtitle_tracks_are_synchronized_independently_before_merge(self) -> None:
+        tracks = ExistingSubtitleTracks(
+            english=[{"id": 0, "start": 30.0, "end": 32.0, "text": "Spoken line"}],
+            chinese=[{"id": 0, "start": 30.3, "end": 35.5, "text": "中文字幕"}],
+            source_label="existing Chinese embedded subtitle",
+        )
+        calls = []
+
+        def synchronize(_video, segments, **kwargs):
+            calls.append(kwargs)
+            shift = -20.0 if segments[0]["text"] == "Spoken line" else -20.2
+            output = [
+                {
+                    **segment,
+                    "start": segment["start"] + shift,
+                    "end": segment["end"] + shift,
+                }
+                for segment in segments
+            ]
+            return output, {
+                "status": "aligned",
+                "pipeline_quality_passed": True,
+                "applied": True,
+            }
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch.object(audio_to_subtitle, "synchronize_subtitle_segments", side_effect=synchronize),
+        ):
+            synchronized, report = synchronize_existing_subtitle_tracks(
+                Path(tmpdir) / "movie.mkv",
+                tracks,
+                mode="auto",
+                report_path=Path(tmpdir) / "sync.json",
+                audio_stream=4,
+            )
+
+        merged = merge_existing_subtitle_segments(
+            synchronized.english,
+            synchronized.chinese,
+            synchronized.source_label,
+        )
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(call["audio_stream"] == 4 for call in calls))
+        self.assertEqual(merged[0]["start"], 10.0)
+        self.assertEqual(merged[0]["end"], 12.0)
+        self.assertEqual(report["status"], "aligned")
+        self.assertTrue(report["applied"])
+
+    def test_existing_subtitle_sync_reverts_both_tracks_when_one_fails_quality(self) -> None:
+        tracks = ExistingSubtitleTracks(
+            english=[{"id": 0, "start": 30.0, "end": 32.0, "text": "Spoken line"}],
+            chinese=[{"id": 0, "start": 30.3, "end": 35.5, "text": "中文字幕"}],
+            source_label="existing Chinese sidecar subtitle",
+        )
+
+        def synchronize(_video, segments, **_kwargs):
+            if segments[0]["text"] == "Spoken line":
+                return [
+                    {**segments[0], "start": 10.0, "end": 12.0}
+                ], {
+                    "status": "aligned",
+                    "pipeline_quality_passed": True,
+                    "applied": True,
+                }
+            return [dict(segments[0])], {
+                "status": "rejected_low_quality",
+                "pipeline_quality_passed": False,
+                "applied": False,
+            }
+
+        with patch.object(
+            audio_to_subtitle,
+            "synchronize_subtitle_segments",
+            side_effect=synchronize,
+        ):
+            synchronized, report = synchronize_existing_subtitle_tracks(
+                Path("movie.mkv"),
+                tracks,
+                mode="auto",
+                audio_stream=2,
+            )
+
+        self.assertEqual(synchronized.english, tracks.english)
+        self.assertEqual(synchronized.chinese, tracks.chinese)
+        self.assertEqual(report["status"], "rejected_partial")
+        self.assertFalse(report["applied"])
+        self.assertTrue(report["reverted_all_tracks"])
 
     def test_pair_events_rejects_nonoverlapping_subtitles_with_large_gap(self) -> None:
         pairs = pair_events(
@@ -2085,9 +2331,13 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertIn('id="advancedSettings"', page)
         self.assertIn("function updateWorkflowVisibility()", page)
         self.assertIn("source.addEventListener('change', updateWorkflowVisibility)", page)
+        self.assertIn("subtitleSync').addEventListener('change', updateWorkflowVisibility)", page)
         self.assertIn("subtitle_file: usesSidecar && !mergeExisting", page)
         self.assertIn("chinese_subtitle_stream: usesEmbedded && mergeExisting", page)
-        self.assertIn("audio_stream: usesAudio ?", page)
+        self.assertIn("const mayUseExisting = usesExisting || (source === 'auto' && mode === 'auto')", page)
+        self.assertIn("usesExisting && subtitleSync !== 'off'", page)
+        self.assertIn("audio_stream: usesSelectedAudioTrack ?", page)
+        self.assertIn("用于字幕同步的音轨", page)
 
     def test_frontend_reports_failed_run_with_last_active_stage(self) -> None:
         stage, stage_index, outcome = subtitle_frontend.infer_stage_info(

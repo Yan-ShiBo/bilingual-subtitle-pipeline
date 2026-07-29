@@ -745,7 +745,7 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
     batch_size = int(payload.get("batch_size") or 5)
     context_lines = int(payload.get("context_lines") or 30)
     max_words = int(payload.get("max_words") or 12)
-    max_chars = int(payload.get("max_chars") or 56)
+    max_chars = int(payload.get("max_chars") or 42)
     max_duration = float(payload.get("max_duration") or 5.5)
     subtitle_style_profile = str(payload.get("subtitle_style_profile") or "adaptive")
     if subtitle_style_profile not in STYLE_PROFILE_NAMES:
@@ -1365,13 +1365,13 @@ def html_page() -> str:
       </div>
 
       <div class="workflow-group" id="audioRecognitionOptions" hidden>
-        <h3>音频识别</h3>
+        <h3 id="audioRecognitionHeading">音频识别</h3>
         <div class="workflow-grid">
           <div class="span-4" id="audioStreamGroup">
-            <label for="audioStream">音频轨道</label>
+            <label for="audioStream" id="audioStreamLabel">用于语音识别的音轨</label>
             <select id="audioStream"><option value="">自动选择</option></select>
           </div>
-          <div class="span-4">
+          <div class="span-4" id="asrLanguageGroup">
             <label for="asrLanguage">音频识别语言</label>
             <select id="asrLanguage">
               <option value="source" selected>跟随源语言</option>
@@ -1404,8 +1404,8 @@ def html_page() -> str:
             <input id="maxWords" type="number" value="12" min="4" max="40">
           </div>
           <div class="span-2">
-            <label for="maxChars">最大字符</label>
-            <input id="maxChars" type="number" value="56" min="20" max="160">
+            <label for="maxChars">英文每条最大字符</label>
+            <input id="maxChars" type="number" value="42" min="20" max="42">
           </div>
           <div class="span-2">
             <label for="maxDuration">最长秒数</label>
@@ -1588,17 +1588,23 @@ function updateWorkflowVisibility() {
   const usesAudio = mode === 'audio';
   const usesExisting = usesSidecar || usesEmbedded;
   const merge = document.getElementById('mergeExistingSubtitles').checked;
+  const syncsExisting = usesExisting && document.getElementById('subtitleSync').value !== 'off';
 
   setHidden('existingSubtitleOptions', !usesExisting);
   setHidden('sidecarOptions', !usesSidecar);
   setHidden('embeddedOptions', !usesEmbedded);
-  setHidden('audioRecognitionOptions', !usesAudio);
+  setHidden('audioRecognitionOptions', !(usesAudio || syncsExisting));
+  setHidden('asrLanguageGroup', !usesAudio);
   setHidden('sidecarPathGroup', !usesSidecar || merge);
   setHidden('chineseSidecarPathGroup', !usesSidecar || !merge);
   setHidden('englishSidecarPathGroup', !usesSidecar || !merge);
   setHidden('subtitleStreamGroup', !usesEmbedded || merge);
   setHidden('chineseSubtitleStreamGroup', !usesEmbedded || !merge);
   setHidden('englishSubtitleStreamGroup', !usesEmbedded || !merge);
+  document.getElementById('audioRecognitionHeading').textContent =
+    usesAudio ? '音频识别' : '字幕同步音轨';
+  document.getElementById('audioStreamLabel').textContent =
+    usesAudio ? '用于语音识别的音轨' : '用于字幕同步的音轨';
 }
 
 function payload() {
@@ -1608,14 +1614,19 @@ function payload() {
   const usesSidecar = mode === 'sidecar';
   const usesEmbedded = mode === 'embedded';
   const usesAudio = mode === 'audio';
-  const mergeExisting = source !== 'audio' && document.getElementById('mergeExistingSubtitles').checked;
+  const usesExisting = usesSidecar || usesEmbedded;
+  const subtitleSync = document.getElementById('subtitleSync').value;
+  const mayUseExisting = usesExisting || (source === 'auto' && mode === 'auto');
+  const mergeExisting = mayUseExisting && document.getElementById('mergeExistingSubtitles').checked;
+  const usesSelectedAudioTrack =
+    usesAudio || (usesExisting && subtitleSync !== 'off') || (source === 'auto' && mode === 'auto');
   return {
     path: document.getElementById('path').value,
     output_root: document.getElementById('outputRoot').value,
     series_name: document.getElementById('seriesName').value,
     movie_name: document.getElementById('movieName').value,
     source,
-    subtitle_sync: usesAudio ? 'off' : document.getElementById('subtitleSync').value,
+    subtitle_sync: usesAudio ? 'off' : subtitleSync,
     subtitle_file: usesSidecar && !mergeExisting ? document.getElementById('sidecarPath').value : '',
     merge_existing_subtitles: mergeExisting,
     chinese_subtitle_file: usesSidecar && mergeExisting ? document.getElementById('chineseSidecarPath').value : '',
@@ -1623,7 +1634,7 @@ function payload() {
     subtitle_stream: usesEmbedded && !mergeExisting ? document.getElementById('subtitleStream').value : '',
     chinese_subtitle_stream: usesEmbedded && mergeExisting ? document.getElementById('chineseSubtitleStream').value : '',
     english_subtitle_stream: usesEmbedded && mergeExisting ? document.getElementById('englishSubtitleStream').value : '',
-    audio_stream: usesAudio ? document.getElementById('audioStream').value : '',
+    audio_stream: usesSelectedAudioTrack ? document.getElementById('audioStream').value : '',
     source_language: sourceLanguage,
     asr_language: source === 'auto' || usesAudio ? resolveAsrLanguageForPayload() : 'auto',
     subtitle_ocr_lang: source === 'auto' || usesEmbedded ? document.getElementById('subtitleOcrLang').value : 'auto',
@@ -1631,7 +1642,7 @@ function payload() {
     batch_size: Number(document.getElementById('batchSize').value || 5),
     context_lines: Number(document.getElementById('contextLines').value || 30),
     max_words: Number(document.getElementById('maxWords').value || 12),
-    max_chars: Number(document.getElementById('maxChars').value || 56),
+    max_chars: Number(document.getElementById('maxChars').value || 42),
     max_duration: Number(document.getElementById('maxDuration').value || 5.5),
     subtitle_style_profile: document.getElementById('subtitleStyleProfile').value,
     subtitle_font_name: document.getElementById('subtitleFontName').value.trim(),
@@ -2255,14 +2266,14 @@ function migrateRecognitionLanguageState() {
 }
 
 function migrateDisplayLimitDefaults() {
-  if (Number(localStorage.getItem(DISPLAY_LIMITS_VERSION_KEY) || 0) >= 2) return;
+  if (Number(localStorage.getItem(DISPLAY_LIMITS_VERSION_KEY) || 0) >= 3) return;
   const maxWords = document.getElementById('maxWords');
   const maxChars = document.getElementById('maxChars');
   const maxDuration = document.getElementById('maxDuration');
   if (maxWords.value === '14') maxWords.value = '12';
-  if (maxChars.value === '82') maxChars.value = '56';
+  if (maxChars.value === '82' || maxChars.value === '56') maxChars.value = '42';
   if (maxDuration.value === '6') maxDuration.value = '5.5';
-  localStorage.setItem(DISPLAY_LIMITS_VERSION_KEY, '2');
+  localStorage.setItem(DISPLAY_LIMITS_VERSION_KEY, '3');
   saveFormState();
 }
 
@@ -2276,6 +2287,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const source = document.getElementById('source');
   source.addEventListener('change', updateWorkflowVisibility);
   document.getElementById('mergeExistingSubtitles').addEventListener('change', updateWorkflowVisibility);
+  document.getElementById('subtitleSync').addEventListener('change', updateWorkflowVisibility);
   document.getElementById('source_language')?.addEventListener('change', () => {
     migrateRecognitionLanguageState();
     saveFormState();

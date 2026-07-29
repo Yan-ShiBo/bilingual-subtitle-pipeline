@@ -892,3 +892,72 @@ GitHub Windows Runner 的临时目录可能使用 `RUNNER~1` 这类 8.3 短路�
 - SSH config 的主机、用户、端口等继续使用 Paramiko 完整 lookup 结果。
 - 对不含 OpenSSH `%` token 的绝对 `IdentityFile`，从匹配后的未展开配置保留原路径；`~/.ssh/...` 和带 `%` token 的相对模板仍使用 Paramiko 展开结果。
 - 回归测试固定使用包含 `runner~1` 的绝对密钥路径，确保本地与 GitHub Windows Runner 行为一致。
+
+## 42. 选择了远程同步音轨，但已有字幕模式没有提交；中英轨还会先合并再同步
+
+### 现象与根因
+
+前端只在“音频识别”来源下提交 `audio_stream`。已有 sidecar/embedded 字幕即使选择了某条音轨，后端仍收到空值，只能自动选轨。更严重的是，旧流程先按原时间合并中英文轨，再把合并后的事件统一交给 ffsubsync。两条字幕轨各自存在不同偏移时，合并过程已经可能错配，后续统一移动无法恢复正确关系。
+
+### 修复
+
+- “已有字幕 + 同步不是关闭”时按层级显示“用于字幕同步的音轨”，关闭同步后自动隐藏。
+- `payload()` 在已有字幕同步、音频识别和尚未完成自动分析三种需要音轨的状态下提交选择；不相关来源仍提交空值。
+- sidecar 和 embedded 加载器改为保留独立的中文、英文事件列表；原有返回合并列表的函数保留为兼容包装。
+- 两条轨分别对齐同一视频和同一 `audio_stream`，通过后才调用中英配对。
+- 自动模式采用原子策略：两条轨都通过质量门才使用同步结果；一条失败时两条都回退。中文字幕单轨则只要求该轨通过。
+- 报告增加 `scope=per_track`、中英文事件数、逐轨报告和 `reverted_all_tracks`。
+- `SYNC_POLICY_VERSION` 升至 6，`SOURCE_CACHE_VERSION` 升至 4；旧的“先合并后同步”缓存不会继续复用。
+- 同步策略升级不会牵连 Whisper：旧策略指纹的 `timing_origin=audio_asr` source cache 仍可复用，并在本次输出后升级指纹；只有已有字幕时间源会因同步策略变化重新提取字幕轨和对齐，不会重新 OCR/ASR。
+
+## 43. 双语每种语言实际只有一行，却按两行额度生成超长字幕
+
+### 现象与根因
+
+双语 ASS 的布局固定为第一行中文、第二行源文，但提示词预算把 `16 × 2` 中文字符和 `42 × 2` 英文字符都当作单种语言可用空间；最终断句又使用最多 28 个中文字和 56 个英文字符。结果是单条字幕字符数看似没有超过“总预算”，实际播放时每种语言各自的一行已经过长。
+
+### 修复
+
+- 双语中文硬上限改为每条 16 字，英文硬上限改为每条 42 字；`--max-chars` 只能进一步收紧英文上限，不能放宽专业布局上限。
+- 时长预算的长事件上限同步改为 `ZH_MAX=16`、`SOURCE_MAX=42`，不再给每种语言重复分配两行。
+- 中英文独立计算所需分段数，再使用同一个分段数保持双语时间对应。
+- 均分算法加入标点权重：优先在中英文句号、问号、感叹号、逗号、分号和冒号后切分；英文避免把冠词、介词、助动词留在行尾。
+- 前端旧的 56/82 字符设置自动迁移到 42，输入控件不再允许设置大于 42。
+- 回归测试验证长双语事件的每个中文片段不超过 16 字、英文不超过 42 字，重组后文本不丢失，并验证中英文标点边界。
+
+## 44. `qwen3:30b` 在 OpenAI 兼容接口中持续思考，结构化正文为空
+
+### 现象与根因
+
+远程 Ollama `0.30.11` 的 `/v1/chat/completions` 实测没有按兼容请求中的 `think=false` 关闭 `qwen3:30b` 思考。最小请求的 512 个输出 token 全部进入 `message.reasoning`，`message.content` 为空并以 `finish_reason=length` 结束。这样即使客户端传入 JSON Schema，也拿不到可解析的字幕对象。
+
+### 修复
+
+- 模型调用改用 Ollama 原生 `/api/chat`；本地和 SSH 隧道远端使用同一接口。
+- `think=false`、`format=<JSON Schema>`、`keep_alive` 和全部采样参数由原生字段提交，不再依赖 OpenAI 兼容映射。
+- 新增 `src/llm_policy.py`，固定三类角色：
+
+| 角色 | temperature | top_p | top_k | seed | num_ctx | num_predict |
+|---|---:|---:|---:|---:|---:|---:|
+| 元数据 | 0.0 | 0.8 | 20 | 41 | 8192 | 512 |
+| 翻译 | 0.15 | 0.8 | 20 | 42 | 32768 | 4096 |
+| 双语校对 | 0.1 | 0.8 | 20 | 43 | 65536 | 4096 |
+
+- 翻译 Schema 强制 `index/corrected_text/chinese_translation/display/terminology`；校对 Schema 强制 `index/corrected_english/corrected_chinese/display/terminology`，并限制数组条数和索引范围。
+- 程序在 Schema 之后再次校验对象数、索引完整性、字段类型、布尔显示标记、术语数组和语言有效性。
+- checkpoint 记录 `llm_role` 及完整 `llm_generation_profile`；`PROCESSING_POLICY_VERSION` 升至 4，旧模型输出会从 source cache 重新校对而不会重新 OCR/ASR。
+- 删除不再需要的 `openai` 直接依赖。
+
+远程 `qwen3:30b` 原生接口实测在约 2 秒内返回并通过完整 Schema：
+
+```json
+[{
+  "index": 0,
+  "corrected_text": "The storm is getting worse.",
+  "chinese_translation": "风暴正在加剧。",
+  "display": false,
+  "terminology": []
+}]
+```
+
+该最小请求没有提供真实批次中的上下文和“正常对白应显示”规则，所以 `display=false` 只用于验证字段约束，不作为翻译质量样本。

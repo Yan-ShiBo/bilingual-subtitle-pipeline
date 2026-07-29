@@ -10,7 +10,7 @@ from typing import Any
 
 Segment = dict[str, Any]
 SUBTITLE_SYNC_MODES = ("auto", "detect", "off")
-SYNC_POLICY_VERSION = 5
+SYNC_POLICY_VERSION = 6
 MAX_OFFSET_SECONDS = 120.0
 SPLIT_PENALTY = 20.0
 MAX_PIECEWISE_JUMPS = 6

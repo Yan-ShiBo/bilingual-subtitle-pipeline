@@ -7,13 +7,19 @@ import re
 import shutil
 import subprocess
 import sys
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
-from openai import OpenAI
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from ass_styles import STYLE_PROFILE_NAMES, ass_style_header, probe_video_play_resolution
 from font_delivery import font_family_name, package_ass_with_font, validate_font_path
+from llm_policy import (
+    generation_profile,
+    indexed_subtitle_schema,
+    movie_name_schema,
+)
 from output_paths import OUTPUT_DIRECTORY_NAME, resolve_output_root, suggested_output_root
 from pipeline_policy import PROCESSING_POLICY_VERSION, TERMINOLOGY_POLICY_VERSION
 from subtitle_sync import (
@@ -24,10 +30,20 @@ from subtitle_sync import (
 
 
 Segment = Dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ExistingSubtitleTracks:
+    english: Optional[List[Segment]]
+    chinese: List[Segment]
+    source_label: str
+
+
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m2ts", ".ts", ".mov", ".wmv"}
 SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt"}
 UNKNOWN_SOURCE_LANGUAGE_TAGS = {"", "auto", "source", "cached source", "subtitle", "embedded subtitle"}
-SOURCE_CACHE_VERSION = 3
+SOURCE_CACHE_VERSION = 4
+COMPATIBLE_SYNC_POLICY_VERSIONS = (5,)
 TARGET_CHINESE_CPS = 9.0
 TARGET_ENGLISH_CPS = 20.0
 MIN_SUBTITLE_DURATION = 20 / 24
@@ -36,7 +52,7 @@ MIN_SUBTITLE_GAP = 2 / 24
 MIN_OVERLAP_RETAIN_DURATION = 0.4
 CHINESE_CHARS_PER_LINE = 16
 ENGLISH_CHARS_PER_LINE = 42
-MAX_SUBTITLE_LINES = 2
+BILINGUAL_LINES_PER_LANGUAGE = 1
 
 
 def configure_output_encoding() -> None:
@@ -96,12 +112,12 @@ def infer_source_language_from_segments(segments: List[Segment], fallback: str) 
 
 
 def source_cache_uses_current_timing_policy(segments: List[Segment]) -> bool:
-    has_merged_existing_subtitles = any(
-        ("en" in segment or "zh" in segment)
-        and "existing chinese" in str(segment.get("source_language") or "").lower()
+    has_existing_subtitle_timing = any(
+        str(segment.get("timing_origin") or "").casefold() == "existing_subtitle"
+        or "existing chinese" in str(segment.get("source_language") or "").casefold()
         for segment in segments
     )
-    if not has_merged_existing_subtitles:
+    if not has_existing_subtitle_timing:
         return True
     return all(int(segment.get("source_cache_version") or 0) >= SOURCE_CACHE_VERSION for segment in segments)
 
@@ -132,6 +148,7 @@ def build_source_request_fingerprint(
     sidecar_path: Optional[Path] = None,
     chinese_sidecar_path: Optional[Path] = None,
     english_sidecar_path: Optional[Path] = None,
+    sync_policy_version: Optional[int] = None,
 ) -> str:
     source_mode = str(getattr(args, "source", "auto") or "auto")
     discovered_sidecars: List[Dict[str, Any]] = []
@@ -156,7 +173,11 @@ def build_source_request_fingerprint(
         "english_subtitle_stream": getattr(args, "english_subtitle_stream", None),
         "audio_stream": getattr(args, "audio_stream", None),
         "subtitle_sync": str(getattr(args, "subtitle_sync", "auto") or "auto"),
-        "subtitle_sync_policy_version": SYNC_POLICY_VERSION,
+        "subtitle_sync_policy_version": (
+            SYNC_POLICY_VERSION
+            if sync_policy_version is None
+            else sync_policy_version
+        ),
         "source_language": str(getattr(args, "source_language", "auto") or "auto"),
         "asr_language": str(getattr(args, "asr_language", "source") or "source"),
         "subtitle_ocr_lang": str(getattr(args, "subtitle_ocr_lang", "auto") or "auto"),
@@ -380,8 +401,15 @@ def transcribe_audio(audio_path: Path, language: Optional[str] = "auto") -> List
                 print(f"Warning: could not unload faster-whisper from the local GPU: {exc}", file=sys.stderr)
 
 
-def call_llm(prompt: str, system_prompt: str = "", model: str = "qwen3:14b") -> str:
-    base_url = "http://localhost:11434/v1"
+def call_llm(
+    prompt: str,
+    system_prompt: str = "",
+    model: str = "qwen3:14b",
+    *,
+    role: str = "translation",
+    response_schema: Optional[Dict[str, Any]] = None,
+) -> str:
+    base_url = "http://localhost:11434"
     if model.startswith("remote:"):
         parts = model.split(":", 2)
         if len(parts) != 3:
@@ -389,29 +417,66 @@ def call_llm(prompt: str, system_prompt: str = "", model: str = "qwen3:14b") -> 
         remote_base_url = os.environ.get("SUBTITLE_REMOTE_OLLAMA_URL", "").rstrip("/")
         if not remote_base_url:
             raise RuntimeError("Remote model selected without a tunnel owned by this frontend process.")
-        base_url = f"{remote_base_url}/v1"
+        base_url = remote_base_url
         model = parts[2]
-
-    client = OpenAI(
-        base_url=base_url,
-        api_key="ollama",
-    )
 
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": prompt})
 
-    response = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=0.2,
-        extra_body={
-            "think": False,
-            "keep_alive": os.environ.get("OLLAMA_KEEP_ALIVE", "10m"),
+    profile = generation_profile(role)
+    payload: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "think": profile.think,
+        "keep_alive": os.environ.get("OLLAMA_KEEP_ALIVE", "10m"),
+        "options": {
+            "temperature": profile.temperature,
+            "top_p": profile.top_p,
+            "top_k": profile.top_k,
+            "seed": profile.seed,
+            "num_ctx": profile.num_ctx,
+            "num_predict": profile.max_tokens,
         },
+    }
+    if response_schema is not None:
+        payload["format"] = response_schema
+
+    response = post_ollama_chat(base_url, payload)
+    message = response.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not content:
+        raise ValueError("LLM returned an empty response")
+    return str(content)
+
+
+def post_ollama_chat(base_url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    request = Request(
+        f"{base_url.rstrip('/')}/api/chat",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
     )
-    return response.choices[0].message.content
+    try:
+        timeout = float(os.environ.get("OLLAMA_REQUEST_TIMEOUT", "600"))
+        with urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace").strip()
+        raise RuntimeError(
+            f"Ollama request failed with HTTP {exc.code}: {detail or exc.reason}"
+        ) from exc
+    except URLError as exc:
+        raise RuntimeError(f"Could not connect to Ollama at {base_url}: {exc.reason}") from exc
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Invalid Ollama response from {base_url}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("Ollama response must be a JSON object")
+    if data.get("error"):
+        raise RuntimeError(f"Ollama request failed: {data['error']}")
+    return data
 
 
 def strip_llm_noise(text: str) -> str:
@@ -440,7 +505,13 @@ def parse_json_response(text: str) -> Any:
         return json.loads(cleaned[start : end + 1])
 
 
-def validate_indexed_batch_response(data: Any, expected_count: int) -> Dict[int, Dict[str, Any]]:
+def validate_indexed_batch_response(
+    data: Any,
+    expected_count: int,
+    role: Optional[str] = None,
+) -> Dict[int, Dict[str, Any]]:
+    if role not in {None, "translation", "proofread"}:
+        raise ValueError(f"Unsupported response validation role: {role}")
     if not isinstance(data, list):
         raise ValueError("LLM did not return a JSON list")
     if len(data) != expected_count:
@@ -458,6 +529,36 @@ def validate_indexed_batch_response(data: Any, expected_count: int) -> Dict[int,
             raise ValueError(f"LLM response index {index} is outside 0..{expected_count - 1}")
         if index in lookup:
             raise ValueError(f"LLM response contains duplicate index {index}")
+        if role is not None:
+            required_text_fields = (
+                ("corrected_text", "chinese_translation")
+                if role == "translation"
+                else ("corrected_english", "corrected_chinese")
+            )
+            for field in required_text_fields:
+                if not isinstance(item.get(field), str):
+                    raise ValueError(
+                        f"LLM response item {position} has no valid {field}"
+                    )
+            if not isinstance(item.get("display"), bool):
+                raise ValueError(
+                    f"LLM response item {position} has no boolean display flag"
+                )
+            terminology = item.get("terminology", [])
+            if not isinstance(terminology, list):
+                raise ValueError(
+                    f"LLM response item {position} has invalid terminology"
+                )
+            for entry_index, entry in enumerate(terminology):
+                if (
+                    not isinstance(entry, dict)
+                    or not isinstance(entry.get("source"), str)
+                    or not isinstance(entry.get("target"), str)
+                ):
+                    raise ValueError(
+                        "LLM response item "
+                        f"{position} has invalid terminology entry {entry_index}"
+                    )
         lookup[index] = item
 
     expected_indexes = set(range(expected_count))
@@ -477,7 +578,15 @@ Given the filename "{filename}", extract:
 Return ONLY a valid JSON object with keys "series_name" and "movie_name".
 """
     try:
-        data = parse_json_response(call_llm(prompt, system_prompt, llm_model))
+        data = parse_json_response(
+            call_llm(
+                prompt,
+                system_prompt,
+                llm_model,
+                role="metadata",
+                response_schema=movie_name_schema(),
+            )
+        )
         return data.get("series_name", "Unknown"), data.get("movie_name", "Unknown")
     except Exception as exc:
         print(f"Failed to parse movie name with LLM: {exc}")
@@ -870,13 +979,13 @@ def merge_existing_subtitle_segments(
     return merged
 
 
-def find_existing_sidecar_subtitle_segments(
+def find_existing_sidecar_subtitle_tracks(
     video_path: Path,
     selected_path: Optional[Path],
     explicit_path: Optional[Path] = None,
     explicit_zh_path: Optional[Path] = None,
     explicit_en_path: Optional[Path] = None,
-) -> Optional[List[Segment]]:
+) -> Optional[ExistingSubtitleTracks]:
     candidates = sidecar_candidates(video_path, selected_path, explicit_path, explicit_zh_path, explicit_en_path)
     if not candidates:
         return None
@@ -900,7 +1009,34 @@ def find_existing_sidecar_subtitle_segments(
         print(f"Merging existing English sidecar subtitle: {en_path}")
         en_segments = parse_subtitle_file(en_path)
 
-    merged = merge_existing_subtitle_segments(en_segments, zh_segments, "existing Chinese sidecar subtitle")
+    return ExistingSubtitleTracks(
+        english=en_segments,
+        chinese=zh_segments,
+        source_label="existing Chinese sidecar subtitle",
+    )
+
+
+def find_existing_sidecar_subtitle_segments(
+    video_path: Path,
+    selected_path: Optional[Path],
+    explicit_path: Optional[Path] = None,
+    explicit_zh_path: Optional[Path] = None,
+    explicit_en_path: Optional[Path] = None,
+) -> Optional[List[Segment]]:
+    tracks = find_existing_sidecar_subtitle_tracks(
+        video_path,
+        selected_path,
+        explicit_path=explicit_path,
+        explicit_zh_path=explicit_zh_path,
+        explicit_en_path=explicit_en_path,
+    )
+    if tracks is None:
+        return None
+    merged = merge_existing_subtitle_segments(
+        tracks.english,
+        tracks.chinese,
+        tracks.source_label,
+    )
     return merged or None
 
 
@@ -943,13 +1079,13 @@ def choose_best_english_stream(streams: List[Any]) -> Optional[Any]:
     return english[0]
 
 
-def find_existing_embedded_subtitle_segments(
+def find_existing_embedded_subtitle_tracks(
     video_path: Path,
     out_dir: Path,
     args: argparse.Namespace,
     chinese_stream_index: Optional[int] = None,
     english_stream_index: Optional[int] = None,
-) -> Optional[List[Segment]]:
+) -> Optional[ExistingSubtitleTracks]:
     from subtitle_pipeline import classify_chinese, find_ffmpeg, get_stream_events, probe_streams
 
     ffmpeg = find_ffmpeg(None)
@@ -1041,8 +1177,133 @@ def find_existing_embedded_subtitle_segments(
             if event.text.strip()
         ]
 
-    merged = merge_existing_subtitle_segments(en_segments, zh_segments, "existing Chinese embedded subtitle")
+    return ExistingSubtitleTracks(
+        english=en_segments,
+        chinese=zh_segments,
+        source_label="existing Chinese embedded subtitle",
+    )
+
+
+def find_existing_embedded_subtitle_segments(
+    video_path: Path,
+    out_dir: Path,
+    args: argparse.Namespace,
+    chinese_stream_index: Optional[int] = None,
+    english_stream_index: Optional[int] = None,
+) -> Optional[List[Segment]]:
+    tracks = find_existing_embedded_subtitle_tracks(
+        video_path,
+        out_dir,
+        args,
+        chinese_stream_index=chinese_stream_index,
+        english_stream_index=english_stream_index,
+    )
+    if tracks is None:
+        return None
+    merged = merge_existing_subtitle_segments(
+        tracks.english,
+        tracks.chinese,
+        tracks.source_label,
+    )
     return merged or None
+
+
+def synchronize_existing_subtitle_tracks(
+    video_path: Path,
+    tracks: ExistingSubtitleTracks,
+    *,
+    mode: str,
+    report_path: Optional[Path] = None,
+    audio_stream: Optional[int] = None,
+    ffmpeg_path: Optional[str] = None,
+) -> Tuple[ExistingSubtitleTracks, Dict[str, Any]]:
+    original_chinese = [dict(segment) for segment in tracks.chinese]
+    original_english = (
+        [dict(segment) for segment in tracks.english]
+        if tracks.english is not None
+        else None
+    )
+
+    synchronized_chinese, chinese_report = synchronize_subtitle_segments(
+        video_path,
+        original_chinese,
+        mode=mode,
+        report_path=None,
+        audio_stream=audio_stream,
+        ffmpeg_path=ffmpeg_path,
+    )
+    synchronized_english: Optional[List[Segment]] = None
+    english_report: Optional[Dict[str, Any]] = None
+    if original_english:
+        synchronized_english, english_report = synchronize_subtitle_segments(
+            video_path,
+            original_english,
+            mode=mode,
+            report_path=None,
+            audio_stream=audio_stream,
+            ffmpeg_path=ffmpeg_path,
+        )
+
+    reports = [chinese_report]
+    if english_report is not None:
+        reports.append(english_report)
+    quality_passed = mode == "off" or all(
+        bool(report.get("pipeline_quality_passed"))
+        for report in reports
+    )
+    applied = (
+        mode == "auto"
+        and quality_passed
+        and any(bool(report.get("applied")) for report in reports)
+    )
+
+    if mode == "auto" and quality_passed:
+        selected_chinese = synchronized_chinese
+        selected_english = synchronized_english
+    else:
+        selected_chinese = original_chinese
+        selected_english = original_english
+
+    if mode == "off":
+        status = "disabled"
+    elif mode == "detect":
+        status = "detected" if quality_passed else "detected_with_warnings"
+    elif quality_passed:
+        status = "aligned" if applied else "already_aligned"
+    else:
+        status = "rejected_partial" if english_report is not None else "rejected"
+
+    report: Dict[str, Any] = {
+        "version": SYNC_POLICY_VERSION,
+        "mode": mode,
+        "backend": "ffsubsync",
+        "scope": "per_track",
+        "video": str(video_path),
+        "audio_stream": audio_stream,
+        "event_count": {
+            "chinese": len(original_chinese),
+            "english": len(original_english or []),
+        },
+        "status": status,
+        "applied": applied,
+        "pipeline_quality_passed": quality_passed,
+        "reverted_all_tracks": mode == "auto" and not quality_passed,
+        "tracks": {
+            "chinese": chinese_report,
+            "english": english_report,
+        },
+    }
+    if report_path is not None:
+        write_json_atomic(report_path, report)
+
+    return (
+        ExistingSubtitleTracks(
+            english=selected_english,
+            chinese=selected_chinese,
+            source_label=tracks.source_label,
+        ),
+        report,
+    )
 
 
 def choose_ocr_lang(language: str) -> str:
@@ -1160,14 +1421,76 @@ def split_text_balanced(text: str, chunk_count: int, joiner: str) -> List[str]:
         return [""] * max(1, chunk_count)
 
     chunk_count = max(1, min(chunk_count, len(units)))
-    base_size, extra = divmod(len(units), chunk_count)
+    if chunk_count == 1:
+        return [joiner.join(units).strip()]
+
+    strong_punctuation = "。！？!?"
+    weak_punctuation = "，、；：,;:"
+    no_break_after = {
+        "a",
+        "an",
+        "the",
+        "to",
+        "of",
+        "in",
+        "on",
+        "for",
+        "with",
+        "and",
+        "or",
+        "but",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "have",
+        "has",
+        "had",
+        "do",
+        "does",
+        "did",
+        "will",
+        "would",
+        "can",
+        "could",
+        "should",
+    }
+    boundaries = [0]
+    for boundary_index in range(1, chunk_count):
+        previous = boundaries[-1]
+        remaining_chunks = chunk_count - boundary_index
+        minimum = previous + 1
+        maximum = len(units) - remaining_chunks
+        ideal = round(len(units) * boundary_index / chunk_count)
+
+        def boundary_score(end: int) -> Tuple[int, int, int]:
+            previous_unit = units[end - 1]
+            next_unit = units[end] if end < len(units) else ""
+            score = abs(end - ideal) * 4
+            if previous_unit.endswith(tuple(strong_punctuation)):
+                score -= 12
+            elif previous_unit.endswith(tuple(weak_punctuation)):
+                score -= 6
+            if joiner:
+                normalized_previous = previous_unit.rstrip(".,;:!?").casefold()
+                if normalized_previous in no_break_after:
+                    score += 10
+            else:
+                if previous_unit in "（《「『【“‘":
+                    score += 12
+                if next_unit in "），。！？；：》」』】”’":
+                    score += 12
+            return score, abs(end - ideal), end
+
+        selected = min(range(minimum, maximum + 1), key=boundary_score)
+        boundaries.append(selected)
+    boundaries.append(len(units))
+
     chunks: List[str] = []
-    offset = 0
     for index in range(chunk_count):
-        size = base_size + (1 if index < extra else 0)
-        chunk = joiner.join(units[offset : offset + size]).strip()
+        chunk = joiner.join(units[boundaries[index] : boundaries[index + 1]]).strip()
         chunks.append(chunk)
-        offset += size
     return chunks
 
 
@@ -1195,11 +1518,12 @@ def split_bilingual_segment(
     start = float(segment["start"])
     end = float(segment["end"])
     duration = end - start
-    zh_max_chars = min(max_chars, 28)
+    en_max_chars = min(max_chars, ENGLISH_CHARS_PER_LINE)
+    zh_max_chars = min(max_chars, CHINESE_CHARS_PER_LINE)
     source_is_en = bool(en_text) and source_text == en_text
     source_is_zh = bool(zh_text) and source_text == zh_text
     source_is_cjk = contains_cjk(source_text) and len(source_text.split()) <= 1
-    source_char_limit = zh_max_chars if source_is_cjk else max_chars
+    source_char_limit = zh_max_chars if source_is_cjk else en_max_chars
     source_joiner = "" if source_is_cjk else " "
     max_available_chunks = max(
         len(en_text.split()),
@@ -1210,7 +1534,7 @@ def split_bilingual_segment(
     chunk_count = max(
         1,
         math.ceil(duration / max_duration),
-        track_chunk_count(en_text, max_words, max_chars, is_cjk=False),
+        track_chunk_count(en_text, max_words, en_max_chars, is_cjk=False),
         track_chunk_count(zh_text, max_words, zh_max_chars, is_cjk=True),
         track_chunk_count(source_text, max_words, source_char_limit, is_cjk=source_is_cjk),
     )
@@ -1228,7 +1552,7 @@ def split_bilingual_segment(
             text_chunks = split_text_balanced(source_text, chunk_count, joiner=source_joiner)
             text_chunks += [""] * (chunk_count - len(text_chunks))
         limits_ok = all(
-            (not chunk or (len(chunk) <= max_chars and len(chunk.split()) <= max_words))
+            (not chunk or (len(chunk) <= en_max_chars and len(chunk.split()) <= max_words))
             for chunk in en_chunks
         ) and all(not chunk or len(chunk) <= zh_max_chars for chunk in zh_chunks) and all(
             not chunk
@@ -1362,7 +1686,7 @@ def split_segment_by_text(segment: Segment, max_words: int, max_chars: int, max_
 def split_segments_for_subtitles(
     segments: List[Segment],
     max_words: int = 12,
-    max_chars: int = 56,
+    max_chars: int = ENGLISH_CHARS_PER_LINE,
     max_duration: float = 5.5,
 ) -> List[Segment]:
     output: List[Segment] = []
@@ -1649,14 +1973,14 @@ def reading_budgets(
     chinese_budget = max(
         4,
         min(
-            CHINESE_CHARS_PER_LINE * MAX_SUBTITLE_LINES,
+            CHINESE_CHARS_PER_LINE * BILINGUAL_LINES_PER_LANGUAGE,
             math.floor(duration * TARGET_CHINESE_CPS),
         ),
     )
     english_budget = max(
         4,
         min(
-            ENGLISH_CHARS_PER_LINE * MAX_SUBTITLE_LINES,
+            ENGLISH_CHARS_PER_LINE * BILINGUAL_LINES_PER_LANGUAGE,
             math.floor(duration * TARGET_ENGLISH_CPS),
         ),
     )
@@ -2071,9 +2395,23 @@ Rules:
     
     for attempt in range(10):
         try:
-            data = parse_json_response(call_llm(prompt, system_prompt, llm_model))
-            if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
-                item = data[0]
+            response_role = "proofread" if is_proofread else "translation"
+            data = parse_json_response(
+                call_llm(
+                    prompt,
+                    system_prompt,
+                    llm_model,
+                    role=response_role,
+                    response_schema=indexed_subtitle_schema(1, response_role),
+                )
+            )
+            lookup = validate_indexed_batch_response(
+                data,
+                1,
+                response_role,
+            )
+            if lookup:
+                item = lookup[0]
                 if not parse_display_flag(item.get("display", True)):
                     return item
                 if is_proofread:
@@ -2231,8 +2569,23 @@ Rules:
             lookup: Optional[Dict[int, Dict[str, Any]]] = None
             for attempt in range(3):
                 try:
-                    data = parse_json_response(call_llm(prompt, system_prompt, llm_model))
-                    lookup = validate_indexed_batch_response(data, len(batch))
+                    data = parse_json_response(
+                        call_llm(
+                            prompt,
+                            system_prompt,
+                            llm_model,
+                            role="translation",
+                            response_schema=indexed_subtitle_schema(
+                                len(batch),
+                                "translation",
+                            ),
+                        )
+                    )
+                    lookup = validate_indexed_batch_response(
+                        data,
+                        len(batch),
+                        "translation",
+                    )
                     break
                 except Exception as exc:
                     print(f"LLM request failed (attempt {attempt+1}/3): {exc}")
@@ -2336,6 +2689,10 @@ Rules:
                             "processing_policy_version": PROCESSING_POLICY_VERSION,
                             "terminology_policy_version": TERMINOLOGY_POLICY_VERSION,
                             "llm_model": llm_model,
+                            "llm_role": "translation",
+                            "llm_generation_profile": asdict(
+                                generation_profile("translation")
+                            ),
                             "terminology": terminology,
                         },
                         item,
@@ -2502,8 +2859,23 @@ Rules:
             lookup: Optional[Dict[int, Dict[str, Any]]] = None
             for attempt in range(3):
                 try:
-                    data = parse_json_response(call_llm(prompt, system_prompt, llm_model))
-                    lookup = validate_indexed_batch_response(data, len(batch))
+                    data = parse_json_response(
+                        call_llm(
+                            prompt,
+                            system_prompt,
+                            llm_model,
+                            role="proofread",
+                            response_schema=indexed_subtitle_schema(
+                                len(batch),
+                                "proofread",
+                            ),
+                        )
+                    )
+                    lookup = validate_indexed_batch_response(
+                        data,
+                        len(batch),
+                        "proofread",
+                    )
                     break
                 except Exception as exc:
                     print(f"LLM request failed (attempt {attempt+1}/3): {exc}")
@@ -2623,6 +2995,10 @@ Rules:
                             "processing_policy_version": PROCESSING_POLICY_VERSION,
                             "terminology_policy_version": TERMINOLOGY_POLICY_VERSION,
                             "llm_model": llm_model,
+                            "llm_role": "proofread",
+                            "llm_generation_profile": asdict(
+                                generation_profile("proofread")
+                            ),
                             "terminology": terminology,
                         },
                         item,
@@ -2896,7 +3272,12 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=5, help="LLM batch size in subtitle sentence units.")
     parser.add_argument("--context-lines", type=int, default=30, help="Reference this many subtitle lines before and after each target batch.")
     parser.add_argument("--max-words", type=int, default=12, help="Maximum English words per subtitle event")
-    parser.add_argument("--max-chars", type=int, default=56, help="Maximum English characters per subtitle event")
+    parser.add_argument(
+        "--max-chars",
+        type=int,
+        default=ENGLISH_CHARS_PER_LINE,
+        help="Requested English characters per event, capped at the bilingual one-line limit.",
+    )
     parser.add_argument("--max-duration", type=float, default=5.5, help="Maximum seconds per subtitle event before splitting")
     parser.add_argument(
         "--subtitle-style-profile",
@@ -2960,6 +3341,18 @@ def main() -> None:
         chinese_sidecar_path=chinese_sidecar_path,
         english_sidecar_path=english_sidecar_path,
     )
+    compatible_source_request_fingerprints = {
+        build_source_request_fingerprint(
+            video_path,
+            input_path,
+            args,
+            sidecar_path=sidecar_path,
+            chinese_sidecar_path=chinese_sidecar_path,
+            english_sidecar_path=english_sidecar_path,
+            sync_policy_version=version,
+        )
+        for version in COMPATIBLE_SYNC_POLICY_VERSIONS
+    }
     has_explicit_source_selection = any(
         value is not None and value != ""
         for value in (
@@ -2985,16 +3378,26 @@ def main() -> None:
         source_language = args.source_language
         asr_language = resolve_asr_language(args.asr_language, args.source_language)
         subtitle_segments: Optional[List[Segment]] = None
+        existing_tracks: Optional[ExistingSubtitleTracks] = None
         loaded_legacy_source_cache = False
         reused_source_cache = False
         if source_segments_path.exists():
             try:
                 cached_segments = load_cached_source_segments(source_segments_path)
-                if not source_cache_matches_request(
+                current_request_matches = source_cache_matches_request(
                     cached_segments,
                     source_request_fingerprint,
                     allow_legacy=allow_legacy_source_cache,
-                ):
+                )
+                compatible_request_matches = any(
+                    source_cache_matches_request(
+                        cached_segments,
+                        fingerprint,
+                        allow_legacy=False,
+                    )
+                    for fingerprint in compatible_source_request_fingerprints
+                )
+                if not current_request_matches and not compatible_request_matches:
                     print(
                         "Ignoring cached source segments because the selected source, file, stream, "
                         f"or input video changed: {source_segments_path}"
@@ -3006,9 +3409,12 @@ def main() -> None:
                     )
                 elif source_cache_matches_requested_language(cached_segments, args.source_language, args.asr_language):
                     subtitle_segments = cached_segments
-                    loaded_legacy_source_cache = not any(
-                        segment.get("source_request_fingerprint")
-                        for segment in cached_segments
+                    loaded_legacy_source_cache = (
+                        compatible_request_matches
+                        or not any(
+                            segment.get("source_request_fingerprint")
+                            for segment in cached_segments
+                        )
                     )
                     actual_source = "cached source segments"
                     reused_source_cache = True
@@ -3023,29 +3429,28 @@ def main() -> None:
                 print(f"Ignoring unreadable source cache {source_segments_path}: {exc}")
 
         if subtitle_segments is None:
-            existing_segments: Optional[List[Segment]] = None
             if merge_existing_subtitles and args.source in ("auto", "sidecar", "srt"):
-                existing_segments = find_existing_sidecar_subtitle_segments(
+                existing_tracks = find_existing_sidecar_subtitle_tracks(
                     video_path,
                     input_path,
                     explicit_path=sidecar_path if (args.subtitle_file or args.srt) else None,
                     explicit_zh_path=chinese_sidecar_path,
                     explicit_en_path=english_sidecar_path,
                 )
-                if existing_segments:
+                if existing_tracks:
                     actual_source = "existing Chinese sidecar subtitles"
                     source_language = "existing Chinese subtitle"
 
-            if existing_segments is None and merge_existing_subtitles and args.source in ("auto", "embedded"):
+            if existing_tracks is None and merge_existing_subtitles and args.source in ("auto", "embedded"):
                 try:
-                    existing_segments = find_existing_embedded_subtitle_segments(
+                    existing_tracks = find_existing_embedded_subtitle_tracks(
                         video_path,
                         out_dir,
                         args,
                         chinese_stream_index=args.chinese_subtitle_stream,
                         english_stream_index=args.english_subtitle_stream,
                     )
-                    if existing_segments:
+                    if existing_tracks:
                         actual_source = "existing Chinese embedded subtitles"
                         source_language = "existing Chinese subtitle"
                 except Exception as exc:
@@ -3054,8 +3459,31 @@ def main() -> None:
                         raise
                     print(f"No existing Chinese embedded subtitles available ({exc}).")
 
-            if existing_segments:
-                subtitle_segments = existing_segments
+            if existing_tracks:
+                synchronized_tracks, sync_report = synchronize_existing_subtitle_tracks(
+                    video_path,
+                    existing_tracks,
+                    mode=args.subtitle_sync,
+                    report_path=sync_report_path,
+                    audio_stream=args.audio_stream,
+                )
+                subtitle_segments = merge_existing_subtitle_segments(
+                    synchronized_tracks.english,
+                    synchronized_tracks.chinese,
+                    synchronized_tracks.source_label,
+                )
+                track_reports = sync_report.get("tracks") or {}
+                track_statuses = ", ".join(
+                    f"{name}={report.get('status')}"
+                    for name, report in track_reports.items()
+                    if isinstance(report, dict)
+                )
+                print(
+                    "Subtitle sync: "
+                    f"scope=per_track, status={sync_report.get('status')}, "
+                    f"applied={sync_report.get('applied')}"
+                    + (f", {track_statuses}" if track_statuses else "")
+                )
                 print("Existing Chinese subtitles detected; translation will be skipped after bilingual proofreading.")
             else:
                 if args.source in ("auto", "sidecar", "srt") and sidecar_path and sidecar_path.exists():
@@ -3115,7 +3543,7 @@ def main() -> None:
             for segment in subtitle_segments:
                 segment.setdefault("timing_origin", "audio_asr")
 
-        if existing_timing_source and not reused_source_cache:
+        if existing_timing_source and not reused_source_cache and existing_tracks is None:
             subtitle_segments, sync_report = synchronize_subtitle_segments(
                 video_path,
                 subtitle_segments,

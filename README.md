@@ -18,6 +18,7 @@
 │  ├─ subtitle_sync.py
 │  ├─ font_delivery.py
 │  ├─ frontend_settings.py
+│  ├─ llm_policy.py
 │  └─ subtitle_pipeline.py       # OCR/轨道工具及兼容入口
 ├─ docs/                 # 项目文档及界面截图
 │  └─ images/
@@ -64,7 +65,7 @@ python .\src\subtitle_frontend.py --host 127.0.0.1 --port 8765
 2. 选择字幕来源：自动、已有字幕文件、视频内封字幕或 Whisper 音频识别。
 3. 页面只展开当前来源需要的选项；中英双轨选择、OCR 和音频识别设置不会同时平铺。
 4. 点击“分析视频”，页面会显示主视频、已有/内封字幕、自动来源判断、checkpoint 和已完成数量；自动模式随后展开命中的来源选项。
-5. 按需选择具体字幕文件、字幕轨道和语言。使用已有字幕时可选择“自动校正、仅检测、关闭”音频同步；批量、上下文与显示长度限制在“高级设置”中。
+5. 按需选择具体字幕文件、字幕轨道和语言。使用已有字幕且开启时间同步时，页面会继续显示“用于字幕同步的音轨”；批量、上下文与显示长度限制在“高级设置”中。
 6. 选择运行方式后点击“运行程序”：
    - `继续任务`：复用 source cache 和 checkpoint，只处理未完成部分。
    - `重新校对（保留识别）`：保留音频识别、OCR 和内封字幕缓存，删除旧 checkpoint 与 ASS，用当前提示词重新校对翻译。
@@ -91,6 +92,8 @@ python .\src\subtitle_frontend.py --host 127.0.0.1 --port 8765
 ```
 
 后端会解析 OpenSSH 的 `HostName`、`User`、`IdentityFile`、`IdentitiesOnly` 和 keepalive 设置，并使用 `known_hosts` 校验服务器身份。连接成功后优先用本地 `127.0.0.1:11435` 转发到远端 `127.0.0.1:11434`；端口已被另一个前端占用时会自动选择空闲端口，并把该实例自己的地址传给翻译子进程。选择 `remote:<连接名>:<模型>` 时不会调用本地 Ollama；模型默认在最后一次请求后保留 10 分钟，可通过 `OLLAMA_KEEP_ALIVE` 调整。
+
+翻译调用使用 Ollama 原生 `/api/chat`，不是兼容层 `/v1/chat/completions`。元数据识别、翻译和已有双语校对使用不同的固定生成参数；翻译/校对响应由 JSON Schema 限定对象数量、索引、字段类型和术语结构，再经过程序语义校验。使用 `qwen3:30b` 时显式关闭思考，避免推理文本耗尽字幕 JSON 的输出预算。
 
 表单和非敏感远程配置由本地前端统一保存在 `%LOCALAPPDATA%\BilingualSubtitlePipeline\frontend-settings.json`，因此切换前端端口后仍会恢复。密钥模式只保存可选的密钥路径，不读取或复制私钥内容。密码模式勾选保存后使用当前 Windows 用户的 DPAPI 加密，配置文件和浏览器 `localStorage` 都不保存明文密码；其他 Windows 用户不能解密。保存接口只允许 loopback Host，请求体必须是 `application/json` 且不超过 1 MiB；前端也拒绝绑定到非本机地址。
 
@@ -138,7 +141,7 @@ python .\src\subtitle_frontend.py --host 127.0.0.1 --port 8765
 - 每个输入字幕单元必须对应且只能对应一个输出对象；模型缺行、重复索引或返回可见空译文时会中断当前批次，不会把错误结果写入 checkpoint。
 - 重复或滚动片段可以保留最早完整项并把后续冗余项设为 `display=false`。
 - Qwen 会收到按当前可用显示时间计算的中文/源文字符预算；中文过长时优先压缩表达，不丢失原意。
-- 模型完成后会再次按默认 12 词、56 个英文字符、28 个中文字符和 5.5 秒的硬上限准备 ASS 显示事件，并执行阅读速度和时间轴检查。
+- 模型完成后会再次按默认 12 词、英文每条 42 字符、中文每条 16 字和 5.5 秒的硬上限准备 ASS 显示事件，并执行阅读速度和时间轴检查。中英文分别断句，并优先在句号、问号、逗号等自然边界切分。
 
 ## 时间标签规则
 
@@ -157,11 +160,11 @@ python .\src\subtitle_frontend.py --host 127.0.0.1 --port 8765
 - 已有字幕中内容不同的同时对白、对白与画面文字重叠会保留为并行 ASS 事件；只有重复/滚动识别片段才裁剪或隐藏。
 - 重叠裁剪后不足 0.4 秒的闪烁残片会丢弃；相邻字幕尽量保留约 2 帧间隔。
 - Whisper 偶发的“短文本异常长时间”会再经过兜底切分，避免一两个词挂十几秒。
-- 中文目标为每秒不超过 9 个非空白字符、每行尽量不超过 16 字；英文目标为每秒不超过 20 个字符、每行尽量不超过 42 字，最多两行。
+- 中文目标为每秒不超过 9 个非空白字符、双语事件中中文单行不超过 16 字；英文目标为每秒不超过 20 个字符、英文单行不超过 42 字。双语 ASS 固定为“中文一行 + 源文一行”，不会把两行额度重复分配给同一种语言。
 - 阅读时间不足且下一条字幕前有安全空档时，出点最多延长 0.5 秒；绝不越过下一条字幕。
 - 程序会打印中英文最大 CPS、超目标事件数和超单行目标事件数，便于对整片做量化复核。
 
-已有中英文字幕合并时，以英文对白轨为初始时间锚；没有重叠且间隔超过 0.75 秒的中英文事件不会强行配对。随后默认用 `ffsubsync 0.5.1` 的 WebRTC VAD、帧率搜索和分段偏移把整条已有字幕对齐到所选音频。程序用稳定事件标记恢复原顺序，并检查搜索边界、乱序、分段跳变和时长变化；不安全的分段候选会自动降级到全局对齐，两者都不合格时保持原时间。原始时间保存在 source 输入和 `pre_sync_*` 元数据中，对齐摘要写入 `<片名>.subtitle-sync.report.json`。`detect` 只报告候选偏移，`off` 完全跳过；音频 ASR 来源不执行这一步，也不会因此占用本地 GPU。
+已有中英文字幕合并时，先让中文轨和英文轨分别用 `ffsubsync 0.5.1` 对齐到同一条所选音频，再进行中英事件配对；只有两条轨都通过质量门槛才整体采用，任一轨失败就同时回退原时间，避免只移动一条轨破坏双语对应。没有重叠且间隔超过 0.75 秒的中英文事件不会强行配对。程序用稳定事件标记恢复原顺序，并检查搜索边界、乱序、分段跳变和时长变化；不安全的分段候选会自动降级到全局对齐，两者都不合格时保持原时间。逐轨结果写入 `<片名>.subtitle-sync.report.json` 的 `tracks` 字段。`detect` 只报告候选偏移，`off` 完全跳过；音频 ASR 来源不执行这一步，也不会因此占用本地 GPU。
 
 阅读速度与行宽参考 [Netflix 简体中文规范](https://partnerhelp.netflixstudios.com/hc/en-us/articles/215986007-Chinese-Simplified-Timed-Text-Style-Guide)、[Netflix 英文规范](https://partnerhelp.netflixstudios.com/hc/en-us/articles/217350977-English-USA-Timed-Text-Style-Guide)、[Netflix 时间规范](https://partnerhelp.netflixstudios.com/hc/en-us/articles/360051554394-Timed-Text-Style-Guide-Subtitle-Timing-Guidelines) 和 [Prime Video 字幕规范](https://videocentral.amazon.com/support/delivery-specifications/prime-video-subtitling-guidelines?language=en_US)。项目采用较保守的中文 9 CPS、英文 20 CPS 作为诊断目标；这不是承诺每条旧来源字幕都能在不删减原意的前提下自动达标。
 
