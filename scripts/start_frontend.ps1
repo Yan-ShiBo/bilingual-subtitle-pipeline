@@ -2,9 +2,32 @@ $ErrorActionPreference = "Stop"
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $appName = "bilingual-subtitle-pipeline"
-$frontendSource = Join-Path $projectRoot "src\subtitle_frontend.py"
-$expectedSourceSha256 = (Get-FileHash -LiteralPath $frontendSource -Algorithm SHA256).Hash.ToLowerInvariant()
 $selectedPort = $null
+
+function Get-FrontendSourceSha256 {
+    $stream = [System.IO.MemoryStream]::new()
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $sourceRoot = Join-Path $projectRoot "src"
+        $sourceFiles = Get-ChildItem -LiteralPath $sourceRoot -Filter "*.py" -File | Sort-Object Name
+        foreach ($sourceFile in $sourceFiles) {
+            $nameBytes = [System.Text.Encoding]::UTF8.GetBytes($sourceFile.Name)
+            $stream.Write($nameBytes, 0, $nameBytes.Length)
+            $stream.WriteByte(0)
+            $contentBytes = [System.IO.File]::ReadAllBytes($sourceFile.FullName)
+            $stream.Write($contentBytes, 0, $contentBytes.Length)
+            $stream.WriteByte(0)
+        }
+        $hash = $sha256.ComputeHash($stream.ToArray())
+        return ([System.BitConverter]::ToString($hash)).Replace("-", "").ToLowerInvariant()
+    }
+    finally {
+        $sha256.Dispose()
+        $stream.Dispose()
+    }
+}
+
+$expectedSourceSha256 = Get-FrontendSourceSha256
 
 function Test-TcpPort {
     param(

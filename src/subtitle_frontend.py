@@ -40,7 +40,19 @@ RUNS: Dict[int, Dict[str, Any]] = {}
 RUNS_LOCK = threading.Lock()
 NAME_CACHE: Dict[str, Dict[str, str]] = {}
 USER_STOP_MARKER = "Frontend task stopped by user"
-FRONTEND_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
+
+def frontend_source_fingerprint() -> str:
+    digest = hashlib.sha256()
+    for path in sorted(APP_DIR.glob("*.py"), key=lambda item: item.name.lower()):
+        digest.update(path.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+FRONTEND_SOURCE_SHA256 = frontend_source_fingerprint()
 
 
 def normalize_space(text: str) -> str:
@@ -1131,12 +1143,24 @@ def html_page() -> str:
 <div class="modal-overlay" id="remoteModal">
   <div class="modal">
     <h2>远程服务器设置</h2>
-    <label>连接名称</label><input id="remoteName" value="Lab Server" style="margin-bottom:12px">
-    <label>主机 IP</label><input id="remoteHost" placeholder="例如 192.168.1.10" style="margin-bottom:12px">
-    <label>SSH 端口</label><input id="remotePort" type="number" value="22" style="margin-bottom:12px">
-    <label>用户名</label><input id="remoteUser" value="root" style="margin-bottom:12px">
-    <label>密码</label><input id="remotePass" type="password" style="margin-bottom:12px">
-    <label style="display:flex;align-items:center;gap:8px;margin-bottom:12px"><input id="remoteRememberPassword" type="checkbox">保存密码到本机浏览器</label>
+    <label for="remoteName">连接名称</label><input id="remoteName" value="AI Server" style="margin-bottom:12px">
+    <label for="remoteHost">服务器</label><input id="remoteHost" value="10.12.96.203" placeholder="10.12.96.203 或 ai-server" style="margin-bottom:12px">
+    <label for="remotePort">SSH 端口</label><input id="remotePort" type="number" value="22" style="margin-bottom:12px">
+    <label for="remoteUser">用户名</label><input id="remoteUser" value="csynth" placeholder="留空读取 SSH config" style="margin-bottom:12px">
+    <label for="remoteAuthMethod">认证方式</label>
+    <select id="remoteAuthMethod" onchange="updateRemoteAuthVisibility()" style="margin-bottom:12px">
+      <option value="key" selected>SSH 密钥</option>
+      <option value="password">密码</option>
+    </select>
+    <div id="remoteKeyOptions">
+      <label for="remoteKeyPath">密钥文件</label>
+      <input id="remoteKeyPath" placeholder="自动读取 ~/.ssh/config" autocomplete="off" style="margin-bottom:12px">
+    </div>
+    <div id="remotePasswordOptions" hidden>
+      <label for="remotePass">密码</label>
+      <input id="remotePass" type="password" autocomplete="current-password" style="margin-bottom:12px">
+      <label style="display:flex;align-items:center;gap:8px;margin-bottom:12px"><input id="remoteRememberPassword" type="checkbox">保存密码到本机浏览器</label>
+    </div>
     <div id="remoteError" style="color:#b42318; font-size:13px; margin-bottom:8px;"></div>
     <div class="actions">
       <button class="secondary" onclick="closeRemoteModal()">取消</button>
@@ -1873,6 +1897,12 @@ const INPUT_IDS = [
 
 const REMOTE_STORAGE_KEY = 'sub_remote_config';
 
+function updateRemoteAuthVisibility() {
+  const authMethod = document.getElementById('remoteAuthMethod').value;
+  document.getElementById('remoteKeyOptions').hidden = authMethod !== 'key';
+  document.getElementById('remotePasswordOptions').hidden = authMethod !== 'password';
+}
+
 function openRemoteModal() {
   document.getElementById('remoteError').textContent = '';
   document.getElementById('remoteModal').style.display = 'flex';
@@ -1881,10 +1911,13 @@ function openRemoteModal() {
   if (conf.port) document.getElementById('remotePort').value = conf.port;
   if (conf.user) document.getElementById('remoteUser').value = conf.user;
   if (conf.name) document.getElementById('remoteName').value = conf.name;
+  document.getElementById('remoteAuthMethod').value = conf.auth_method || (conf.password ? 'password' : 'key');
+  document.getElementById('remoteKeyPath').value = conf.key_filename || '';
   if (conf.password) {
     document.getElementById('remotePass').value = conf.password;
     document.getElementById('remoteRememberPassword').checked = true;
   }
+  updateRemoteAuthVisibility();
 }
 
 function closeRemoteModal() {
@@ -1902,7 +1935,9 @@ async function connectRemoteServer() {
     port: document.getElementById('remotePort').value,
     user: document.getElementById('remoteUser').value,
     password: document.getElementById('remotePass').value,
-    name: document.getElementById('remoteName').value || 'Remote'
+    name: document.getElementById('remoteName').value || 'Remote',
+    auth_method: document.getElementById('remoteAuthMethod').value,
+    key_filename: document.getElementById('remoteKeyPath').value
   };
   
   try {
@@ -1919,12 +1954,15 @@ async function connectRemoteServer() {
         port: payload.port,
         user: payload.user,
         name: payload.name,
-        password: rememberPassword ? payload.password : ''
+        auth_method: payload.auth_method,
+        key_filename: payload.key_filename,
+        password: payload.auth_method === 'password' && rememberPassword ? payload.password : ''
       }));
-      updateLlmModels(data.models, payload.name);
+      updateLlmModels(data.models, data.name || payload.name);
       closeRemoteModal();
       if (data.models && data.models.length > 0) {
-        alert('远程服务器连接成功！获取到 ' + data.models.length + ' 个模型。');
+        const authLabel = data.auth_method === 'key' ? 'SSH 密钥' : '密码';
+        alert(authLabel + '连接成功！获取到 ' + data.models.length + ' 个模型。');
       } else {
         alert('SSH 连接成功，但未能获取到远程 Ollama 模型列表 (Ollama服务可能未启动或端口不通)。');
       }
@@ -2112,11 +2150,15 @@ class Handler(BaseHTTPRequestHandler):
                     int(body.get("port", 22)),
                     body.get("user", ""),
                     body.get("password", ""),
-                    body.get("name", "remote")
+                    body.get("name", "remote"),
+                    body.get("auth_method", ""),
+                    body.get("key_filename", ""),
                 )
                 if success:
                     models = tunnel_manager.fetch_models()
-                    self.send_json({"status": "connected", "models": models})
+                    connection_status = tunnel_manager.status()
+                    connection_status.update({"status": "connected", "models": models})
+                    self.send_json(connection_status)
                 else:
                     self.send_json({"error": tunnel_manager.last_error}, status=400)
             elif self.path == "/api/remote/status":

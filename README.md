@@ -67,6 +67,27 @@ python .\src\subtitle_frontend.py --host 127.0.0.1 --port 8765
 
 单个视频文件在“分析”时会优先调用本地 Ollama `qwen3:14b` 识别干净的系列名和片名，例如把发布组、分辨率、编码、音轨、HDR/DV 等标签从文件名中剔除。Ollama 不可用时会退回本地规则识别。
 
+## 远程 Ollama 与 SSH 密钥
+
+前端“校对与翻译模型”右侧的“远程”按钮支持两种 SSH 认证：
+
+- `SSH 密钥`：默认方式。主机可填写 IP 或 `~/.ssh/config` 中的别名；密钥文件留空时自动读取 SSH config、SSH agent 和默认密钥。
+- `密码`：兼容旧服务器。只有选择密码认证后才显示密码和“保存密码到本机浏览器”。
+
+当前机器的推荐配置为：
+
+```text
+服务器：10.12.96.203（也可填写 ai-server）
+端口：22
+用户名：csynth
+认证方式：SSH 密钥
+密钥文件：留空，读取 ~/.ssh/config
+```
+
+后端会解析 OpenSSH 的 `HostName`、`User`、`IdentityFile`、`IdentitiesOnly` 和 keepalive 设置，并使用 `known_hosts` 校验服务器身份。连接成功后，本地 `127.0.0.1:11435` 转发到远端 `127.0.0.1:11434`；选择 `remote:<连接名>:<模型>` 时不会调用本地 Ollama。
+
+密钥模式只在浏览器保存服务器配置和可选的密钥路径，不读取或保存私钥内容。密码模式仍可按需把密码保存在当前浏览器 `localStorage`；共享电脑不应启用。
+
 ## 字幕来源优先级
 
 默认 `--source auto` 使用以下优先级：
