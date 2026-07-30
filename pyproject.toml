@@ -42,6 +42,7 @@ py-modules = [
   "ssh_tunnel",
   "subtitle_frontend",
   "subtitle_pipeline",
+  "subtitle_quality",
   "subtitle_sync",
 ]
 

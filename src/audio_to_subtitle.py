@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
@@ -26,6 +27,12 @@ from subtitle_sync import (
     SUBTITLE_SYNC_MODES,
     SYNC_POLICY_VERSION,
     synchronize_subtitle_segments,
+)
+from subtitle_quality import (
+    SubtitleLayoutPolicy,
+    build_layout_policy,
+    build_quality_report,
+    write_quality_report,
 )
 
 
@@ -630,6 +637,11 @@ def should_clean_english_track(segment: Segment) -> bool:
     if language not in UNKNOWN_SOURCE_LANGUAGE_TAGS:
         return False
     return True
+
+
+def source_track_text(segment: Segment) -> str:
+    text = clean_subtitle_text(str(segment.get("en") or ""))
+    return clean_english_track_text(text) if should_clean_english_track(segment) else text
 
 
 def classify_subtitle_text(text: str) -> str:
@@ -1511,36 +1523,79 @@ def split_bilingual_segment(
     max_words: int,
     max_chars: int,
     max_duration: float,
+    layout_policy: Optional[SubtitleLayoutPolicy] = None,
 ) -> List[Segment]:
-    en_text = clean_english_track_text(str(segment.get("en") or ""))
+    en_text = source_track_text(segment)
     zh_text = to_simplified_text(clean_subtitle_text(str(segment.get("zh") or "")))
     source_text = clean_subtitle_text(str(segment.get("text") or en_text or zh_text))
     start = float(segment["start"])
     end = float(segment["end"])
     duration = end - start
-    en_max_chars = min(max_chars, ENGLISH_CHARS_PER_LINE)
+    en_is_compact = contains_east_asian(en_text) and len(en_text.split()) <= 1
+    en_max_chars = (
+        min(max_chars, CHINESE_CHARS_PER_LINE)
+        if en_is_compact
+        else min(max_chars, ENGLISH_CHARS_PER_LINE)
+    )
     zh_max_chars = min(max_chars, CHINESE_CHARS_PER_LINE)
     source_is_en = bool(en_text) and source_text == en_text
     source_is_zh = bool(zh_text) and source_text == zh_text
-    source_is_cjk = contains_cjk(source_text) and len(source_text.split()) <= 1
+    source_is_cjk = contains_east_asian(source_text) and len(source_text.split()) <= 1
     source_char_limit = zh_max_chars if source_is_cjk else en_max_chars
     source_joiner = "" if source_is_cjk else " "
-    max_available_chunks = max(
-        len(en_text.split()),
-        len(zh_text),
-        len(source_text) if source_is_cjk else len(source_text.split()),
-        1,
-    )
+    bilingual = bool(en_text and zh_text)
+    available_chunk_counts: List[int] = []
+    if en_text:
+        available_chunk_counts.append(
+            max(1, len(en_text) if en_is_compact else len(en_text.split()))
+        )
+    if zh_text:
+        available_chunk_counts.append(max(1, len(zh_text)))
+    if source_text and not source_is_en and not source_is_zh:
+        available_chunk_counts.append(
+            max(1, len(source_text) if source_is_cjk else len(source_text.split()))
+        )
+    max_available_chunks = min(available_chunk_counts) if available_chunk_counts else 1
     chunk_count = max(
         1,
         math.ceil(duration / max_duration),
-        track_chunk_count(en_text, max_words, en_max_chars, is_cjk=False),
+        track_chunk_count(en_text, max_words, en_max_chars, is_cjk=en_is_compact),
         track_chunk_count(zh_text, max_words, zh_max_chars, is_cjk=True),
         track_chunk_count(source_text, max_words, source_char_limit, is_cjk=source_is_cjk),
     )
+    if layout_policy is not None:
+        if en_text:
+            chunk_count = max(
+                chunk_count,
+                layout_policy.required_chunks(en_text, "en", bilingual=bilingual),
+            )
+        if zh_text:
+            chunk_count = max(
+                chunk_count,
+                layout_policy.required_chunks(zh_text, "zh", bilingual=bilingual),
+            )
+        if not en_text and not zh_text and source_text:
+            source_track = "zh" if source_is_cjk else "en"
+            chunk_count = max(
+                chunk_count,
+                layout_policy.required_chunks(
+                    source_text,
+                    source_track,
+                    bilingual=False,
+                ),
+            )
+    chunk_count = min(chunk_count, max_available_chunks)
 
     while True:
-        en_chunks = split_text_balanced(en_text, chunk_count, joiner=" ") if en_text else [""] * chunk_count
+        en_chunks = (
+            split_text_balanced(
+                en_text,
+                chunk_count,
+                joiner="" if en_is_compact else " ",
+            )
+            if en_text
+            else [""] * chunk_count
+        )
         zh_chunks = split_text_balanced(zh_text, chunk_count, joiner="") if zh_text else [""] * chunk_count
         en_chunks += [""] * (chunk_count - len(en_chunks))
         zh_chunks += [""] * (chunk_count - len(zh_chunks))
@@ -1552,7 +1607,13 @@ def split_bilingual_segment(
             text_chunks = split_text_balanced(source_text, chunk_count, joiner=source_joiner)
             text_chunks += [""] * (chunk_count - len(text_chunks))
         limits_ok = all(
-            (not chunk or (len(chunk) <= en_max_chars and len(chunk.split()) <= max_words))
+            (
+                not chunk
+                or (
+                    len(chunk) <= en_max_chars
+                    and (en_is_compact or len(chunk.split()) <= max_words)
+                )
+            )
             for chunk in en_chunks
         ) and all(not chunk or len(chunk) <= zh_max_chars for chunk in zh_chunks) and all(
             not chunk
@@ -1562,6 +1623,14 @@ def split_bilingual_segment(
             )
             for chunk in text_chunks
         )
+        if layout_policy is not None:
+            limits_ok = limits_ok and all(
+                not chunk or layout_policy.fits(chunk, "en", bilingual=bilingual)
+                for chunk in en_chunks
+            ) and all(
+                not chunk or layout_policy.fits(chunk, "zh", bilingual=bilingual)
+                for chunk in zh_chunks
+            )
         if limits_ok or chunk_count >= max_available_chunks:
             break
         chunk_count += 1
@@ -1688,18 +1757,25 @@ def split_segments_for_subtitles(
     max_words: int = 12,
     max_chars: int = ENGLISH_CHARS_PER_LINE,
     max_duration: float = 5.5,
+    layout_policy: Optional[SubtitleLayoutPolicy] = None,
 ) -> List[Segment]:
     output: List[Segment] = []
 
     for segment in segments:
         text = clean_subtitle_text(segment.get("text", ""))
-        en_text = clean_english_track_text(str(segment.get("en") or ""))
+        en_text = source_track_text(segment)
         zh_text = to_simplified_text(clean_subtitle_text(str(segment.get("zh") or "")))
         if not text and not en_text and not zh_text:
             continue
         segment = {**segment, "text": text or en_text or zh_text}
         if "en" in segment or "zh" in segment:
-            pieces = split_bilingual_segment(segment, max_words, max_chars, max_duration)
+            pieces = split_bilingual_segment(
+                segment,
+                max_words,
+                max_chars,
+                max_duration,
+                layout_policy=layout_policy,
+            )
         else:
             duration = float(segment["end"]) - float(segment["start"])
             needs_split = duration > max_duration or len(text) > max_chars or len(text.split()) > max_words
@@ -1724,7 +1800,7 @@ def split_segments_for_subtitles(
 
 
 def duplicate_display_key(segment: Segment) -> str:
-    text = clean_english_track_text(str(segment.get("en") or ""))
+    text = source_track_text(segment)
     if not text:
         text = to_simplified_text(clean_subtitle_text(str(segment.get("zh") or segment.get("text") or "")))
     normalized = "".join(character.casefold() for character in text if character.isalnum())
@@ -1747,6 +1823,174 @@ def overlap_content_key(segment: Segment) -> str:
     return "".join(character.casefold() for character in text if character.isalnum())
 
 
+def model_guard_text_keys(segment: Segment) -> List[str]:
+    keys: List[str] = []
+    for field in ("text", "en", "zh"):
+        value = clean_subtitle_text(str(segment.get(field) or ""))
+        key = "".join(character.casefold() for character in value if character.isalnum())
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def model_guard_key_is_meaningful(key: str) -> bool:
+    cjk_count = len(CJK_RE.findall(key))
+    return cjk_count >= 2 or len(key) >= 6
+
+
+def model_guard_temporal_gap(first: Segment, second: Segment) -> float:
+    first_start = float(first["start"])
+    first_end = float(first["end"])
+    second_start = float(second["start"])
+    second_end = float(second["end"])
+    if first_start <= second_end and second_start <= first_end:
+        return 0.0
+    return min(abs(second_start - first_end), abs(first_start - second_end))
+
+
+def model_hide_support_reason(
+    source_segments: List[Segment],
+    processed_segments: List[Segment],
+    index: int,
+    *,
+    max_gap: float = 4.0,
+) -> Optional[str]:
+    source = source_segments[index]
+    source_keys = model_guard_text_keys(source)
+    meaningful_keys = [key for key in source_keys if model_guard_key_is_meaningful(key)]
+    if not meaningful_keys:
+        return "empty_or_nonsemantic_source"
+
+    for neighbor_index in range(index - 1, max(-1, index - 51), -1):
+        neighbor = processed_segments[neighbor_index]
+        if neighbor.get("display", True) is False:
+            continue
+        if model_guard_temporal_gap(source, neighbor) > max_gap:
+            continue
+
+        represented_keys = model_guard_text_keys(neighbor)
+        if neighbor_index < len(source_segments):
+            represented_keys.extend(model_guard_text_keys(source_segments[neighbor_index]))
+        for source_key in meaningful_keys:
+            for represented_key in represented_keys:
+                if not model_guard_key_is_meaningful(represented_key):
+                    continue
+                if source_key == represented_key:
+                    return "adjacent_exact_duplicate"
+                if source_key in represented_key:
+                    return "covered_by_adjacent_visible_line"
+                length_ratio = min(len(source_key), len(represented_key)) / max(
+                    len(source_key),
+                    len(represented_key),
+                )
+                similarity = SequenceMatcher(None, source_key, represented_key).ratio()
+                if length_ratio >= 0.75 and similarity >= 0.88:
+                    return "adjacent_near_duplicate"
+    return None
+
+
+def guard_model_hidden_segment_at(
+    source_segments: List[Segment],
+    processed_segments: List[Segment],
+    index: int,
+) -> None:
+    segment = processed_segments[index]
+    model_requested_hidden = segment.get("model_display_requested") is False
+    if not model_requested_hidden and segment.get("display", True) is False:
+        model_requested_hidden = not bool(segment.get("display_suppression"))
+    if not model_requested_hidden:
+        return
+
+    segment["model_display_requested"] = False
+    reason = model_hide_support_reason(source_segments, processed_segments, index)
+    if reason:
+        segment["display"] = False
+        segment["display_guard"] = "accepted_hidden"
+        segment["display_guard_reason"] = reason
+    else:
+        segment["display"] = True
+        segment["display_guard"] = "forced_visible"
+        segment["display_guard_reason"] = "unique_source_not_covered"
+
+
+def guard_model_hidden_segments(
+    source_segments: List[Segment],
+    processed_segments: List[Segment],
+) -> List[Segment]:
+    if len(source_segments) != len(processed_segments):
+        raise ValueError("Display guard requires one processed item per source subtitle event")
+
+    guarded = []
+    for processed in processed_segments:
+        item = dict(processed)
+        item.pop("display_start", None)
+        item.pop("display_end", None)
+        guarded.append(item)
+    for index in range(len(guarded)):
+        guard_model_hidden_segment_at(source_segments, guarded, index)
+    return guarded
+
+
+def guarded_display_candidate(
+    source_segments: List[Segment],
+    previous_processed: List[Segment],
+    segment: Segment,
+    item: Dict[str, Any],
+    context_start: float,
+    context_end: float,
+) -> Segment:
+    candidate = apply_display_timing(
+        segment,
+        item,
+        context_start,
+        context_end,
+    )
+    source_prefix = source_segments[: len(previous_processed) + 1]
+    combined = [*previous_processed, candidate]
+    guard_model_hidden_segment_at(
+        source_prefix,
+        combined,
+        len(combined) - 1,
+    )
+    return combined[-1]
+
+
+def first_guarded_language_repair_index(
+    source_segments: List[Segment],
+    processed_segments: List[Segment],
+    *,
+    proofread: bool,
+) -> Optional[int]:
+    for index, processed in enumerate(processed_segments):
+        if processed.get("display_guard") != "forced_visible":
+            continue
+        if proofread:
+            original_en, original_zh = original_en_zh(source_segments[index])
+            corrected = clean_english_track_text(str(processed.get("en") or original_en))
+            translated = to_simplified_text(
+                clean_subtitle_text(str(processed.get("zh") or original_zh))
+            )
+            valid = is_language_valid(
+                original_en or original_zh,
+                corrected,
+                translated,
+                require_corrected=bool(original_en),
+            )
+        else:
+            corrected = clean_subtitle_text(
+                str(processed.get("en") or processed.get("text") or "")
+            )
+            translated = clean_subtitle_text(str(processed.get("zh") or ""))
+            valid = is_language_valid(
+                str(source_segments[index].get("text") or ""),
+                corrected,
+                translated,
+            )
+        if not valid:
+            return index
+    return None
+
+
 def suppress_recent_exact_duplicates(
     segments: List[Segment],
     max_gap: float = 4.0,
@@ -1765,6 +2009,7 @@ def suppress_recent_exact_duplicates(
             gap = float(segment["start"]) - float(previous["end"])
             if gap <= max_gap:
                 segment["display"] = False
+                segment["display_suppression"] = "recent_exact_duplicate"
                 continue
         last_visible_by_key[key] = segment
     extend_display_over_hidden_segments(output, max_gap=2.0, max_duration=max_duration)
@@ -1776,6 +2021,7 @@ def prepare_segments_for_output(
     max_words: int,
     max_chars: int,
     max_duration: float,
+    layout_policy: Optional[SubtitleLayoutPolicy] = None,
 ) -> List[Segment]:
     visible: List[Segment] = []
     deduplicated = suppress_recent_exact_duplicates(segments, max_duration=max_duration)
@@ -1790,7 +2036,13 @@ def prepare_segments_for_output(
         if item["end"] > item["start"]:
             visible.append(item)
     timeline_cleaned = resolve_timeline_overlaps(visible)
-    split = split_segments_for_subtitles(timeline_cleaned, max_words, max_chars, max_duration)
+    split = split_segments_for_subtitles(
+        timeline_cleaned,
+        max_words,
+        max_chars,
+        max_duration,
+        layout_policy=layout_policy,
+    )
     sanitized = apply_timing_sanity_rules(split, max_duration=max_duration)
     ordered = sorted(sanitized, key=lambda item: (float(item["start"]), float(item["end"])))
     non_overlapping = resolve_timeline_overlaps(ordered)
@@ -1818,14 +2070,16 @@ def subtitle_character_count(text: Any, *, collapse_spaces: bool = False) -> int
 
 
 def required_reading_duration(segment: Segment) -> float:
-    english = clean_english_track_text(str(segment.get("en") or ""))
+    source = source_track_text(segment)
     chinese = to_simplified_text(clean_subtitle_text(str(segment.get("zh") or "")))
-    if not english and not chinese:
+    if not source and not chinese:
         text = clean_subtitle_text(str(segment.get("text") or ""))
-        if contains_cjk(text):
+        if contains_cjk(text) and normalize_language_tag(
+            str(segment.get("source_language") or "")
+        ) == "zh":
             chinese = text
         else:
-            english = text
+            source = text
 
     required = MIN_SUBTITLE_DURATION
     if chinese:
@@ -1833,8 +2087,13 @@ def required_reading_duration(segment: Segment) -> float:
             required,
             subtitle_character_count(chinese, collapse_spaces=True) / TARGET_CHINESE_CPS,
         )
-    if english:
-        required = max(required, subtitle_character_count(english) / TARGET_ENGLISH_CPS)
+    if source:
+        source_cps = (
+            TARGET_CHINESE_CPS
+            if contains_east_asian(source)
+            else TARGET_ENGLISH_CPS
+        )
+        required = max(required, subtitle_character_count(source) / source_cps)
     return required
 
 
@@ -1902,17 +2161,23 @@ def readability_stats(segments: List[Segment]) -> Dict[str, float | int]:
         "english_over_target": 0,
         "chinese_over_single_line": 0,
         "english_over_single_line": 0,
+        "compact_source_events": 0,
+        "compact_source_max_cps": 0.0,
+        "compact_source_over_target": 0,
+        "compact_source_over_single_line": 0,
     }
     for segment in segments:
         duration = max(0.01, float(segment["end"]) - float(segment["start"]))
         chinese = to_simplified_text(clean_subtitle_text(str(segment.get("zh") or "")))
-        english = clean_english_track_text(str(segment.get("en") or ""))
-        if not chinese and not english:
+        source = source_track_text(segment)
+        if not chinese and not source:
             text = clean_subtitle_text(str(segment.get("text") or ""))
-            if contains_cjk(text):
+            if contains_cjk(text) and normalize_language_tag(
+                str(segment.get("source_language") or "")
+            ) == "zh":
                 chinese = text
             else:
-                english = text
+                source = text
 
         if chinese:
             count = subtitle_character_count(chinese, collapse_spaces=True)
@@ -1921,13 +2186,26 @@ def readability_stats(segments: List[Segment]) -> Dict[str, float | int]:
             stats["chinese_max_cps"] = max(float(stats["chinese_max_cps"]), cps)
             stats["chinese_over_target"] += int(cps > TARGET_CHINESE_CPS + 1e-9)
             stats["chinese_over_single_line"] += int(count > CHINESE_CHARS_PER_LINE)
-        if english:
-            count = subtitle_character_count(english)
+        if source:
+            count = subtitle_character_count(source)
             cps = count / duration
-            stats["english_events"] += 1
-            stats["english_max_cps"] = max(float(stats["english_max_cps"]), cps)
-            stats["english_over_target"] += int(cps > TARGET_ENGLISH_CPS + 1e-9)
-            stats["english_over_single_line"] += int(count > ENGLISH_CHARS_PER_LINE)
+            if contains_east_asian(source):
+                stats["compact_source_events"] += 1
+                stats["compact_source_max_cps"] = max(
+                    float(stats["compact_source_max_cps"]),
+                    cps,
+                )
+                stats["compact_source_over_target"] += int(
+                    cps > TARGET_CHINESE_CPS + 1e-9
+                )
+                stats["compact_source_over_single_line"] += int(
+                    count > CHINESE_CHARS_PER_LINE
+                )
+            else:
+                stats["english_events"] += 1
+                stats["english_max_cps"] = max(float(stats["english_max_cps"]), cps)
+                stats["english_over_target"] += int(cps > TARGET_ENGLISH_CPS + 1e-9)
+                stats["english_over_single_line"] += int(count > ENGLISH_CHARS_PER_LINE)
     return stats
 
 
@@ -1940,7 +2218,11 @@ def print_readability_report(segments: List[Segment]) -> None:
         f"zh>{CHINESE_CHARS_PER_LINE}chars={stats['chinese_over_single_line']}, "
         f"en_max_cps={float(stats['english_max_cps']):.2f}, "
         f"en>{TARGET_ENGLISH_CPS:g}cps={stats['english_over_target']}, "
-        f"en>{ENGLISH_CHARS_PER_LINE}chars={stats['english_over_single_line']}"
+        f"en>{ENGLISH_CHARS_PER_LINE}chars={stats['english_over_single_line']}, "
+        f"east_asian_source_max_cps={float(stats['compact_source_max_cps']):.2f}, "
+        f"east_asian_source>{TARGET_CHINESE_CPS:g}cps={stats['compact_source_over_target']}, "
+        f"east_asian_source>{CHINESE_CHARS_PER_LINE}chars="
+        f"{stats['compact_source_over_single_line']}"
     )
 
 
@@ -2204,6 +2486,12 @@ def apply_display_timing(
     output = dict(segment)
     display = parse_display_flag(item.get("display", item.get("show", item.get("keep", True))))
     output["display"] = display
+    if display:
+        output.pop("model_display_requested", None)
+        output.pop("display_guard", None)
+        output.pop("display_guard_reason", None)
+    else:
+        output["model_display_requested"] = False
     output.pop("display_start", None)
     output.pop("display_end", None)
     return output
@@ -2278,8 +2566,15 @@ def retry_single_segment_llm(
     language_label: str,
     is_proofread: bool = False,
     terminology_text: str = "(none yet)",
+    require_display: bool = False,
 ) -> Dict[str, Any]:
     print(f"检测到语言异常，正在重试单句: {segment.get('text', '')}")
+    display_requirement = (
+        "- This line is not covered by another visible subtitle. "
+        'You MUST set "display": true and return complete visible text.'
+        if require_display
+        else ""
+    )
     if is_proofread:
         batch_text = format_bilingual_prompt_segment(
             0,
@@ -2321,6 +2616,7 @@ Schema:
 
 Rules:
 - One input line must still produce one output object for checkpointing.
+{display_requirement}
 - Correct obvious English and Chinese OCR/subtitle recognition errors.
 - Convert Traditional Chinese to natural Simplified Chinese.
 - If corrected_chinese is already non-empty and complete, preserve its meaning and only proofread it. Do not replace it with a fresh translation.
@@ -2380,6 +2676,7 @@ Schema:
 
 Rules:
 - One input line must still produce one output object for checkpointing.
+{display_requirement}
 - Never output or change timestamps. Timing is enforced by the subtitle pipeline.
 - Do not output previous or following context lines.
 - Do not add explanations, markdown, notes, or extra keys.
@@ -2413,6 +2710,9 @@ Rules:
             if lookup:
                 item = lookup[0]
                 if not parse_display_flag(item.get("display", True)):
+                    if require_display:
+                        print(f"重试单句第 {attempt + 1} 次仍请求隐藏唯一字幕，继续重试...")
+                        continue
                     return item
                 if is_proofread:
                     orig_en, orig_zh = original_en_zh(segment)
@@ -2471,6 +2771,10 @@ def translate_and_correct_segments(
                 )
             ):
                 processed_segments = sanitize_checkpoint_display_timing(cached)
+                processed_segments = guard_model_hidden_segments(
+                    segments[: len(processed_segments)],
+                    processed_segments,
+                )
                 print(f"Resuming from checkpoint with {len(processed_segments)} completed segments.")
             else:
                 print("Ignoring checkpoint because it does not match the current subtitle segmentation.")
@@ -2478,6 +2782,17 @@ def translate_and_correct_segments(
             print(f"Ignoring unreadable checkpoint {checkpoint_path}: {exc}")
 
     start_index = len(processed_segments)
+    repair_index = first_guarded_language_repair_index(
+        segments,
+        processed_segments,
+        proofread=False,
+    )
+    if repair_index is not None:
+        start_index = min(start_index, repair_index)
+        print(
+            "Checkpoint contains a restored unique subtitle without a valid "
+            f"Chinese translation; reprocessing from item {start_index + 1}."
+        )
     if start_index < len(segments):
         start_index -= start_index % batch_size
         processed_segments = processed_segments[:start_index]
@@ -2612,7 +2927,28 @@ Rules:
                 corrected = clean_subtitle_text(corrected_val)
                 translated_val = str(item.get("chinese_translation") or "")
                 translated = clean_subtitle_text(translated_val)
-                display = parse_display_flag(item.get("display", True))
+                candidate_metadata = {
+                    **segment,
+                    "en": corrected,
+                    "zh": translated,
+                    "processing_mode": "translate",
+                    "processing_policy_version": PROCESSING_POLICY_VERSION,
+                    "terminology_policy_version": TERMINOLOGY_POLICY_VERSION,
+                    "llm_model": llm_model,
+                    "llm_role": "translation",
+                    "llm_generation_profile": asdict(
+                        generation_profile("translation")
+                    ),
+                }
+                guarded_candidate = guarded_display_candidate(
+                    segments,
+                    [*processed_segments, *batch_processed],
+                    candidate_metadata,
+                    item,
+                    context_start,
+                    context_end,
+                )
+                display = guarded_candidate.get("display", True) is not False
                 proposed_terminology = applicable_terminology_entries(
                     extract_terminology_entries(item),
                     corrected,
@@ -2628,6 +2964,9 @@ Rules:
                     not is_language_valid(segment["text"], corrected, translated)
                     or conflicts
                 ):
+                    forced_model_hide = (
+                        guarded_candidate.get("display_guard") == "forced_visible"
+                    )
                     retry_item = retry_single_segment_llm(
                         segment,
                         f"{before_text}\n\nPREVIOUS APPROVED OUTPUT:\n{approved_output_context}",
@@ -2644,6 +2983,7 @@ Rules:
                         language_label,
                         is_proofread=False,
                         terminology_text=format_terminology_glossary(glossary, corrected),
+                        require_display=forced_model_hide,
                     )
                     if not retry_item:
                         raise RuntimeError(f"LLM could not produce a valid translation for segment {i + j}")
@@ -2657,7 +2997,29 @@ Rules:
                     corrected = clean_subtitle_text(corrected_val)
                     translated_val = str(item.get("chinese_translation") or "")
                     translated = clean_subtitle_text(translated_val)
-                    display = parse_display_flag(item.get("display", True))
+                    candidate_metadata.update(
+                        {
+                            "en": corrected,
+                            "zh": translated,
+                        }
+                    )
+                    guarded_candidate = guarded_display_candidate(
+                        segments,
+                        [*processed_segments, *batch_processed],
+                        candidate_metadata,
+                        item,
+                        context_start,
+                        context_end,
+                    )
+                    if forced_model_hide:
+                        guarded_candidate.update(
+                            {
+                                "model_display_requested": False,
+                                "display_guard": "forced_visible",
+                                "display_guard_reason": "unique_source_not_covered",
+                            }
+                        )
+                    display = guarded_candidate.get("display", True) is not False
                     proposed_terminology = applicable_terminology_entries(
                         extract_terminology_entries(item),
                         corrected,
@@ -2679,27 +3041,8 @@ Rules:
                     if display
                     else []
                 )
-                batch_processed.append(
-                    apply_display_timing(
-                        {
-                            **segment,
-                            "en": corrected,
-                            "zh": translated or corrected,
-                            "processing_mode": "translate",
-                            "processing_policy_version": PROCESSING_POLICY_VERSION,
-                            "terminology_policy_version": TERMINOLOGY_POLICY_VERSION,
-                            "llm_model": llm_model,
-                            "llm_role": "translation",
-                            "llm_generation_profile": asdict(
-                                generation_profile("translation")
-                            ),
-                            "terminology": terminology,
-                        },
-                        item,
-                        context_start,
-                        context_end,
-                    )
-                )
+                guarded_candidate["terminology"] = terminology
+                batch_processed.append(guarded_candidate)
         except Exception as exc:
             raise RuntimeError(
                 f"Failed to process subtitle batch {i + 1}-{i + len(batch)}; "
@@ -2719,9 +3062,25 @@ Rules:
 
 def original_en_zh(segment: Segment) -> Tuple[str, str]:
     text = clean_subtitle_text(str(segment.get("text", "")))
-    en_text = clean_english_track_text(str(segment.get("en") or ("" if contains_cjk(text) else text)))
-    zh_text = to_simplified_text(clean_subtitle_text(str(segment.get("zh") or (text if contains_cjk(text) else ""))))
-    return en_text, zh_text
+    language = normalize_language_tag(str(segment.get("source_language") or ""))
+    source_text = source_track_text(segment)
+    if not source_text and not segment.get("en") and language != "zh":
+        source_text = text
+    chinese_text = clean_subtitle_text(str(segment.get("zh") or ""))
+    if (
+        not chinese_text
+        and text
+        and (
+            language == "zh"
+            or (
+                language in UNKNOWN_SOURCE_LANGUAGE_TAGS
+                and contains_cjk(text)
+                and not source_text
+            )
+        )
+    ):
+        chinese_text = text
+    return source_text, to_simplified_text(chinese_text)
 
 
 def proofread_existing_chinese_segments(
@@ -2756,6 +3115,10 @@ def proofread_existing_chinese_segments(
                 )
             ):
                 processed_segments = sanitize_checkpoint_display_timing(to_simplified_segments(cached))
+                processed_segments = guard_model_hidden_segments(
+                    segments[: len(processed_segments)],
+                    processed_segments,
+                )
                 print(f"Resuming from checkpoint with {len(processed_segments)} completed segments.")
             else:
                 print("Ignoring checkpoint because it does not match the current subtitle segmentation.")
@@ -2763,6 +3126,17 @@ def proofread_existing_chinese_segments(
             print(f"Ignoring unreadable checkpoint {checkpoint_path}: {exc}")
 
     start_index = len(processed_segments)
+    repair_index = first_guarded_language_repair_index(
+        segments,
+        processed_segments,
+        proofread=True,
+    )
+    if repair_index is not None:
+        start_index = min(start_index, repair_index)
+        print(
+            "Checkpoint contains a restored unique subtitle without valid "
+            f"bilingual text; reprocessing from item {start_index + 1}."
+        )
     if start_index < len(segments):
         start_index -= start_index % batch_size
         processed_segments = processed_segments[:start_index]
@@ -2903,7 +3277,28 @@ Rules:
                     or original_zh
                 )
                 corrected_zh = to_simplified_text(clean_subtitle_text(corrected_zh_val))
-                display = parse_display_flag(item.get("display", True))
+                candidate_metadata = {
+                    **segment,
+                    "en": corrected_en,
+                    "zh": corrected_zh,
+                    "processing_mode": "proofread_existing_chinese",
+                    "processing_policy_version": PROCESSING_POLICY_VERSION,
+                    "terminology_policy_version": TERMINOLOGY_POLICY_VERSION,
+                    "llm_model": llm_model,
+                    "llm_role": "proofread",
+                    "llm_generation_profile": asdict(
+                        generation_profile("proofread")
+                    ),
+                }
+                guarded_candidate = guarded_display_candidate(
+                    segments,
+                    [*processed_segments, *batch_processed],
+                    candidate_metadata,
+                    item,
+                    context_start,
+                    context_end,
+                )
+                display = guarded_candidate.get("display", True) is not False
                 terminology_source = corrected_en or original_en or original_zh
                 proposed_terminology = applicable_terminology_entries(
                     extract_terminology_entries(item),
@@ -2925,6 +3320,9 @@ Rules:
                     )
                     or conflicts
                 ):
+                    forced_model_hide = (
+                        guarded_candidate.get("display_guard") == "forced_visible"
+                    )
                     retry_item = retry_single_segment_llm(
                         segment,
                         f"{before_text}\n\nPREVIOUS APPROVED OUTPUT:\n{approved_output_context}",
@@ -2944,6 +3342,7 @@ Rules:
                             glossary,
                             terminology_source,
                         ),
+                        require_display=forced_model_hide,
                     )
                     if not retry_item:
                         raise RuntimeError(f"LLM could not produce a valid proofread result for segment {i + j}")
@@ -2957,7 +3356,29 @@ Rules:
                         or original_zh
                     )
                     corrected_zh = to_simplified_text(clean_subtitle_text(corrected_zh_val))
-                    display = parse_display_flag(item.get("display", True))
+                    candidate_metadata.update(
+                        {
+                            "en": corrected_en,
+                            "zh": corrected_zh,
+                        }
+                    )
+                    guarded_candidate = guarded_display_candidate(
+                        segments,
+                        [*processed_segments, *batch_processed],
+                        candidate_metadata,
+                        item,
+                        context_start,
+                        context_end,
+                    )
+                    if forced_model_hide:
+                        guarded_candidate.update(
+                            {
+                                "model_display_requested": False,
+                                "display_guard": "forced_visible",
+                                "display_guard_reason": "unique_source_not_covered",
+                            }
+                        )
+                    display = guarded_candidate.get("display", True) is not False
                     terminology_source = corrected_en or original_en or original_zh
                     proposed_terminology = applicable_terminology_entries(
                         extract_terminology_entries(item),
@@ -2985,27 +3406,8 @@ Rules:
                     if display
                     else []
                 )
-                batch_processed.append(
-                    apply_display_timing(
-                        {
-                            **segment,
-                            "en": corrected_en,
-                            "zh": corrected_zh,
-                            "processing_mode": "proofread_existing_chinese",
-                            "processing_policy_version": PROCESSING_POLICY_VERSION,
-                            "terminology_policy_version": TERMINOLOGY_POLICY_VERSION,
-                            "llm_model": llm_model,
-                            "llm_role": "proofread",
-                            "llm_generation_profile": asdict(
-                                generation_profile("proofread")
-                            ),
-                            "terminology": terminology,
-                        },
-                        item,
-                        context_start,
-                        context_end,
-                    )
-                )
+                guarded_candidate["terminology"] = terminology
+                batch_processed.append(guarded_candidate)
         except Exception as exc:
             raise RuntimeError(
                 f"Failed to proofread subtitle batch {i + 1}-{i + len(batch)}; "
@@ -3594,17 +3996,6 @@ def main() -> None:
                 terminology_path=terminology_path,
             )
 
-        output_segments = prepare_segments_for_output(
-            processed_segments,
-            max_words=args.max_words,
-            max_chars=args.max_chars,
-            max_duration=args.max_duration,
-        )
-        en_ass = out_dir / f"{movie_name}.en.ass"
-        zh_ass = out_dir / f"{movie_name}.zh.ass"
-        bi_ass = out_dir / f"{movie_name}.bilingual.ass"
-
-        print("Generating bilingual subtitles...", flush=True)
         subtitle_font_file = (
             validate_font_path(Path(args.subtitle_font_file))
             if args.subtitle_font_file
@@ -3626,6 +4017,26 @@ def main() -> None:
             f"scale={args.subtitle_font_scale}%, "
             f"PlayRes={play_resolution[0]}x{play_resolution[1]}"
         )
+        layout_policy = build_layout_policy(
+            play_resolution,
+            profile_name=args.subtitle_style_profile,
+            font_name=resolved_font_name,
+            font_scale=args.subtitle_font_scale,
+            font_path=subtitle_font_file,
+        )
+        output_segments = prepare_segments_for_output(
+            processed_segments,
+            max_words=args.max_words,
+            max_chars=args.max_chars,
+            max_duration=args.max_duration,
+            layout_policy=layout_policy,
+        )
+        en_ass = out_dir / f"{movie_name}.en.ass"
+        zh_ass = out_dir / f"{movie_name}.zh.ass"
+        bi_ass = out_dir / f"{movie_name}.bilingual.ass"
+        quality_report_path = out_dir / f"{movie_name}.quality-report.json"
+
+        print("Generating bilingual subtitles...", flush=True)
         ass_options = {
             "play_resolution": play_resolution,
             "style_profile": args.subtitle_style_profile,
@@ -3635,6 +4046,12 @@ def main() -> None:
         generate_ass(output_segments, en_ass, "en", **ass_options)
         generate_ass(output_segments, zh_ass, "zh", **ass_options)
         generate_ass(output_segments, bi_ass, "bilingual", **ass_options)
+        artifact_paths = {
+            "english_ass": str(en_ass),
+            "chinese_ass": str(zh_ass),
+            "bilingual_ass": str(bi_ass),
+            "quality_report": str(quality_report_path),
+        }
         if subtitle_font_file is not None:
             font_manifest = package_ass_with_font(
                 bi_ass,
@@ -3645,6 +4062,9 @@ def main() -> None:
                 "Font delivery bundle: "
                 f"{font_manifest['matroska_subtitle_bundle']}"
             )
+            artifact_paths["bilingual_font_bundle"] = str(
+                font_manifest["matroska_subtitle_bundle"]
+            )
 
         if loaded_legacy_source_cache:
             for segment in subtitle_segments:
@@ -3654,8 +4074,32 @@ def main() -> None:
             write_json_atomic(source_segments_path, subtitle_segments)
             write_json_atomic(checkpoint_path, processed_segments)
 
+        quality_report = build_quality_report(
+            subtitle_segments,
+            processed_segments,
+            output_segments,
+            layout_policy,
+            max_duration=args.max_duration,
+            target_chinese_cps=TARGET_CHINESE_CPS,
+            target_english_cps=TARGET_ENGLISH_CPS,
+            artifacts=artifact_paths,
+        )
+        write_quality_report(quality_report_path, quality_report)
         print_timing_report(output_segments)
         print_readability_report(output_segments)
+        print(
+            "Final quality report: "
+            f"status={quality_report['status']}, "
+            f"review_items={quality_report['summary']['review_items']}, "
+            f"pixel_overflow={quality_report['summary']['pixel_overflow_events']}, "
+            f"model_hide_overrides={quality_report['summary']['model_hide_overrides']}, "
+            f"path={quality_report_path}"
+        )
+        if quality_report["status"] == "fail":
+            raise RuntimeError(
+                "Final subtitle quality validation failed. "
+                f"Review {quality_report_path} before delivery."
+            )
         print(f"Success! Subtitles saved to {out_dir}")
     finally:
         if temp_audio.exists():

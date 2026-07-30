@@ -23,6 +23,7 @@ from audio_to_subtitle import (  # noqa: E402
     extend_display_over_hidden_segments,
     find_sidecar_subtitle,
     generate_ass,
+    guard_model_hidden_segments,
     load_cached_source_segments,
     merge_existing_subtitle_segments,
     optimize_readability_timing,
@@ -364,6 +365,163 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertFalse(output[1]["display"])
         self.assertFalse(output[2]["display"])
         self.assertEqual(output[0]["zh"], "\u5408\u5e76\u540e\u7684\u7ffb\u8bd1")
+
+    def test_model_hide_guard_forces_unique_source_line_visible(self) -> None:
+        source = [
+            {"id": 0, "start": 1.0, "end": 2.0, "text": "First complete sentence."},
+            {"id": 1, "start": 2.1, "end": 3.0, "text": "A different important sentence."},
+        ]
+        processed = [
+            {
+                **source[0],
+                "en": "First complete sentence.",
+                "zh": "\u7b2c\u4e00\u53e5\u5b8c\u6574\u7684\u8bdd\u3002",
+                "display": True,
+            },
+            {
+                **source[1],
+                "en": "A different important sentence.",
+                "zh": "\u53e6\u4e00\u53e5\u91cd\u8981\u7684\u8bdd\u3002",
+                "display": False,
+                "model_display_requested": False,
+            },
+        ]
+
+        guarded = guard_model_hidden_segments(source, processed)
+
+        self.assertTrue(guarded[1]["display"])
+        self.assertEqual(guarded[1]["display_guard"], "forced_visible")
+        self.assertEqual(
+            guarded[1]["display_guard_reason"],
+            "unique_source_not_covered",
+        )
+
+    def test_model_hide_guard_accepts_fragment_covered_by_earlier_line(self) -> None:
+        source = [
+            {"id": 0, "start": 10.0, "end": 11.0, "text": "A sentence starts here"},
+            {"id": 1, "start": 11.0, "end": 12.0, "text": "and finishes here"},
+        ]
+        processed = [
+            {
+                **source[0],
+                "en": "A sentence starts here and finishes here",
+                "zh": "\u4e00\u53e5\u8bdd\u5728\u8fd9\u91cc\u5b8c\u6574\u8bf4\u5b8c",
+                "display": True,
+            },
+            {
+                **source[1],
+                "en": "and finishes here",
+                "zh": "",
+                "display": False,
+                "model_display_requested": False,
+            },
+        ]
+
+        guarded = guard_model_hidden_segments(source, processed)
+
+        self.assertFalse(guarded[1]["display"])
+        self.assertEqual(guarded[1]["display_guard"], "accepted_hidden")
+        self.assertEqual(
+            guarded[1]["display_guard_reason"],
+            "covered_by_adjacent_visible_line",
+        )
+
+    def test_translation_pipeline_overrides_unsupported_model_hide(self) -> None:
+        source = [
+            {"id": 0, "start": 1.0, "end": 2.0, "text": "This line is unique."},
+        ]
+        llm_response = (
+            '[{"index":0,"corrected_text":"This line is unique.",'
+            '"chinese_translation":"\u8fd9\u53e5\u8bdd\u662f\u552f\u4e00\u7684\u3002","display":false}]'
+        )
+
+        with patch.object(audio_to_subtitle, "call_llm", return_value=llm_response):
+            output = translate_and_correct_segments(
+                source,
+                llm_model="qwen3:30b",
+                batch_size=1,
+                context_lines=0,
+                source_language="en",
+            )
+
+        self.assertTrue(output[0]["display"])
+        self.assertEqual(output[0]["display_guard"], "forced_visible")
+
+    def test_forced_visible_line_retries_until_chinese_is_complete(self) -> None:
+        source = [
+            {"id": 0, "start": 1.0, "end": 2.0, "text": "This line is unique."},
+        ]
+        responses = [
+            (
+                '[{"index":0,"corrected_text":"This line is unique.",'
+                '"chinese_translation":"","display":false}]'
+            ),
+            (
+                '[{"index":0,"corrected_text":"This line is unique.",'
+                '"chinese_translation":"\u8fd9\u53e5\u8bdd\u662f\u552f\u4e00\u7684\u3002","display":true}]'
+            ),
+        ]
+        prompts = []
+
+        def call_llm(prompt, *_args, **_kwargs):
+            prompts.append(prompt)
+            return responses.pop(0)
+
+        with patch.object(audio_to_subtitle, "call_llm", side_effect=call_llm):
+            output = translate_and_correct_segments(
+                source,
+                llm_model="qwen3:30b",
+                batch_size=1,
+                context_lines=0,
+                source_language="en",
+            )
+
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("MUST set", prompts[1])
+        self.assertTrue(output[0]["display"])
+        self.assertEqual(output[0]["zh"], "\u8fd9\u53e5\u8bdd\u662f\u552f\u4e00\u7684\u3002")
+        self.assertEqual(output[0]["display_guard"], "forced_visible")
+
+    def test_resume_reprocesses_restored_unique_line_with_missing_translation(self) -> None:
+        source = [
+            {"id": 0, "start": 1.0, "end": 2.0, "text": "This line is unique."},
+        ]
+        cached = [
+            {
+                **source[0],
+                "en": "This line is unique.",
+                "zh": "",
+                "display": False,
+                "processing_mode": "translate",
+                "processing_policy_version": audio_to_subtitle.PROCESSING_POLICY_VERSION,
+                "terminology_policy_version": audio_to_subtitle.TERMINOLOGY_POLICY_VERSION,
+                "llm_model": "qwen3:30b",
+            }
+        ]
+        response = (
+            '[{"index":0,"corrected_text":"This line is unique.",'
+            '"chinese_translation":"\u8fd9\u53e5\u8bdd\u662f\u552f\u4e00\u7684\u3002","display":true}]'
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_path = Path(tmpdir) / "checkpoint.json"
+            checkpoint_path.write_text(
+                json.dumps(cached, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            with patch.object(audio_to_subtitle, "call_llm", return_value=response) as call:
+                output = translate_and_correct_segments(
+                    source,
+                    llm_model="qwen3:30b",
+                    batch_size=1,
+                    context_lines=0,
+                    source_language="en",
+                    checkpoint_path=checkpoint_path,
+                )
+
+        call.assert_called_once()
+        self.assertTrue(output[0]["display"])
+        self.assertEqual(output[0]["zh"], "\u8fd9\u53e5\u8bdd\u662f\u552f\u4e00\u7684\u3002")
 
     def test_translation_reuses_approved_name_terminology_across_batches(self) -> None:
         source = [
@@ -2097,9 +2255,17 @@ class DisplayCleanupTests(unittest.TestCase):
 
             body = (out_dir / "Episode.bilingual.ass").read_text(encoding="utf-8")
             source_cache = json.loads((out_dir / "Episode.segments.source.json").read_text(encoding="utf-8"))
+            quality_report = json.loads(
+                (out_dir / "Episode.quality-report.json").read_text(encoding="utf-8")
+            )
             self.assertIn("Hello world", body)
             self.assertIn("\u7e41\u4f53\u5b57\u5e55", body)
             self.assertEqual(source_cache[0]["zh"], "\u7e41\u4f53\u5b57\u5e55")
+            self.assertEqual(quality_report["status"], "pass")
+            self.assertEqual(
+                quality_report["artifacts"]["bilingual_ass"],
+                str(out_dir / "Episode.bilingual.ass"),
+            )
 
     def test_existing_chinese_proofreading_corrects_english_and_hides_duplicates(self) -> None:
         source = [

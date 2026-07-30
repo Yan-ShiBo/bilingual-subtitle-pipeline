@@ -484,12 +484,15 @@ def checkpoint_info(
     out_dir = output_dir(output_root, series_name, movie_name)
     checkpoint = out_dir / f"{movie_name}.segments.checkpoint.json"
     source = out_dir / f"{movie_name}.segments.source.json"
+    quality_report = out_dir / f"{movie_name}.quality-report.json"
     info: Dict[str, Any] = {
         "output_dir": str(out_dir),
         "checkpoint_path": str(checkpoint),
         "source_segments_path": str(source),
+        "quality_report_path": str(quality_report),
         "checkpoint_exists": checkpoint.exists(),
         "source_segments_exists": source.exists(),
+        "quality_report_exists": quality_report.exists(),
         "completed_count": 0,
         "total_count": None,
         "last_item": None,
@@ -533,6 +536,17 @@ def checkpoint_info(
                     info["preview"] = [summarize_segment(item) for item in visible_items[-10:]]
         except Exception as exc:
             info["checkpoint_error"] = str(exc)
+
+    if quality_report.exists():
+        try:
+            report = read_json(quality_report)
+            if not isinstance(report, dict):
+                raise ValueError("quality report is not an object")
+            info["quality_status"] = str(report.get("status") or "")
+            info["quality_summary"] = report.get("summary") or {}
+            info["quality_checks"] = report.get("checks") or {}
+        except Exception as exc:
+            info["quality_report_error"] = str(exc)
 
     return info
 
@@ -662,6 +676,7 @@ def remove_translation_outputs(out_dir: Path, movie_name: str) -> None:
         f"{movie_name}.bilingual.ass",
         f"{movie_name}.bilingual.mks",
         f"{movie_name}.bilingual.font-delivery.json",
+        f"{movie_name}.quality-report.json",
     ]
     for name in names:
         path = out_dir / name
@@ -1174,6 +1189,7 @@ def html_page() -> str:
     .stat:nth-child(4n) { border-right: 0; }
     .stat b { display: block; font-size: 20px; margin-top: 4px; }
     .muted { color: #66717f; font-size: 13px; }
+    #paths { overflow-wrap: anywhere; }
     pre { white-space: pre-wrap; word-break: break-word; background: #111827; color: #e5e7eb; border-radius: 8px; padding: 12px; max-height: 320px; overflow: auto; }
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
     th, td { border-bottom: 1px solid #e5e7eb; text-align: left; padding: 8px; vertical-align: top; }
@@ -1195,7 +1211,7 @@ def html_page() -> str:
     .stage-step.interrupted .dot { background: #bf8700; }
     .stage-step.pending .dot { background: #cfd6e4; }
     .stage-line { flex: 1; height: 2px; background: #dde1e7; margin: 0 16px; }
-    .status-message { margin: 14px 0 0; padding: 10px 12px; border-left: 4px solid #bf8700; background: #fff8c5; color: #633c01; line-height: 1.55; }
+    .status-message { margin: 14px 0 0; padding: 10px 12px; border-left: 4px solid #bf8700; background: #fff8c5; color: #633c01; line-height: 1.55; overflow-wrap: anywhere; }
     .status-message.error { border-left-color: #da3633; background: #ffebe9; color: #82071e; }
     @media (max-width: 800px) {
       main { padding: 14px; }
@@ -1459,6 +1475,7 @@ def html_page() -> str:
       <div class="stat"><span class="muted">已有字幕</span><b id="sidecarState">未知</b></div>
       <div class="stat"><span class="muted">内封字幕</span><b id="embeddedState">未知</b></div>
       <div class="stat"><span class="muted">自动来源</span><b id="autoSourceState">-</b></div>
+      <div class="stat"><span class="muted">成片质检</span><b id="qualityState">未生成</b></div>
     </div>
     <p class="muted" id="paths"></p>
     <p class="status-message" id="runMessage" role="alert" aria-live="polite" hidden></p>
@@ -1858,6 +1875,10 @@ function render(data) {
   const embeddedItems = (data.embedded_subtitles || []).filter(item => !item.error);
   document.getElementById('embeddedState').textContent = data.has_embedded_subtitles === undefined ? '未知' : (data.has_embedded_subtitles ? `${embeddedItems.length} 条轨道` : '无');
   document.getElementById('autoSourceState').textContent = sourceLabel(data.auto_source || '-');
+  const qualityLabels = {pass: '通过', review: '建议复核', fail: '未通过'};
+  document.getElementById('qualityState').textContent = data.running
+    ? '待更新'
+    : (qualityLabels[data.quality_status] || (data.quality_report_error ? '报告异常' : '未生成'));
   document.getElementById('paths').textContent = [
     data.video_path ? `主视频：${data.video_path}` : '',
     data.name_source ? `片名识别：${data.name_source}` : '',
@@ -1866,7 +1887,8 @@ function render(data) {
     data.sidecar_subtitles ? `已有字幕：${subtitleListLabel(data.sidecar_subtitles)}` : '',
     data.embedded_subtitles ? `内封字幕：${subtitleListLabel(data.embedded_subtitles)}` : '',
     data.output_dir ? `输出：${data.output_dir}` : '',
-    data.checkpoint_exists && data.checkpoint_path ? `checkpoint：${data.checkpoint_path}` : ''
+    data.checkpoint_exists && data.checkpoint_path ? `checkpoint：${data.checkpoint_path}` : '',
+    data.quality_report_exists && data.quality_report_path ? `质检报告：${data.quality_report_path}` : ''
   ].filter(Boolean).join('  |  ');
 
   const runMessage = document.getElementById('runMessage');
@@ -1892,6 +1914,17 @@ function render(data) {
     const reprocess = document.querySelector('input[name="runMode"][value="reprocess"]');
     const resume = document.querySelector('input[name="runMode"][value="resume"]');
     if (reprocess && resume?.checked) reprocess.checked = true;
+  } else if (!data.running && data.quality_status === 'fail') {
+    runMessage.textContent = `成片质检未通过。请先查看质检报告：${data.quality_report_path || ''}`;
+    runMessage.className = 'status-message error';
+    runMessage.hidden = false;
+  } else if (!data.running && data.quality_status === 'review') {
+    const summary = data.quality_summary || {};
+    const reviewItems = summary.review_items ?? 0;
+    const hideOverrides = summary.model_hide_overrides ?? 0;
+    runMessage.textContent = `字幕已生成，质检建议复核 ${reviewItems} 项，其中模型误隐藏保护 ${hideOverrides} 项。`;
+    runMessage.className = 'status-message';
+    runMessage.hidden = false;
   } else {
     runMessage.textContent = '';
     runMessage.hidden = true;

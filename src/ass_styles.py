@@ -26,6 +26,23 @@ class AssStyleProfile:
     shadow: float
 
 
+@dataclass(frozen=True)
+class ResolvedAssStyle:
+    profile_name: str
+    font_name: str
+    scale: float
+    play_res_x: int
+    play_res_y: int
+    margin_horizontal: int
+    margin_vertical: int
+    chinese_size: int
+    source_size: int
+    source_only_size: int
+    outline: float
+    shadow: float
+    safe_line_width: float
+
+
 STYLE_PROFILES = {
     "adaptive": AssStyleProfile(
         chinese_size=52,
@@ -191,13 +208,13 @@ def normalized_style_options(
     return profile, sanitize_font_name(font_name), min(1.6, max(0.7, scale))
 
 
-def ass_style_header(
+def resolve_ass_style(
     play_res_x: int = 1920,
     play_res_y: int = DEFAULT_PLAY_RES_Y,
     profile_name: str = "adaptive",
     font_name: str | None = None,
     font_scale: int | float = 100,
-) -> str:
+) -> ResolvedAssStyle:
     profile_name, font_name, scale = normalized_style_options(profile_name, font_name, font_scale)
     profile = STYLE_PROFILES[profile_name]
     margin_horizontal = max(20, int(round(play_res_x * profile.margin_horizontal_ratio)))
@@ -207,6 +224,39 @@ def ass_style_header(
     source_only_size = max(16, int(round(profile.source_only_size * scale)))
     outline = profile.outline * scale
     shadow = profile.shadow * scale
+    edge_reserve = 2 * (outline + shadow + 2)
+    safe_line_width = max(120.0, play_res_x - 2 * margin_horizontal - edge_reserve)
+    return ResolvedAssStyle(
+        profile_name=profile_name,
+        font_name=font_name,
+        scale=scale,
+        play_res_x=play_res_x,
+        play_res_y=play_res_y,
+        margin_horizontal=margin_horizontal,
+        margin_vertical=margin_vertical,
+        chinese_size=chinese_size,
+        source_size=source_size,
+        source_only_size=source_only_size,
+        outline=outline,
+        shadow=shadow,
+        safe_line_width=safe_line_width,
+    )
+
+
+def ass_style_header(
+    play_res_x: int = 1920,
+    play_res_y: int = DEFAULT_PLAY_RES_Y,
+    profile_name: str = "adaptive",
+    font_name: str | None = None,
+    font_scale: int | float = 100,
+) -> str:
+    style = resolve_ass_style(
+        play_res_x,
+        play_res_y,
+        profile_name=profile_name,
+        font_name=font_name,
+        font_scale=font_scale,
+    )
     format_line = (
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
         "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
@@ -216,9 +266,9 @@ def ass_style_header(
 
     def style_line(name: str, size: int, primary: str) -> str:
         return (
-            f"Style: {name},{font_name},{size},{primary},&H000000FF,&H00000000,"
-            f"&H64000000,0,0,0,0,100,100,0,0,1,{outline:.2f},{shadow:.2f},2,"
-            f"{margin_horizontal},{margin_horizontal},{margin_vertical},1"
+            f"Style: {name},{style.font_name},{size},{primary},&H000000FF,&H00000000,"
+            f"&H64000000,0,0,0,0,100,100,0,0,1,{style.outline:.2f},{style.shadow:.2f},2,"
+            f"{style.margin_horizontal},{style.margin_horizontal},{style.margin_vertical},1"
         )
 
     return "\n".join(
@@ -233,10 +283,10 @@ def ass_style_header(
             "",
             "[V4+ Styles]",
             format_line,
-            style_line("Default", chinese_size, "&H00FFFFFF"),
-            style_line("Chinese", chinese_size, "&H00FFFFFF"),
-            style_line("Source", source_size, "&H00E6E6E6"),
-            style_line("SourceOnly", source_only_size, "&H00FFFFFF"),
+            style_line("Default", style.chinese_size, "&H00FFFFFF"),
+            style_line("Chinese", style.chinese_size, "&H00FFFFFF"),
+            style_line("Source", style.source_size, "&H00E6E6E6"),
+            style_line("SourceOnly", style.source_only_size, "&H00FFFFFF"),
             "",
             "[Events]",
             "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
