@@ -699,6 +699,9 @@ def flatten_quality_review_items(
             if not isinstance(sample, dict):
                 continue
             segment_id = sample.get("checkpoint_segment_id", sample.get("id"))
+            segment = segments_by_id.get(str(segment_id))
+            if segment and segment.get("manual_reviewed_at"):
+                continue
             issues = sample.get("issues")
             issue = sample.get("issue")
             if not issue and isinstance(issues, list):
@@ -711,7 +714,7 @@ def flatten_quality_review_items(
                     "segment_id": segment_id,
                     "start": sample.get("start"),
                     "end": sample.get("end"),
-                    "segment": segments_by_id.get(str(segment_id)),
+                    "segment": segment,
                     "details": sample,
                 }
             )
@@ -745,6 +748,8 @@ def checkpoint_info(
         "preview": [],
         "checkpoint_compatible": None,
         "quality_review_items": [],
+        "quality_review_pending_count": 0,
+        "manual_reviewed_count": 0,
     }
     checkpoint_items: List[Dict[str, Any]] = []
 
@@ -770,6 +775,10 @@ def checkpoint_info(
             if isinstance(items, list):
                 checkpoint_items = [item for item in items if isinstance(item, dict)]
                 info["completed_count"] = len(items)
+                info["manual_reviewed_count"] = sum(
+                    bool(item.get("manual_reviewed_at"))
+                    for item in checkpoint_items
+                )
                 if items:
                     checkpoint_model = str(items[0].get("llm_model") or "")
                     checkpoint_policy = int(items[0].get("processing_policy_version") or 0)
@@ -805,6 +814,9 @@ def checkpoint_info(
             info["quality_review_items"] = flatten_quality_review_items(
                 report,
                 checkpoint_items,
+            )
+            info["quality_review_pending_count"] = len(
+                info["quality_review_items"]
             )
             info["manual_review_pending"] = bool(report.get("manual_review_pending"))
         except Exception as exc:

@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import asdict, dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -24,6 +25,7 @@ from font_delivery import font_family_name, package_ass_with_font, validate_font
 from llm_policy import (
     generation_profile,
     indexed_subtitle_schema,
+    indexed_terminology_schema,
     movie_name_schema,
     movie_style_schema,
 )
@@ -33,6 +35,7 @@ from pipeline_policy import (
     PROCESSING_POLICY_VERSION,
     STYLE_GUIDE_POLICY_VERSION,
     TERMINOLOGY_POLICY_VERSION,
+    TERMINOLOGY_REVIEW_POLICY_VERSION,
 )
 from scene_timing import align_subtitles_to_scene_cuts, detect_scene_cuts
 from subtitle_delivery import validate_ass_rendering, write_delivery_srts
@@ -101,9 +104,27 @@ def configure_output_encoding() -> None:
 
 def write_json_atomic(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f"{path.name}.tmp")
-    tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp_path.replace(path)
+    tmp_path = path.with_name(
+        f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    )
+    tmp_path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    try:
+        for attempt in range(20):
+            try:
+                tmp_path.replace(path)
+                return
+            except PermissionError:
+                if attempt == 19:
+                    raise
+                time.sleep(min(0.05 * (attempt + 1), 0.5))
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def load_cached_source_segments(path: Path) -> List[Segment]:
@@ -242,6 +263,28 @@ def source_cache_matches_request(
     if not cached_fingerprints:
         return allow_legacy
     return cached_fingerprints == {request_fingerprint}
+
+
+def source_request_audio_stream_variants(
+    requested_audio_stream: Optional[int],
+    effective_audio_stream: Optional[int],
+    subtitle_sync_mode: str,
+    sync_report_path: Path,
+) -> set[Optional[int]]:
+    variants = {requested_audio_stream}
+    if subtitle_sync_mode == "off":
+        variants.add(None)
+        return variants
+    if effective_audio_stream is None or not sync_report_path.exists():
+        return variants
+    try:
+        report = json.loads(sync_report_path.read_text(encoding="utf-8"))
+        report_audio_stream = int(report.get("audio_stream"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return variants
+    if report_audio_stream == int(effective_audio_stream):
+        variants.update({None, effective_audio_stream})
+    return variants
 
 
 def dominant_source_language(segments: List[Segment]) -> str:
@@ -479,6 +522,7 @@ def call_llm(
     *,
     role: str = "translation",
     response_schema: Optional[Dict[str, Any]] = None,
+    seed_offset: int = 0,
 ) -> str:
     base_url = "http://localhost:11434"
     if model.startswith("remote:"):
@@ -507,7 +551,7 @@ def call_llm(
             "temperature": profile.temperature,
             "top_p": profile.top_p,
             "top_k": profile.top_k,
-            "seed": profile.seed,
+            "seed": profile.seed + max(0, int(seed_offset)),
             "num_ctx": profile.num_ctx,
             "num_predict": profile.max_tokens,
         },
@@ -561,19 +605,181 @@ def strip_llm_noise(text: str) -> str:
     return text
 
 
-def parse_json_response(text: str) -> Any:
+def _schema_string_property_names(response_schema: Dict[str, Any]) -> set[str]:
+    names: set[str] = set()
+
+    def collect(node: Any) -> None:
+        if not isinstance(node, dict):
+            return
+        properties = node.get("properties")
+        if isinstance(properties, dict):
+            for name, property_schema in properties.items():
+                if isinstance(property_schema, dict) and property_schema.get("type") == "string":
+                    names.add(str(name))
+                collect(property_schema)
+        collect(node.get("items"))
+
+    collect(response_schema)
+    return names
+
+
+def repair_unquoted_schema_strings(text: str, response_schema: Dict[str, Any]) -> str:
+    string_properties = _schema_string_property_names(response_schema)
+    if not string_properties:
+        return text
+
+    lines = text.splitlines(keepends=True)
+    repaired_lines: List[str] = []
+    changed = False
+    property_pattern = re.compile(
+        r'^(?P<prefix>\s*"(?P<key>(?:\\.|[^"\\])*)"\s*:\s*)(?P<value>.*)$'
+    )
+    for line_index, line in enumerate(lines):
+        newline = ""
+        body = line
+        if body.endswith("\r\n"):
+            body, newline = body[:-2], "\r\n"
+        elif body.endswith("\n"):
+            body, newline = body[:-1], "\n"
+
+        match = property_pattern.match(body)
+        if not match or match.group("key") not in string_properties:
+            repaired_lines.append(line)
+            continue
+
+        value_with_spacing = match.group("value")
+        trailing_spacing = value_with_spacing[len(value_with_spacing.rstrip()) :]
+        value = value_with_spacing.rstrip()
+        has_comma = value.endswith(",")
+        if has_comma:
+            value = value[:-1].rstrip()
+        raw_value = value.strip()
+
+        if (
+            not raw_value
+            or raw_value.startswith('"')
+            or raw_value in {"null", "true", "false"}
+            or raw_value.startswith(("{", "["))
+        ):
+            repaired_lines.append(line)
+            continue
+
+        if raw_value.endswith('"'):
+            raw_value = raw_value[:-1].rstrip()
+        if len(raw_value) >= 2 and raw_value.startswith("'") and raw_value.endswith("'"):
+            raw_value = raw_value[1:-1]
+        if not raw_value:
+            repaired_lines.append(line)
+            continue
+
+        if not has_comma:
+            for following_line in lines[line_index + 1 :]:
+                following_content = following_line.strip()
+                if not following_content:
+                    continue
+                if following_content.startswith('"'):
+                    has_comma = True
+                break
+
+        repaired_lines.append(
+            match.group("prefix")
+            + json.dumps(raw_value, ensure_ascii=False)
+            + ("," if has_comma else "")
+            + trailing_spacing
+            + newline
+        )
+        changed = True
+
+    return "".join(repaired_lines) if changed else text
+
+
+def parse_concatenated_json_array(text: str) -> List[Any]:
+    decoder = json.JSONDecoder()
+    values: List[Any] = []
+    position = 0
+    while position < len(text):
+        while position < len(text) and (
+            text[position].isspace() or text[position] == ","
+        ):
+            position += 1
+        if position >= len(text):
+            break
+        value, position = decoder.raw_decode(text, position)
+        if isinstance(value, list):
+            values.extend(value)
+        elif isinstance(value, dict):
+            values.append(value)
+        else:
+            raise json.JSONDecodeError(
+                "Concatenated structured response contains a scalar",
+                text,
+                position,
+            )
+    if not values:
+        raise json.JSONDecodeError(
+            "Concatenated structured response is empty",
+            text,
+            0,
+        )
+    return values
+
+
+def parse_json_response(
+    text: str,
+    response_schema: Optional[Dict[str, Any]] = None,
+) -> Any:
     cleaned = strip_llm_noise(text)
     try:
         return json.loads(cleaned)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as initial_error:
+        expects_array = bool(
+            response_schema
+            and response_schema.get("type") == "array"
+        )
+        if expects_array:
+            try:
+                parsed = parse_concatenated_json_array(cleaned)
+                print("Repaired concatenated structured LLM JSON values.")
+                return parsed
+            except json.JSONDecodeError:
+                pass
+        if response_schema is not None:
+            repaired = repair_unquoted_schema_strings(cleaned, response_schema)
+            if repaired != cleaned:
+                try:
+                    parsed = json.loads(repaired)
+                    print("Repaired unquoted string values in structured LLM JSON.")
+                    return parsed
+                except json.JSONDecodeError:
+                    if expects_array:
+                        try:
+                            parsed = parse_concatenated_json_array(repaired)
+                            print(
+                                "Repaired unquoted and concatenated "
+                                "structured LLM JSON values."
+                            )
+                            return parsed
+                        except json.JSONDecodeError:
+                            pass
         start_candidates = [pos for pos in (cleaned.find("["), cleaned.find("{")) if pos >= 0]
         if not start_candidates:
-            raise
+            raise initial_error
         start = min(start_candidates)
         end = max(cleaned.rfind("]"), cleaned.rfind("}"))
         if end <= start:
-            raise
-        return json.loads(cleaned[start : end + 1])
+            raise initial_error
+        candidate = cleaned[start : end + 1]
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            if response_schema is None:
+                raise
+            repaired = repair_unquoted_schema_strings(candidate, response_schema)
+            if repaired == candidate:
+                raise
+            parsed = json.loads(repaired)
+            print("Repaired unquoted string values in structured LLM JSON.")
+            return parsed
 
 
 def validate_indexed_batch_response(
@@ -639,6 +845,53 @@ def validate_indexed_batch_response(
     return lookup
 
 
+def normalize_final_qa_batch_response(
+    data: Any,
+    batch: List[Segment],
+) -> Any:
+    if not isinstance(data, list):
+        return data
+    normalized: List[Any] = []
+    for item in data:
+        if not isinstance(item, dict):
+            normalized.append(item)
+            continue
+        output = dict(item)
+        if "index" not in output and "local_index" in output:
+            output["index"] = output["local_index"]
+        try:
+            index = int(output["index"])
+        except (KeyError, TypeError, ValueError):
+            index = -1
+        aliases = {
+            "corrected_english": (
+                "correctedEnglish",
+                "corrected_source",
+                "source",
+                "english",
+                "en",
+            ),
+            "corrected_chinese": (
+                "correctedChinese",
+                "chinese",
+                "zh",
+            ),
+        }
+        for field, field_aliases in aliases.items():
+            if isinstance(output.get(field), str):
+                continue
+            for alias in field_aliases:
+                value = output.get(alias)
+                if isinstance(value, str):
+                    output[field] = value
+                    break
+        if "display" not in output and 0 <= index < len(batch):
+            output["display"] = batch[index].get("display", True) is not False
+        output.setdefault("terminology", [])
+        normalized.append(output)
+    return normalized
+
+
 def parse_movie_name(filename: str, llm_model: str) -> Tuple[str, str]:
     system_prompt = "You extract clean movie and series names from release filenames."
     prompt = f"""
@@ -649,14 +902,16 @@ Given the filename "{filename}", extract:
 Return ONLY a valid JSON object with keys "series_name" and "movie_name".
 """
     try:
+        response_schema = movie_name_schema()
         data = parse_json_response(
             call_llm(
                 prompt,
                 system_prompt,
                 llm_model,
                 role="metadata",
-                response_schema=movie_name_schema(),
-            )
+                response_schema=response_schema,
+            ),
+            response_schema=response_schema,
         )
         return data.get("series_name", "Unknown"), data.get("movie_name", "Unknown")
     except Exception as exc:
@@ -681,6 +936,14 @@ CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 EAST_ASIAN_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]")
 JAPANESE_SCRIPT_RE = re.compile(r"[\u3040-\u30ff]")
 KOREAN_SCRIPT_RE = re.compile(r"[\uac00-\ud7af]")
+SUBTITLE_TRACK_LABEL_RE = re.compile(
+    r"^\s*[\(\[\{\uFF08\u3010]?\s*"
+    r"(?:english|eng|chinese|chi|zho|mandarin|cantonese)"
+    r"\s*(?:[-:\u2013\u2014\uFF1A]\s*)?"
+    r"(?:sdh|cc|closed\s+captions?|subtitles?|captions?)"
+    r"\s*[\)\]\}\uFF09\u3011]?\s*$",
+    re.IGNORECASE,
+)
 
 
 def contains_cjk(text: str) -> bool:
@@ -2728,6 +2991,9 @@ def guard_model_hidden_segment_at(
     index: int,
 ) -> None:
     segment = processed_segments[index]
+    if segment.get("display_suppression"):
+        segment["display"] = False
+        return
     model_requested_hidden = segment.get("model_display_requested") is False
     if not model_requested_hidden and segment.get("display", True) is False:
         model_requested_hidden = not bool(segment.get("display_suppression"))
@@ -2767,6 +3033,41 @@ def guard_model_hidden_segments(
     for index in range(len(guarded)):
         guard_model_hidden_segment_at(source_segments, guarded, index)
     return guarded
+
+
+def is_subtitle_track_label_artifact(segment: Segment) -> bool:
+    for field in ("text", "en"):
+        value = normalize_space(str(segment.get(field) or ""))
+        if value and SUBTITLE_TRACK_LABEL_RE.fullmatch(value):
+            return True
+    return False
+
+
+def suppress_subtitle_track_label_artifacts(
+    segments: List[Segment],
+) -> Tuple[List[Segment], List[Dict[str, Any]]]:
+    normalized: List[Segment] = []
+    suppressed: List[Dict[str, Any]] = []
+    for segment in segments:
+        item = dict(segment)
+        if is_subtitle_track_label_artifact(item):
+            item.update(
+                {
+                    "display": False,
+                    "display_suppression": "subtitle_track_label_artifact",
+                    "display_guard": "accepted_hidden",
+                    "display_guard_reason": "subtitle_track_label_artifact",
+                }
+            )
+            suppressed.append(
+                {
+                    "id": item.get("id"),
+                    "start": item.get("start"),
+                    "text": str(item.get("text") or item.get("en") or ""),
+                }
+            )
+        normalized.append(item)
+    return normalized, suppressed
 
 
 def guarded_display_candidate(
@@ -2813,6 +3114,7 @@ def first_guarded_language_repair_index(
                 corrected,
                 translated,
                 require_corrected=bool(original_en),
+                original_translation=original_zh,
             )
         else:
             corrected = clean_subtitle_text(
@@ -3265,6 +3567,478 @@ def terminology_from_segments(
     return glossary
 
 
+def terminology_review_candidates(
+    segments: List[Segment],
+    seeded_entries: Any = None,
+) -> List[Dict[str, Any]]:
+    glossary: Dict[str, Dict[str, str]] = {}
+    for segment in segments:
+        register_terminology(glossary, segment.get("terminology"))
+    register_terminology(glossary, seeded_entries)
+
+    candidates: List[Dict[str, Any]] = []
+    for entry in sorted(
+        glossary.values(),
+        key=lambda item: item["source"].casefold(),
+    ):
+        contexts: List[Dict[str, Any]] = []
+        for segment in segments:
+            source, chinese = original_en_zh(segment)
+            if not source_contains_term(source, entry["source"]):
+                continue
+            contexts.append(
+                {
+                    "id": segment.get("id"),
+                    "source": source,
+                    "chinese": chinese,
+                    "ocr_confidence": segment.get("ocr_confidence"),
+                }
+            )
+            if len(contexts) == 3:
+                break
+        candidates.append({**entry, "contexts": contexts})
+    return candidates
+
+
+def terminology_review_fingerprint(
+    candidates: List[Dict[str, Any]],
+    llm_model: str,
+    title: str,
+    review_mode: str,
+) -> str:
+    serialized = json.dumps(
+        {
+            "version": TERMINOLOGY_REVIEW_POLICY_VERSION,
+            "llm_model": llm_model,
+            "title": normalize_space(title),
+            "review_mode": review_mode,
+            "candidates": candidates,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def terminology_mapping_fingerprint(
+    candidates: List[Dict[str, Any]],
+    llm_model: str,
+    title: str,
+    review_mode: str,
+) -> str:
+    serialized = json.dumps(
+        {
+            "version": TERMINOLOGY_REVIEW_POLICY_VERSION,
+            "llm_model": llm_model,
+            "title": normalize_space(title),
+            "review_mode": review_mode,
+            "mappings": [
+                {
+                    "source": candidate["source"],
+                    "target": candidate["target"],
+                }
+                for candidate in candidates
+            ],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def is_plausible_ocr_terminology_repair(
+    source: str,
+    original_target: str,
+    proposed_target: str,
+) -> bool:
+    source_text = normalize_space(source).casefold()
+    original = normalize_space(original_target).casefold()
+    proposed = normalize_space(proposed_target).casefold()
+    if not original or not proposed or original == proposed:
+        return False
+    if proposed == source_text:
+        return True
+    if abs(len(original) - len(proposed)) > 1:
+        return False
+    if len(original) == len(proposed):
+        return sum(
+            left != right
+            for left, right in zip(original, proposed)
+        ) == 1
+
+    shorter, longer = (
+        (original, proposed)
+        if len(original) < len(proposed)
+        else (proposed, original)
+    )
+    short_index = 0
+    long_index = 0
+    differences = 0
+    while short_index < len(shorter) and long_index < len(longer):
+        if shorter[short_index] == longer[long_index]:
+            short_index += 1
+            long_index += 1
+            continue
+        differences += 1
+        long_index += 1
+        if differences > 1:
+            return False
+    return True
+
+
+def validate_terminology_review_response(
+    data: Any,
+    expected_count: int,
+) -> Dict[int, Dict[str, Any]]:
+    if not isinstance(data, list) or len(data) != expected_count:
+        raise ValueError(
+            "Terminology review response must contain exactly "
+            f"{expected_count} items"
+        )
+    lookup: Dict[int, Dict[str, Any]] = {}
+    for position, raw in enumerate(data):
+        if not isinstance(raw, dict):
+            raise ValueError(
+                f"Terminology review item {position} is not an object"
+            )
+        item = dict(raw)
+        if "index" not in item and "local_index" in item:
+            item["index"] = item["local_index"]
+        try:
+            index = int(item["index"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Terminology review item {position} has no valid index"
+            ) from exc
+        target = item.get("target")
+        raw_confidence = item.get("confidence")
+        decision = item.get("decision")
+        if not isinstance(target, str) or not normalize_space(target):
+            raise ValueError(
+                f"Terminology review item {position} has no target"
+            )
+        if isinstance(raw_confidence, str):
+            confidence = {
+                "high": 1.0,
+                "medium": 0.6,
+                "low": 0.3,
+            }.get(raw_confidence.casefold(), -1.0)
+        else:
+            try:
+                confidence = float(raw_confidence)
+            except (TypeError, ValueError):
+                confidence = -1.0
+        if not 0 <= confidence <= 1:
+            raise ValueError(
+                f"Terminology review item {position} has invalid confidence"
+            )
+        if decision not in {"keep", "ocr_repair", "retranslate"}:
+            raise ValueError(
+                f"Terminology review item {position} has invalid decision"
+            )
+        if index in lookup:
+            raise ValueError(
+                f"Terminology review response repeats index {index}"
+            )
+        item["confidence"] = confidence
+        lookup[index] = item
+    expected_indexes = set(range(expected_count))
+    if set(lookup) != expected_indexes:
+        raise ValueError(
+            "Terminology review response is missing indexes: "
+            f"{sorted(expected_indexes - set(lookup))}"
+        )
+    return lookup
+
+
+def review_movie_terminology(
+    segments: List[Segment],
+    llm_model: str,
+    artifact_path: Path,
+    *,
+    title: str = "",
+    seeded_entries: Any = None,
+    batch_size: int = 16,
+) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
+    candidates = terminology_review_candidates(segments, seeded_entries)
+    preserve_existing_edition = any(
+        str(segment.get("processing_mode") or "")
+        == "proofread_existing_chinese"
+        for segment in segments
+    )
+    review_mode = (
+        "preserve_existing_edition"
+        if preserve_existing_edition
+        else "review_generated_translation"
+    )
+    input_fingerprint = terminology_review_fingerprint(
+        candidates,
+        llm_model,
+        title,
+        review_mode,
+    )
+    mapping_fingerprint = terminology_mapping_fingerprint(
+        candidates,
+        llm_model,
+        title,
+        review_mode,
+    )
+    if not candidates:
+        report = {
+            "version": TERMINOLOGY_REVIEW_POLICY_VERSION,
+            "status": "skipped_empty",
+            "llm_model": llm_model,
+            "input_fingerprint": input_fingerprint,
+            "mapping_fingerprint": mapping_fingerprint,
+            "review_mode": review_mode,
+            "reviewed_count": 0,
+            "correction_count": 0,
+            "unapplied_count": 0,
+            "entries": [],
+            "resolved_entries": [],
+        }
+        write_json_atomic(artifact_path, report)
+        return [], report
+
+    cached: Optional[Dict[str, Any]] = None
+    if artifact_path.exists():
+        try:
+            raw = json.loads(artifact_path.read_text(encoding="utf-8"))
+            if (
+                isinstance(raw, dict)
+                and raw.get("version") == TERMINOLOGY_REVIEW_POLICY_VERSION
+                and raw.get("llm_model") == llm_model
+                and (
+                    raw.get("input_fingerprint") == input_fingerprint
+                    or raw.get("mapping_fingerprint") == mapping_fingerprint
+                )
+            ):
+                cached = raw
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+    if (
+        cached
+        and cached.get("status") in {"pass", "review"}
+        and isinstance(cached.get("resolved_entries"), list)
+    ):
+        if cached.get("mapping_fingerprint") != mapping_fingerprint:
+            cached = {
+                **cached,
+                "mapping_fingerprint": mapping_fingerprint,
+            }
+            write_json_atomic(artifact_path, cached)
+        print(f"Using cached movie-wide terminology review: {artifact_path}")
+        return [
+            dict(entry)
+            for entry in cached["resolved_entries"]
+            if isinstance(entry, dict)
+        ], cached
+
+    reviewed: List[Dict[str, Any]] = []
+    if (
+        cached
+        and cached.get("status") == "running"
+        and isinstance(cached.get("entries"), list)
+    ):
+        reviewed = [
+            dict(entry)
+            for entry in cached["entries"]
+            if isinstance(entry, dict)
+        ]
+        if len(reviewed) > len(candidates):
+            reviewed = []
+        elif reviewed:
+            print(f"Resuming terminology review at item {len(reviewed) + 1}.")
+
+    effective_batch_size = max(1, batch_size)
+    start_index = len(reviewed)
+    start_index -= start_index % effective_batch_size
+    reviewed = reviewed[:start_index]
+    for batch_start in range(
+        start_index,
+        len(candidates),
+        effective_batch_size,
+    ):
+        batch = candidates[batch_start : batch_start + effective_batch_size]
+        item_text = "\n\n".join(
+            (
+                f"ITEM {index}\n"
+                f"SOURCE TERM: {candidate['source']}\n"
+                f"CURRENT CHINESE TARGET: {candidate['target']}\n"
+                "CONTEXTS:\n"
+                + (
+                    "\n".join(
+                        "- SOURCE: "
+                        f"{context['source']}\n"
+                        f"  CHINESE OCR/SUBTITLE: {context['chinese']}\n"
+                        f"  OCR CONFIDENCE: {context.get('ocr_confidence')}"
+                        for context in candidate["contexts"]
+                    )
+                    or "- (no direct context retained)"
+                )
+            )
+            for index, candidate in enumerate(batch)
+        )
+        prompt = f"""
+Review the terminology mappings for the film "{title or '(unknown title)'}".
+{
+    "The Chinese track is an existing professional subtitle edition. Preserve "
+    "its wording and regional name choices; only OCR repairs may be applied."
+    if preserve_existing_edition
+    else
+    "The Chinese track is generated or provisional. High-confidence terminology "
+    "corrections and retranslations may be applied."
+}
+Some text may have come through bitmap OCR, so individual look-alike characters
+or Latin handles can be misrecognized.
+
+{item_text}
+
+Return exactly {len(batch)} JSON objects using the provided schema.
+- index is the zero-based ITEM number in this batch.
+- target is the best concise Simplified Chinese rendering.
+- confidence is a number from 0.0 to 1.0. Use at least 0.9 only when the
+  classification and target are both clear.
+- decision must be "keep", "ocr_repair", or "retranslate".
+- Use "ocr_repair" only when preserving the same edition wording while correcting
+  recognition damage such as a look-alike character, missing stroke, or corrupted
+  Latin identifier.
+- Use "retranslate" for any different localization, synonym, transliteration,
+  Mainland/Taiwan terminology swap, or preferred spelling. Retranslations will not
+  be applied, even at high confidence.
+- Keep valid edition choices such as regional transliterations and vocabulary.
+- For a stylized avatar handle, recover the edition's existing spelling or localized
+  pun; do not invent a new transliteration.
+- If a repeated CJK target appears to be a one-character OCR corruption of a
+  localized handle or pun, repair that CJK target instead of falling back to the
+  Latin source spelling.
+- Do not output explanations or extra keys.
+"""
+        response_schema = indexed_terminology_schema(len(batch))
+        lookup: Optional[Dict[int, Dict[str, Any]]] = None
+        for attempt in range(3):
+            try:
+                data = parse_json_response(
+                    call_llm(
+                        prompt,
+                        (
+                            "You are the senior terminology editor for a "
+                            "professional Simplified Chinese film subtitle."
+                        ),
+                        llm_model,
+                        role="proofread",
+                        response_schema=response_schema,
+                        seed_offset=attempt,
+                    ),
+                    response_schema=response_schema,
+                )
+                lookup = validate_terminology_review_response(
+                    data,
+                    len(batch),
+                )
+                break
+            except Exception as exc:
+                print(
+                    "Terminology review batch "
+                    f"{batch_start + 1}-{batch_start + len(batch)} failed "
+                    f"(attempt {attempt + 1}/3): {exc}"
+                )
+                if attempt < 2:
+                    time.sleep(2)
+                else:
+                    raise
+        if lookup is None:
+            raise RuntimeError(
+                "Terminology review did not produce a complete batch"
+            )
+
+        for local_index, candidate in enumerate(batch):
+            item = lookup[local_index]
+            original_target = to_simplified_text(candidate["target"])
+            proposed_target = to_simplified_text(
+                clean_subtitle_text(item["target"])
+            )
+            confidence = float(item["confidence"])
+            decision = str(item["decision"])
+            proposed_changed = (
+                normalize_space(proposed_target).casefold()
+                != normalize_space(original_target).casefold()
+            )
+            plausible_ocr_repair = is_plausible_ocr_terminology_repair(
+                candidate["source"],
+                original_target,
+                proposed_target,
+            )
+            applied = bool(
+                proposed_changed
+                and confidence >= 0.9
+                and (
+                    (
+                        decision == "ocr_repair"
+                        and (
+                            not preserve_existing_edition
+                            or plausible_ocr_repair
+                        )
+                    )
+                    or (
+                        not preserve_existing_edition
+                        and decision == "retranslate"
+                    )
+                )
+                and proposed_target
+            )
+            reviewed.append(
+                {
+                    "source": candidate["source"],
+                    "original_target": original_target,
+                    "proposed_target": proposed_target,
+                    "target": proposed_target if applied else original_target,
+                    "confidence": confidence,
+                    "decision": decision,
+                    "plausible_ocr_repair": plausible_ocr_repair,
+                    "changed": applied,
+                    "unapplied": proposed_changed and not applied,
+                }
+            )
+        write_json_atomic(
+            artifact_path,
+            {
+                "version": TERMINOLOGY_REVIEW_POLICY_VERSION,
+                "status": "running",
+                "llm_model": llm_model,
+                "input_fingerprint": input_fingerprint,
+                "mapping_fingerprint": mapping_fingerprint,
+                "review_mode": review_mode,
+                "reviewed_count": len(reviewed),
+                "entries": reviewed,
+            },
+        )
+
+    resolved_entries = [
+        {"source": entry["source"], "target": entry["target"]}
+        for entry in reviewed
+    ]
+    correction_count = sum(bool(entry.get("changed")) for entry in reviewed)
+    unapplied_count = sum(bool(entry.get("unapplied")) for entry in reviewed)
+    report = {
+        "version": TERMINOLOGY_REVIEW_POLICY_VERSION,
+        "status": "review" if unapplied_count else "pass",
+        "llm_model": llm_model,
+        "input_fingerprint": input_fingerprint,
+        "mapping_fingerprint": mapping_fingerprint,
+        "review_mode": review_mode,
+        "reviewed_count": len(reviewed),
+        "correction_count": correction_count,
+        "unapplied_count": unapplied_count,
+        "entries": reviewed,
+        "resolved_entries": resolved_entries,
+    }
+    write_json_atomic(artifact_path, report)
+    return resolved_entries, report
+
+
 def register_terminology(
     glossary: Dict[str, Dict[str, str]],
     entries: Any,
@@ -3288,6 +4062,58 @@ def register_terminology(
     return accepted
 
 
+def load_terminology_overrides(path: Path) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    entries = raw.get("entries") if isinstance(raw, dict) else raw
+    if not isinstance(entries, list):
+        raise ValueError("terminology overrides must contain an entries list")
+    overrides: List[Dict[str, Any]] = []
+    for raw_entry in entries:
+        if not isinstance(raw_entry, dict):
+            continue
+        source = normalize_space(str(raw_entry.get("source") or ""))
+        if not source:
+            continue
+        if raw_entry.get("remove") is True:
+            overrides.append({"source": source, "remove": True})
+            continue
+        target = to_simplified_text(
+            normalize_space(str(raw_entry.get("target") or ""))
+        )
+        if target:
+            overrides.append({"source": source, "target": target})
+    return overrides
+
+
+def apply_terminology_overrides(
+    entries: Any,
+    overrides: Any,
+) -> List[Dict[str, str]]:
+    glossary: Dict[str, Dict[str, str]] = {}
+    register_terminology(glossary, entries)
+    if not isinstance(overrides, list):
+        return list(glossary.values())
+    for raw in overrides:
+        if not isinstance(raw, dict):
+            continue
+        source = normalize_space(str(raw.get("source") or ""))
+        if source and raw.get("remove") is True:
+            glossary.pop(source.casefold(), None)
+            continue
+        target = to_simplified_text(
+            normalize_space(str(raw.get("target") or ""))
+        )
+        if not source or not target:
+            continue
+        glossary[source.casefold()] = {
+            "source": source,
+            "target": target,
+        }
+    return [dict(entry) for entry in glossary.values()]
+
+
 def source_contains_term(source_text: str, source_term: str) -> bool:
     source = normalize_space(source_term)
     if not source:
@@ -3307,6 +4133,22 @@ def applicable_terminology_entries(
         for entry in entries
         if source_contains_term(source_text, str(entry.get("source") or ""))
     ]
+
+
+def approved_terminology_entries(
+    glossary: Dict[str, Dict[str, str]],
+    proposed_entries: List[Dict[str, str]],
+) -> List[Dict[str, str]]:
+    approved: List[Dict[str, str]] = []
+    approved_keys: set[str] = set()
+    for entry in proposed_entries:
+        key = normalize_space(str(entry.get("source") or "")).casefold()
+        resolved = glossary.get(key)
+        if not key or resolved is None or key in approved_keys:
+            continue
+        approved.append(dict(resolved))
+        approved_keys.add(key)
+    return approved
 
 
 def format_terminology_glossary(
@@ -3357,6 +4199,103 @@ def terminology_conflicts(
         if source_contains_term(source_text, source) and target.casefold() not in target_folded:
             conflicts.append(dict(entry))
     return conflicts
+
+
+SPEAKER_LABEL_RE = re.compile(
+    r"^\s*[-\u2013\u2014]?\s*(?P<label>[A-Za-z][A-Za-z0-9 .'\-]{0,48}):"
+)
+CJK_SPEAKER_LABEL_RE = re.compile(
+    r"^\s*[-\u2013\u2014]?\s*[^:：\n]{1,24}[：:]"
+)
+SUBTITLE_CUE_RE = re.compile(
+    r"\([^()\n]{1,96}\)|\[[^\[\]\n]{1,96}\]|"
+    r"（[^（）\n]{1,96}）|【[^【】\n]{1,96}】"
+)
+OUTER_QUOTE_PAIRS = (
+    ('"', '"'),
+    ("'", "'"),
+    ("\u201c", "\u201d"),
+    ("\u2018", "\u2019"),
+    ("\u300c", "\u300d"),
+    ("\u300e", "\u300f"),
+)
+
+
+def restore_glossary_speaker_label(
+    source_text: str,
+    target_text: str,
+    glossary: Dict[str, Dict[str, str]],
+) -> str:
+    target = normalize_space(target_text)
+    match = SPEAKER_LABEL_RE.match(normalize_space(source_text))
+    if not target or not match or not glossary:
+        return target
+
+    speaker_label = match.group("label")
+    mappings = [
+        entry
+        for entry in glossary.values()
+        if source_contains_term(speaker_label, entry["source"])
+    ]
+    missing_targets = [
+        normalize_space(entry["target"])
+        for entry in mappings
+        if normalize_space(entry["target"])
+        and normalize_space(entry["target"]).casefold() not in target.casefold()
+    ]
+    if not missing_targets:
+        return target
+    speaker_prefix = "\u3001".join(missing_targets)
+    return f"{speaker_prefix}\uff1a{target}"
+
+
+def has_subtitle_speaker_label(text: str) -> bool:
+    normalized = normalize_space(text)
+    return bool(
+        SPEAKER_LABEL_RE.match(normalized)
+        or CJK_SPEAKER_LABEL_RE.match(normalized)
+    )
+
+
+def strip_added_outer_quotes(original: str, proposed: str) -> str:
+    original_text = normalize_space(original)
+    proposed_text = normalize_space(proposed)
+    for opening, closing in OUTER_QUOTE_PAIRS:
+        original_wrapped = (
+            len(original_text) >= len(opening) + len(closing)
+            and original_text.startswith(opening)
+            and original_text.endswith(closing)
+        )
+        proposed_wrapped = (
+            len(proposed_text) >= len(opening) + len(closing)
+            and proposed_text.startswith(opening)
+            and proposed_text.endswith(closing)
+        )
+        if proposed_wrapped and not original_wrapped:
+            return normalize_space(
+                proposed_text[len(opening) : len(proposed_text) - len(closing)]
+            )
+    return proposed_text
+
+
+def preserve_final_qa_track_structure(original: str, proposed: str) -> str:
+    original_text = clean_subtitle_text(original)
+    proposed_text = strip_added_outer_quotes(
+        original_text,
+        clean_subtitle_text(proposed),
+    )
+    if not original_text:
+        return proposed_text
+    if (
+        has_subtitle_speaker_label(original_text)
+        and not has_subtitle_speaker_label(proposed_text)
+    ):
+        return original_text
+    if len(SUBTITLE_CUE_RE.findall(proposed_text)) < len(
+        SUBTITLE_CUE_RE.findall(original_text)
+    ):
+        return original_text
+    return proposed_text
 
 
 def write_terminology_artifact(
@@ -3519,6 +4458,7 @@ Required decisions:
 
 Do not edit individual subtitle lines. Do not add markdown or explanations.
 """
+    response_schema = movie_style_schema()
     raw = parse_json_response(
         call_llm(
             prompt,
@@ -3528,8 +4468,9 @@ Do not edit individual subtitle lines. Do not add markdown or explanations.
             ),
             llm_model,
             role="proofread",
-            response_schema=movie_style_schema(),
-        )
+            response_schema=response_schema,
+        ),
+        response_schema=response_schema,
     )
     if not isinstance(raw, dict):
         raise ValueError("Movie-wide style analysis did not return a JSON object")
@@ -3622,6 +4563,7 @@ def is_language_valid(
     corrected: str,
     translated: str,
     require_corrected: bool = True,
+    original_translation: str = "",
 ) -> bool:
     if require_corrected and not normalize_space(corrected):
         return False
@@ -3638,7 +4580,24 @@ def is_language_valid(
         
     # 中文不是中文：译文无中文字符，但包含多个字母（说明可能是生硬复制了外文句子或根本没翻译）
     if not trans_has_cjk and any(character.isalpha() for character in translated):
-        return False
+        original_token = "".join(
+            character.casefold()
+            for character in normalize_space(original_translation)
+            if character.isalnum()
+        )
+        translated_token = "".join(
+            character.casefold()
+            for character in normalize_space(translated)
+            if character.isalnum()
+        )
+        preserved_existing_token = (
+            bool(original_token)
+            and original_token == translated_token
+            and len(original_token) <= 12
+            and source_contains_term(original_text, original_token)
+        )
+        if not preserved_existing_token:
+            return False
         
     return True
 
@@ -3655,6 +4614,7 @@ def retry_single_segment_llm(
     language_label: str,
     is_proofread: bool = False,
     terminology_text: str = "(none yet)",
+    terminology_glossary: Optional[Dict[str, Dict[str, str]]] = None,
     require_display: bool = False,
 ) -> Dict[str, Any]:
     print(
@@ -3785,18 +4745,54 @@ Rules:
 - Reuse every applicable APPROVED MOVIE-WIDE TERMINOLOGY mapping exactly.
 - In terminology, return only personal names or recurring terms that occur in this target line. Use an empty list when there are none.
 """
-    
+    if is_proofread:
+        original_source, original_chinese = original_en_zh(segment)
+        terminology_source = original_source or original_chinese
+    else:
+        terminology_source = str(segment.get("text") or "")
+    required_terminology = applicable_terminology_entries(
+        list((terminology_glossary or {}).values()),
+        terminology_source,
+    )
+    if required_terminology:
+        required_terminology_text = "\n".join(
+            f"- {entry['source']} => {entry['target']}"
+            for entry in required_terminology
+        )
+        prompt += f"""
+
+=== REQUIRED TERMINOLOGY FOR THIS TARGET ===
+{required_terminology_text}
+
+Every exact target string above must appear in the Chinese output. Do not shorten
+a full name to only a surname. These required names take precedence over the
+soft character target when both cannot be satisfied.
+"""
+    response_role = "proofread" if is_proofread else "translation"
+    response_schema = indexed_subtitle_schema(1, response_role)
+    validation_feedback = ""
     for attempt in range(10):
         try:
-            response_role = "proofread" if is_proofread else "translation"
+            attempt_prompt = prompt
+            if validation_feedback:
+                attempt_prompt += f"""
+
+=== AUTOMATIC VALIDATION FEEDBACK ===
+{validation_feedback}
+
+Correct the listed defect in this attempt. Return the complete subtitle object,
+not an explanation.
+"""
             data = parse_json_response(
                 call_llm(
-                    prompt,
+                    attempt_prompt,
                     system_prompt,
                     llm_model,
                     role=response_role,
-                    response_schema=indexed_subtitle_schema(1, response_role),
-                )
+                    response_schema=response_schema,
+                    seed_offset=attempt,
+                ),
+                response_schema=response_schema,
             )
             lookup = validate_indexed_batch_response(
                 data,
@@ -3811,6 +4807,10 @@ Rules:
                             f"Single-item retry {attempt + 1} still requested "
                             "hiding a unique subtitle; retrying."
                         )
+                        validation_feedback = (
+                            'The previous output set "display" to false. This '
+                            'unique subtitle must use "display": true.'
+                        )
                         continue
                     return item
                 if is_proofread:
@@ -3823,36 +4823,102 @@ Rules:
                         else ""
                     )
                     translated = str(item.get("corrected_chinese") or item.get("chinese_translation") or "")
-                    if source_language_preserved(
+                    translated = restore_glossary_speaker_label(
+                        corrected or orig_en,
+                        translated,
+                        terminology_glossary or {},
+                    )
+                    item["corrected_chinese"] = translated
+                    proposed_terminology = applicable_terminology_entries(
+                        extract_terminology_entries(item),
+                        corrected or orig_en or orig_zh,
+                    )
+                    language_preserved = source_language_preserved(
                         segment,
                         orig_en,
                         corrected,
-                    ) and is_language_valid(
+                    )
+                    language_valid = is_language_valid(
                         orig_en or orig_zh,
                         corrected,
                         translated,
                         require_corrected=bool(orig_en),
-                    ):
+                        original_translation=orig_zh,
+                    )
+                    conflicts = terminology_conflicts(
+                        terminology_glossary or {},
+                        corrected or orig_en or orig_zh,
+                        translated,
+                        proposed_terminology,
+                    )
+                    if language_preserved and language_valid and not conflicts:
                         return item
                 else:
                     corrected = str(item.get("corrected_text") or item.get("corrected_source") or segment.get("text", ""))
                     translated = str(item.get("chinese_translation") or "")
-                    if source_language_preserved(
+                    translated = restore_glossary_speaker_label(
+                        corrected,
+                        translated,
+                        terminology_glossary or {},
+                    )
+                    item["chinese_translation"] = translated
+                    proposed_terminology = applicable_terminology_entries(
+                        extract_terminology_entries(item),
+                        corrected,
+                    )
+                    language_preserved = source_language_preserved(
                         segment,
                         str(segment.get("text") or ""),
                         corrected,
-                    ) and is_language_valid(
+                    )
+                    language_valid = is_language_valid(
                         str(segment.get("text") or ""),
                         corrected,
                         translated,
-                    ):
+                    )
+                    conflicts = terminology_conflicts(
+                        terminology_glossary or {},
+                        corrected,
+                        translated,
+                        proposed_terminology,
+                    )
+                    if language_preserved and language_valid and not conflicts:
                         return item
+                feedback: List[str] = []
+                if not language_preserved:
+                    feedback.append(
+                        "The source-language text changed language or script; "
+                        "keep it in the original language."
+                    )
+                if not language_valid:
+                    feedback.append(
+                        "The Chinese output or source-language output failed "
+                        "language validation; return both complete tracks."
+                    )
+                if conflicts:
+                    missing = ", ".join(
+                        f"{entry['source']} => {entry['target']}"
+                        for entry in conflicts
+                    )
+                    print(
+                        f"Single-item retry {attempt + 1} omitted required "
+                        f"terminology: {missing}"
+                    )
+                    feedback.append(
+                        "The Chinese output omitted these required exact "
+                        f"mappings: {missing}."
+                    )
+                validation_feedback = "\n".join(feedback)
             print(
                 f"Single-item retry {attempt + 1} still failed language "
                 "validation; retrying."
             )
         except Exception as exc:
             print(f"Single-item retry request failed: {ascii(str(exc))}")
+            validation_feedback = (
+                "The previous response was not valid against the required JSON "
+                "schema. Return only one complete raw JSON object in the list."
+            )
     
     print(
         "All 10 single-item retries failed; stopping the current batch "
@@ -4027,6 +5093,10 @@ Rules:
 
         try:
             lookup: Optional[Dict[int, Dict[str, Any]]] = None
+            response_schema = indexed_subtitle_schema(
+                len(batch),
+                "translation",
+            )
             for attempt in range(3):
                 try:
                     data = parse_json_response(
@@ -4035,11 +5105,10 @@ Rules:
                             system_prompt,
                             llm_model,
                             role="translation",
-                            response_schema=indexed_subtitle_schema(
-                                len(batch),
-                                "translation",
-                            ),
-                        )
+                            response_schema=response_schema,
+                            seed_offset=attempt,
+                        ),
+                        response_schema=response_schema,
                     )
                     lookup = validate_indexed_batch_response(
                         data,
@@ -4075,7 +5144,11 @@ Rules:
                     corrected_val,
                 )
                 translated_val = str(item.get("chinese_translation") or "")
-                translated = clean_subtitle_text(translated_val)
+                translated = restore_glossary_speaker_label(
+                    corrected,
+                    clean_subtitle_text(translated_val),
+                    glossary,
+                )
                 candidate_metadata = {
                     **segment,
                     "en": corrected,
@@ -4137,6 +5210,7 @@ Rules:
                         language_label,
                         is_proofread=False,
                         terminology_text=format_terminology_glossary(glossary, corrected),
+                        terminology_glossary=glossary,
                         require_display=forced_model_hide,
                     )
                     if not retry_item:
@@ -4154,7 +5228,11 @@ Rules:
                         corrected_val,
                     )
                     translated_val = str(item.get("chinese_translation") or "")
-                    translated = clean_subtitle_text(translated_val)
+                    translated = restore_glossary_speaker_label(
+                        corrected,
+                        clean_subtitle_text(translated_val),
+                        glossary,
+                    )
                     candidate_metadata.update(
                         {
                             "en": corrected,
@@ -4414,6 +5492,10 @@ Rules:
 
         try:
             lookup: Optional[Dict[int, Dict[str, Any]]] = None
+            response_schema = indexed_subtitle_schema(
+                len(batch),
+                "proofread",
+            )
             for attempt in range(3):
                 try:
                     data = parse_json_response(
@@ -4422,11 +5504,10 @@ Rules:
                             system_prompt,
                             llm_model,
                             role="proofread",
-                            response_schema=indexed_subtitle_schema(
-                                len(batch),
-                                "proofread",
-                            ),
-                        )
+                            response_schema=response_schema,
+                            seed_offset=attempt,
+                        ),
+                        response_schema=response_schema,
                     )
                     lookup = validate_indexed_batch_response(
                         data,
@@ -4467,7 +5548,11 @@ Rules:
                     or item.get("zh")
                     or original_zh
                 )
-                corrected_zh = to_simplified_text(clean_subtitle_text(corrected_zh_val))
+                corrected_zh = restore_glossary_speaker_label(
+                    corrected_en or original_en,
+                    to_simplified_text(clean_subtitle_text(corrected_zh_val)),
+                    glossary,
+                )
                 candidate_metadata = {
                     **segment,
                     "en": corrected_en,
@@ -4513,6 +5598,7 @@ Rules:
                         corrected_en,
                         corrected_zh,
                         require_corrected=bool(original_en),
+                        original_translation=original_zh,
                     )
                     or conflicts
                 ):
@@ -4538,6 +5624,7 @@ Rules:
                             glossary,
                             terminology_source,
                         ),
+                        terminology_glossary=glossary,
                         require_display=forced_model_hide,
                     )
                     if not retry_item:
@@ -4559,7 +5646,11 @@ Rules:
                         or item.get("zh")
                         or original_zh
                     )
-                    corrected_zh = to_simplified_text(clean_subtitle_text(corrected_zh_val))
+                    corrected_zh = restore_glossary_speaker_label(
+                        corrected_en or original_en,
+                        to_simplified_text(clean_subtitle_text(corrected_zh_val)),
+                        glossary,
+                    )
                     candidate_metadata.update(
                         {
                             "en": corrected_en,
@@ -4605,6 +5696,7 @@ Rules:
                             corrected_en,
                             corrected_zh,
                             require_corrected=bool(original_en),
+                            original_translation=original_zh,
                         )
                         or conflicts
                     ):
@@ -4634,34 +5726,39 @@ Rules:
     return processed_segments
 
 
+def final_qa_segment_fingerprint_row(segment: Segment) -> Dict[str, Any]:
+    return {
+        "id": segment.get("id"),
+        "start": segment.get("start"),
+        "end": segment.get("end"),
+        "en": segment.get("en"),
+        "zh": segment.get("zh"),
+        "display": segment.get("display", True),
+        "source_language": segment.get("source_language"),
+        "source_text_authority": segment.get("source_text_authority"),
+        "chinese_text_authority": segment.get("chinese_text_authority"),
+        "processing_plan_fingerprint": segment.get(
+            "processing_plan_fingerprint"
+        ),
+        "manual_reviewed_at": segment.get("manual_reviewed_at"),
+    }
+
+
 def final_qa_fingerprint(
     segments: List[Segment],
     llm_model: str,
     style_guide: Optional[Dict[str, Any]],
 ) -> str:
-    rows = [
-        {
-            "id": segment.get("id"),
-            "start": segment.get("start"),
-            "end": segment.get("end"),
-            "en": segment.get("en"),
-            "zh": segment.get("zh"),
-            "display": segment.get("display", True),
-            "source_language": segment.get("source_language"),
-            "source_text_authority": segment.get("source_text_authority"),
-            "chinese_text_authority": segment.get("chinese_text_authority"),
-            "processing_plan_fingerprint": segment.get(
-                "processing_plan_fingerprint"
-            ),
-            "manual_reviewed_at": segment.get("manual_reviewed_at"),
-        }
-        for segment in segments
-    ]
+    rows = [final_qa_segment_fingerprint_row(segment) for segment in segments]
     serialized = json.dumps(
         {
             "policy_version": FINAL_QA_POLICY_VERSION,
             "llm_model": llm_model,
             "style_fingerprint": (style_guide or {}).get("input_fingerprint"),
+            "terminology_review_fingerprint": (style_guide or {}).get(
+                "terminology_review_fingerprint"
+            ),
+            "style_terminology": (style_guide or {}).get("terminology") or [],
             "segments": rows,
         },
         ensure_ascii=False,
@@ -4669,6 +5766,39 @@ def final_qa_fingerprint(
         separators=(",", ":"),
     )
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def final_qa_cache_accepts_manual_overrides(
+    cached_segments: Any,
+    segments: List[Segment],
+) -> bool:
+    if not isinstance(cached_segments, list) or len(cached_segments) != len(segments):
+        return False
+    authority_fields = (
+        "id",
+        "source_language",
+        "source_text_authority",
+        "chinese_text_authority",
+        "processing_plan_fingerprint",
+    )
+    manual_override_found = False
+    for cached_segment, segment in zip(cached_segments, segments):
+        if not isinstance(cached_segment, dict) or not isinstance(segment, dict):
+            return False
+        if segment.get("manual_reviewed_at"):
+            manual_override_found = True
+            if any(
+                cached_segment.get(field) != segment.get(field)
+                for field in authority_fields
+            ):
+                return False
+            continue
+        if (
+            final_qa_segment_fingerprint_row(cached_segment)
+            != final_qa_segment_fingerprint_row(segment)
+        ):
+            return False
+    return manual_override_found
 
 
 def run_final_subtitle_qa(
@@ -4706,6 +5836,53 @@ def run_final_subtitle_qa(
     ):
         print(f"Using cached independent final subtitle QA: {artifact_path}")
         return [dict(segment) for segment in cached["segments"]], cached
+    cached_segments = cached.get("segments") if cached else None
+    if (
+        cached
+        and cached.get("status") in {"pass", "review"}
+        and cached.get("llm_model") == llm_model
+        and cached.get("output_fingerprint")
+        == final_qa_fingerprint(cached_segments or [], llm_model, style_guide)
+        and final_qa_cache_accepts_manual_overrides(cached_segments, segments)
+    ):
+        reviewed = [dict(segment) for segment in segments]
+        manual_ids = {
+            segment.get("id")
+            for segment in reviewed
+            if segment.get("manual_reviewed_at")
+        }
+        for segment in reviewed:
+            if segment.get("id") in manual_ids:
+                segment["final_qa_manual_preserved"] = True
+        rejected_items = [
+            dict(item)
+            for item in cached.get("rejected_items") or []
+            if isinstance(item, dict) and item.get("id") not in manual_ids
+        ]
+        report = dict(cached)
+        report.update(
+            {
+                "status": "review" if rejected_items else "pass",
+                "input_fingerprint": input_fingerprint,
+                "output_fingerprint": final_qa_fingerprint(
+                    reviewed,
+                    llm_model,
+                    style_guide,
+                ),
+                "reviewed_count": len(reviewed),
+                "manual_preserved_count": len(manual_ids),
+                "manual_override_count": len(manual_ids),
+                "rejected_count": len(rejected_items),
+                "rejected_items": rejected_items,
+                "segments": reviewed,
+            }
+        )
+        write_json_atomic(artifact_path, report)
+        print(
+            "Applied manually reviewed checkpoint overrides to cached "
+            f"independent final subtitle QA: {artifact_path}"
+        )
+        return reviewed, report
 
     reviewed: List[Segment] = []
     changes: List[Dict[str, Any]] = []
@@ -4786,9 +5963,23 @@ Another editor already translated and proofread them. Do not trust earlier wordi
 {after}
 
 Return exactly {len(batch)} JSON objects using the provided schema.
+Each object must use the key "index" with the zero-based local index. Do not use
+"local_index", and do not return timestamps.
+Schema:
+[
+  {{
+    "index": 0,
+    "corrected_english": "...",
+    "corrected_chinese": "...",
+    "display": true,
+    "terminology": [{{"source": "John", "target": "约翰"}}]
+  }}
+]
 Rules:
 - Preserve every local index, timestamp, and display decision.
 - Correct residual ASR/OCR errors, grammar, mistranslation, inconsistent names, forms of address, and terminology.
+- Never remove an existing speaker label or SDH/music/sound cue from either language track.
+- Never wrap an entire subtitle in quotation marks unless the original line was already wrapped.
 - When SOURCE_AUTHORITY=authored, preserve the source-language text exactly and review only the Chinese lane.
 - Treat recognition confidence as review priority, not proof that text is correct or incorrect.
 - `corrected_english` is a legacy schema field name for the SOURCE track. The source may be English, Japanese, Korean, or another language.
@@ -4799,19 +5990,48 @@ Rules:
 - Keep source/English within 42 characters and Chinese within 16 characters where meaning permits.
 - Never add commentary or keys outside the schema.
 """
-        data = parse_json_response(
-            call_llm(
-                prompt,
-                (
-                    "You are the independent senior subtitle QC editor. "
-                    "Review the completed bilingual deliverable against the movie-wide style guide."
-                ),
-                llm_model,
-                role="proofread",
-                response_schema=indexed_subtitle_schema(len(batch), "proofread"),
+        response_schema = indexed_subtitle_schema(len(batch), "proofread")
+        lookup: Optional[Dict[int, Dict[str, Any]]] = None
+        for attempt in range(3):
+            try:
+                data = parse_json_response(
+                    call_llm(
+                        prompt,
+                        (
+                            "You are the independent senior subtitle QC editor. "
+                            "Review the completed bilingual deliverable against the movie-wide style guide."
+                        ),
+                        llm_model,
+                        role="proofread",
+                        response_schema=response_schema,
+                        seed_offset=attempt,
+                    ),
+                    response_schema=response_schema,
+                )
+                data = normalize_final_qa_batch_response(data, batch)
+                lookup = validate_indexed_batch_response(
+                    data,
+                    len(batch),
+                    "proofread",
+                )
+                break
+            except Exception as exc:
+                print(
+                    "Independent final QA batch "
+                    f"{batch_start + 1}-{batch_start + len(batch)} failed "
+                    f"(attempt {attempt + 1}/3): {exc}"
+                )
+                if attempt < 2:
+                    import time
+
+                    time.sleep(2)
+                else:
+                    raise
+        if lookup is None:
+            raise RuntimeError(
+                "Independent final QA response validation did not produce "
+                "a complete batch"
             )
-        )
-        lookup = validate_indexed_batch_response(data, len(batch), "proofread")
         batch_reviewed: List[Segment] = []
         for local_index, segment in enumerate(batch):
             item = lookup[local_index]
@@ -4826,19 +6046,39 @@ Rules:
                 )
                 continue
             original_source, original_zh = original_en_zh(segment)
-            corrected_source = preserve_authored_source(
-                segment,
-                original_source,
-                str(item.get("corrected_english") or original_source),
+            corrected_source = (
+                preserve_final_qa_track_structure(
+                    original_source,
+                    preserve_authored_source(
+                        segment,
+                        original_source,
+                        str(item.get("corrected_english") or original_source),
+                    ),
+                )
+                if original_source
+                else ""
             )
             corrected_zh = to_simplified_text(
                 clean_subtitle_text(
                     str(item.get("corrected_chinese") or original_zh)
                 )
             )
+            corrected_zh = restore_glossary_speaker_label(
+                corrected_source or original_source,
+                corrected_zh,
+                glossary,
+            )
+            corrected_zh = preserve_final_qa_track_structure(
+                original_zh,
+                corrected_zh,
+            )
             proposed_terminology = applicable_terminology_entries(
                 extract_terminology_entries(item),
                 corrected_source or original_source,
+            )
+            proposed_terminology = approved_terminology_entries(
+                glossary,
+                proposed_terminology,
             )
             conflicts = terminology_conflicts(
                 glossary,
@@ -4856,6 +6096,7 @@ Rules:
                 corrected_source,
                 corrected_zh,
                 require_corrected=bool(original_source),
+                original_translation=original_zh,
             ) and not conflicts
             if not valid:
                 batch_reviewed.append(dict(segment))
@@ -4897,7 +6138,21 @@ Rules:
                         "fields": changed_fields,
                     }
                 )
-            register_terminology(glossary, proposed_terminology)
+            resolved_terminology: List[Dict[str, str]] = []
+            resolved_keys: set[str] = set()
+            for entry in [
+                *(segment.get("terminology") or []),
+                *proposed_terminology,
+            ]:
+                if not isinstance(entry, dict):
+                    continue
+                key = normalize_space(str(entry.get("source") or "")).casefold()
+                resolved = glossary.get(key)
+                if not key or resolved is None or key in resolved_keys:
+                    continue
+                resolved_terminology.append(dict(resolved))
+                resolved_keys.add(key)
+            output["terminology"] = resolved_terminology
             batch_reviewed.append(output)
 
         validate_timing_preserved(batch, batch_reviewed, batch_start)
@@ -5307,6 +6562,10 @@ def main() -> None:
     processing_plan_path = out_dir / f"{movie_name}.processing-plan.json"
     sync_report_path = out_dir / f"{movie_name}.subtitle-sync.report.json"
     terminology_path = out_dir / f"{movie_name}.terminology.json"
+    terminology_review_path = out_dir / f"{movie_name}.terminology-review.json"
+    terminology_overrides_path = (
+        out_dir / f"{movie_name}.terminology-overrides.json"
+    )
     style_guide_path = out_dir / f"{movie_name}.style-guide.json"
     final_qa_path = out_dir / f"{movie_name}.final-qa.json"
     run_state_file = Path(args.run_state_file) if args.run_state_file else None
@@ -5416,7 +6675,7 @@ def main() -> None:
             f"existing_origin={preferred_auto_existing_origin or 'none'}"
         )
     audio_inventory_assets = automatic_assets
-    if args.source != "auto" and args.audio_stream is None and not any(
+    if args.source != "auto" and not any(
         asset.origin == "audio"
         for asset in audio_inventory_assets
     ):
@@ -5532,19 +6791,31 @@ def main() -> None:
         english_sidecar_path=english_sidecar_path,
         processing_plan_fingerprint=automatic_plan_cache_fingerprint,
     )
-    compatible_source_request_fingerprints = {
-        build_source_request_fingerprint(
-            video_path,
-            input_path,
-            args,
-            sidecar_path=sidecar_path,
-            chinese_sidecar_path=chinese_sidecar_path,
-            english_sidecar_path=english_sidecar_path,
-            sync_policy_version=version,
-            processing_plan_fingerprint=automatic_plan_cache_fingerprint,
+    compatible_source_request_fingerprints: set[str] = set()
+    for audio_stream_variant in source_request_audio_stream_variants(
+        args.audio_stream,
+        effective_audio_stream,
+        effective_subtitle_sync_mode,
+        sync_report_path,
+    ):
+        fingerprint_args = argparse.Namespace(**vars(args))
+        fingerprint_args.audio_stream = audio_stream_variant
+        compatible_source_request_fingerprints.update(
+            build_source_request_fingerprint(
+                video_path,
+                input_path,
+                fingerprint_args,
+                sidecar_path=sidecar_path,
+                chinese_sidecar_path=chinese_sidecar_path,
+                english_sidecar_path=english_sidecar_path,
+                sync_policy_version=version,
+                processing_plan_fingerprint=automatic_plan_cache_fingerprint,
+            )
+            for version in {
+                SYNC_POLICY_VERSION,
+                *COMPATIBLE_SYNC_POLICY_VERSIONS,
+            }
         )
-        for version in COMPATIBLE_SYNC_POLICY_VERSIONS
-    }
     has_explicit_source_selection = any(
         value is not None and value != ""
         for value in (
@@ -6065,6 +7336,77 @@ def main() -> None:
                 style_guide=style_guide,
             )
 
+        try:
+            reviewed_terminology, terminology_review_report = (
+                review_movie_terminology(
+                    processed_segments,
+                    args.llm_model,
+                    terminology_review_path,
+                    title=movie_name,
+                    seeded_entries=style_guide.get("terminology"),
+                )
+            )
+            manual_terminology = load_terminology_overrides(
+                terminology_overrides_path
+            )
+            reviewed_terminology = apply_terminology_overrides(
+                reviewed_terminology,
+                manual_terminology,
+            )
+            terminology_review_report = {
+                **terminology_review_report,
+                "manual_override_count": len(manual_terminology),
+                "resolved_entries": reviewed_terminology,
+            }
+            write_json_atomic(
+                terminology_review_path,
+                terminology_review_report,
+            )
+            style_guide = {
+                **style_guide,
+                "terminology": reviewed_terminology,
+                "terminology_review_fingerprint": (
+                    terminology_review_report.get("input_fingerprint")
+                ),
+                "terminology_review_status": terminology_review_report.get(
+                    "status"
+                ),
+            }
+            write_json_atomic(style_guide_path, style_guide)
+            authoritative_glossary: Dict[str, Dict[str, str]] = {}
+            register_terminology(
+                authoritative_glossary,
+                reviewed_terminology,
+            )
+            write_terminology_artifact(
+                terminology_path,
+                authoritative_glossary,
+                args.llm_model,
+            )
+            print(
+                "Movie-wide terminology review: "
+                f"status={terminology_review_report.get('status')}, "
+                f"reviewed={terminology_review_report.get('reviewed_count', 0)}, "
+                f"corrected={terminology_review_report.get('correction_count', 0)}, "
+                f"unapplied={terminology_review_report.get('unapplied_count', 0)}, "
+                f"manual={terminology_review_report.get('manual_override_count', 0)}"
+            )
+        except Exception as exc:
+            terminology_review_report = {
+                "version": TERMINOLOGY_REVIEW_POLICY_VERSION,
+                "status": "failed",
+                "llm_model": args.llm_model,
+                "error": str(exc),
+            }
+            write_json_atomic(
+                terminology_review_path,
+                terminology_review_report,
+            )
+            print(
+                "Movie-wide terminology review failed; "
+                f"using first-pass terminology: {exc}"
+            )
+
         if len(processed_segments) >= 12:
             try:
                 processed_segments, final_qa_report = run_final_subtitle_qa(
@@ -6074,6 +7416,29 @@ def main() -> None:
                     style_guide=style_guide,
                     batch_size=max(8, args.batch_size * 2),
                 )
+                (
+                    processed_segments,
+                    suppressed_track_labels,
+                ) = suppress_subtitle_track_label_artifacts(processed_segments)
+                if suppressed_track_labels:
+                    final_qa_report = {
+                        **final_qa_report,
+                        "segments": processed_segments,
+                        "output_fingerprint": final_qa_fingerprint(
+                            processed_segments,
+                            args.llm_model,
+                            style_guide,
+                        ),
+                        "deterministic_hidden_count": len(
+                            suppressed_track_labels
+                        ),
+                        "deterministic_hidden_items": suppressed_track_labels,
+                    }
+                    write_json_atomic(final_qa_path, final_qa_report)
+                    print(
+                        "Suppressed subtitle track label artifacts: "
+                        f"{len(suppressed_track_labels)}"
+                    )
                 write_json_atomic(checkpoint_path, processed_segments)
                 print(
                     "Independent final QA: "
@@ -6189,6 +7554,7 @@ def main() -> None:
             "source_manifest": str(source_manifest_path),
             "processing_plan": str(processing_plan_path),
             "style_guide": str(style_guide_path),
+            "terminology_review": str(terminology_review_path),
             "final_qa": str(final_qa_path),
             "render_validation": str(render_validation_path),
             **srt_artifacts,
@@ -6197,6 +7563,10 @@ def main() -> None:
             artifact_paths["render_preview"] = str(render_preview_path)
         if sync_report_path.exists():
             artifact_paths["subtitle_sync_report"] = str(sync_report_path)
+        if terminology_overrides_path.exists():
+            artifact_paths["terminology_overrides"] = str(
+                terminology_overrides_path
+            )
         if scene_cut_cache_path.exists():
             artifact_paths["scene_cut_cache"] = str(scene_cut_cache_path)
         if subtitle_font_file is not None:

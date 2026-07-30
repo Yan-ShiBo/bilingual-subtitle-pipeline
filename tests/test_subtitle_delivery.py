@@ -40,6 +40,32 @@ class SubtitleDeliveryTests(unittest.TestCase):
         self.assertIn("\u4f60\u597d\nHello", bilingual)
         self.assertNotIn("\u4f60\u597d", english)
 
+    def test_delivery_does_not_duplicate_chinese_only_source_as_english(self) -> None:
+        segments = [
+            {
+                "id": 1,
+                "start": 4.0,
+                "end": 6.0,
+                "text": "\u6e90\u7e41\u4f53\u4e2d\u6587",
+                "en": "",
+                "zh": "\u7b80\u4f53\u4e2d\u6587",
+                "display": True,
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = subtitle_delivery.write_delivery_srts(
+                segments,
+                Path(tmpdir),
+                "Movie",
+            )
+            bilingual = Path(paths["bilingual_srt"]).read_text(encoding="utf-8")
+            english = Path(paths["english_srt"]).read_text(encoding="utf-8")
+
+        self.assertEqual(english, "")
+        self.assertIn("\u7b80\u4f53\u4e2d\u6587", bilingual)
+        self.assertNotIn("\u6e90\u7e41\u4f53\u4e2d\u6587", bilingual)
+        self.assertEqual(bilingual.count("\u7b80\u4f53\u4e2d\u6587"), 1)
+
     def test_ass_render_validation_checks_real_pixels(self) -> None:
         segments = [
             {
@@ -51,9 +77,13 @@ class SubtitleDeliveryTests(unittest.TestCase):
                 "zh": "\u4f60\u597d",
             }
         ]
+        calls = []
 
-        def fake_run(command, **_kwargs):
+        def fake_run(command, **kwargs):
+            calls.append((command, kwargs))
             preview = Path(command[-1])
+            if not preview.is_absolute():
+                preview = Path(kwargs["cwd"]) / preview
             image = Image.new("RGB", (320, 180), (16, 18, 22))
             for x in range(100, 140):
                 for y in range(130, 150):
@@ -77,6 +107,14 @@ class SubtitleDeliveryTests(unittest.TestCase):
         self.assertEqual(report["status"], "pass")
         self.assertEqual(report["checkpoint_segment_id"], 9)
         self.assertGreater(report["changed_pixels"], 32)
+        command, kwargs = calls[0]
+        video_filter = command[command.index("-vf") + 1]
+        self.assertRegex(
+            video_filter,
+            r"ass=filename='subtitle-render-[^']+\.ass'",
+        )
+        self.assertNotIn(str(ass_path.resolve()), video_filter)
+        self.assertEqual(Path(kwargs["cwd"]), root.resolve())
 
 
 if __name__ == "__main__":

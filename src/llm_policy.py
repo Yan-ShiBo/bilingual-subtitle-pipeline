@@ -125,6 +125,38 @@ def indexed_subtitle_schema(expected_count: int, role: str) -> dict[str, Any]:
     }
 
 
+def indexed_terminology_schema(expected_count: int) -> dict[str, Any]:
+    if expected_count <= 0:
+        raise ValueError("expected_count must be positive")
+    return {
+        "type": "array",
+        "minItems": expected_count,
+        "maxItems": expected_count,
+        "items": {
+            "type": "object",
+            "properties": {
+                "index": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": expected_count - 1,
+                },
+                "target": {"type": "string"},
+                "confidence": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                },
+                "decision": {
+                    "type": "string",
+                    "enum": ["keep", "ocr_repair", "retranslate"],
+                },
+            },
+            "required": ["index", "target", "confidence", "decision"],
+            "additionalProperties": False,
+        },
+    }
+
+
 def movie_name_schema() -> dict[str, Any]:
     return {
         "type": "object",

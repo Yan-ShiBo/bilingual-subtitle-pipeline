@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +31,8 @@ def plain_subtitle_text(value: Any) -> str:
 
 
 def segment_track_text(segment: dict[str, Any], track: str) -> str:
-    source = plain_subtitle_text(segment.get("en") or segment.get("text"))
+    raw_source = segment["en"] if "en" in segment else segment.get("text")
+    source = plain_subtitle_text(raw_source)
     chinese = plain_subtitle_text(segment.get("zh"))
     if track == "en":
         return source
@@ -87,8 +90,16 @@ def write_delivery_srts(
     return {key: str(path) for key, path in paths.items()}
 
 
-def _filter_path(path: Path) -> str:
-    value = path.resolve().as_posix()
+def _filter_path(path: Path, *, relative_to: Path | None = None) -> str:
+    resolved = path.resolve()
+    if relative_to is not None:
+        try:
+            value = os.path.relpath(resolved, relative_to.resolve())
+        except ValueError:
+            value = resolved.as_posix()
+    else:
+        value = resolved.as_posix()
+    value = value.replace("\\", "/")
     return value.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
 
 
@@ -126,28 +137,53 @@ def validate_ass_rendering(
     ) / 2
     width = max(320, min(3840, int(play_resolution[0])))
     height = max(180, min(2160, int(play_resolution[1])))
-    ass_filter = f"ass=filename='{_filter_path(ass_path)}'"
-    if font_directory is not None:
-        ass_filter += f":fontsdir='{_filter_path(font_directory)}'"
-    video_filter = f"setpts=PTS+{midpoint:.6f}/TB,{ass_filter}"
+    working_directory = ass_path.resolve().parent
     preview_path.parent.mkdir(parents=True, exist_ok=True)
-    command = [
-        ffmpeg,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-f",
-        "lavfi",
-        "-i",
-        f"color=c=0x101216:s={width}x{height}:r=1:d=1",
-        "-vf",
-        video_filter,
-        "-frames:v",
-        "1",
-        "-y",
-        str(preview_path),
-    ]
+    temporary_ass: Path | None = None
+    temporary_preview: Path | None = None
     try:
+        with tempfile.NamedTemporaryFile(
+            prefix="subtitle-render-",
+            suffix=".ass",
+            dir=working_directory,
+            delete=False,
+        ) as handle:
+            temporary_ass = Path(handle.name)
+        shutil.copyfile(ass_path, temporary_ass)
+        with tempfile.NamedTemporaryFile(
+            prefix="subtitle-render-",
+            suffix=".png",
+            dir=working_directory,
+            delete=False,
+        ) as handle:
+            temporary_preview = Path(handle.name)
+
+        ass_filter = (
+            "ass=filename='"
+            f"{_filter_path(temporary_ass, relative_to=working_directory)}'"
+        )
+        if font_directory is not None:
+            ass_filter += (
+                ":fontsdir='"
+                f"{_filter_path(font_directory, relative_to=working_directory)}'"
+            )
+        video_filter = f"setpts=PTS+{midpoint:.6f}/TB,{ass_filter}"
+        command = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c=0x101216:s={width}x{height}:r=1:d=1",
+            "-vf",
+            video_filter,
+            "-frames:v",
+            "1",
+            "-y",
+            temporary_preview.name,
+        ]
         subprocess.run(
             command,
             check=True,
@@ -156,7 +192,9 @@ def validate_ass_rendering(
             encoding="utf-8",
             errors="replace",
             timeout=90,
+            cwd=str(working_directory),
         )
+        shutil.move(str(temporary_preview), str(preview_path))
         with Image.open(preview_path) as image:
             rgb = image.convert("RGB")
             background = (16, 18, 22)
@@ -191,6 +229,17 @@ def validate_ass_rendering(
             "image_size": image_size,
             "preview_path": str(preview_path),
         }
+    except subprocess.CalledProcessError as exc:
+        details = str(exc.stderr or exc.stdout or "").strip()
+        reason = details[-2000:] if details else str(exc)
+        return {
+            "status": "failed",
+            "reason": reason,
+            "sample_event_id": sample.get("id"),
+            "checkpoint_segment_id": sample.get("checkpoint_segment_id"),
+            "sample_time_seconds": round(midpoint, 3),
+            "preview_path": str(preview_path),
+        }
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         return {
             "status": "failed",
@@ -200,3 +249,11 @@ def validate_ass_rendering(
             "sample_time_seconds": round(midpoint, 3),
             "preview_path": str(preview_path),
         }
+    finally:
+        for temporary_path in (temporary_ass, temporary_preview):
+            if temporary_path is None:
+                continue
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass

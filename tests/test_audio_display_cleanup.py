@@ -37,12 +37,42 @@ from audio_to_subtitle import (  # noqa: E402
     split_segments_for_subtitles,
     source_cache_uses_current_timing_policy,
     source_cache_matches_request,
+    suppress_subtitle_track_label_artifacts,
     synchronize_existing_subtitle_tracks,
     translate_and_correct_segments,
 )
 
 
 class DisplayCleanupTests(unittest.TestCase):
+    def test_atomic_json_write_retries_transient_windows_lock(self) -> None:
+        original_replace = Path.replace
+        replace_calls = 0
+
+        def flaky_replace(source, target):
+            nonlocal replace_calls
+            replace_calls += 1
+            if replace_calls < 3:
+                raise PermissionError(5, "temporarily locked")
+            return original_replace(source, target)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "checkpoint.json"
+            with (
+                patch.object(Path, "replace", new=flaky_replace),
+                patch.object(audio_to_subtitle.time, "sleep") as sleep,
+            ):
+                audio_to_subtitle.write_json_atomic(
+                    output_path,
+                    {"status": "running", "reviewed_count": 270},
+                )
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+            temporary_files = list(Path(tmpdir).glob("*.tmp"))
+
+        self.assertEqual(payload["reviewed_count"], 270)
+        self.assertEqual(replace_calls, 3)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(temporary_files, [])
+
     def test_output_root_discovers_existing_central_subtitle_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -427,6 +457,41 @@ class DisplayCleanupTests(unittest.TestCase):
             "covered_by_adjacent_visible_line",
         )
 
+    def test_delivery_suppresses_subtitle_track_label_artifact(self) -> None:
+        segments = [
+            {
+                "id": 0,
+                "start": 1.0,
+                "end": 2.0,
+                "text": "(SPEAKING ENGLISH)",
+                "en": "(SPEAKING ENGLISH)",
+                "zh": "（说英语）",
+                "display": True,
+            },
+            {
+                "id": 1,
+                "start": 99.0,
+                "end": 100.0,
+                "text": "(ENGLISH - SDH)",
+                "en": "(ENGLISH - SDH)",
+                "zh": "（英文对白）",
+                "display": True,
+            },
+        ]
+
+        output, suppressed = suppress_subtitle_track_label_artifacts(segments)
+
+        self.assertTrue(output[0]["display"])
+        self.assertFalse(output[1]["display"])
+        self.assertEqual(
+            output[1]["display_suppression"],
+            "subtitle_track_label_artifact",
+        )
+        self.assertEqual([item["id"] for item in suppressed], [1])
+        output[1]["model_display_requested"] = False
+        guarded = guard_model_hidden_segments(segments, output)
+        self.assertFalse(guarded[1]["display"])
+
     def test_translation_pipeline_overrides_unsupported_model_hide(self) -> None:
         source = [
             {"id": 0, "start": 1.0, "end": 2.0, "text": "This line is unique."},
@@ -567,6 +632,230 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertEqual(output[1]["zh"], "\u7ea6\u7ff0\u5750\u4e0b\u4e86\u3002")
         self.assertEqual(terminology["entries"], [{"source": "John", "target": "\u7ea6\u7ff0"}])
 
+    def test_proofreading_restores_known_speaker_label_missing_in_chinese(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 1.0,
+                "end": 3.0,
+                "text": "AECH: Okay, Mom, I heard you.",
+                "en": "AECH: Okay, Mom, I heard you.",
+                "zh": "\u597d\uff0c\u8001\u5988\uff0c\u542c\u5230\u4e86",
+                "source_language": "en",
+                "source_text_authority": "ocr",
+            }
+        ]
+        style_guide = {
+            "status": "ready",
+            "terminology": [{"source": "Aech", "target": "\u827e\u533a"}],
+        }
+        response = (
+            '[{"index":0,"corrected_english":"AECH: Okay, Mom, I heard you.",'
+            '"corrected_chinese":"\u597d\uff0c\u8001\u5988\uff0c\u542c\u5230\u4e86","display":true,'
+            '"terminology":[]}]'
+        )
+
+        with (
+            patch.object(audio_to_subtitle, "call_llm", return_value=response),
+            patch.object(
+                audio_to_subtitle,
+                "retry_single_segment_llm",
+                side_effect=AssertionError("speaker label restoration should be deterministic"),
+            ),
+        ):
+            output = proofread_existing_chinese_segments(
+                source,
+                llm_model="qwen3.5:122b",
+                batch_size=1,
+                context_lines=0,
+                style_guide=style_guide,
+            )
+
+        self.assertEqual(output[0]["zh"], "\u827e\u533a\uff1a\u597d\uff0c\u8001\u5988\uff0c\u542c\u5230\u4e86")
+
+    def test_single_item_retry_rejects_known_name_conflict(self) -> None:
+        source = {
+            "id": 0,
+            "start": 1.0,
+            "end": 3.0,
+            "text": "John arrived.",
+        }
+        responses = [
+            (
+                '[{"index":0,"corrected_text":"John arrived.",'
+                '"chinese_translation":"\u5f3a\u5c3c\u5230\u4e86\u3002","display":true,'
+                '"terminology":[]}]'
+            ),
+            (
+                '[{"index":0,"corrected_text":"John arrived.",'
+                '"chinese_translation":"\u7ea6\u7ff0\u5230\u4e86\u3002","display":true,'
+                '"terminology":[]}]'
+            ),
+        ]
+        glossary = {"john": {"source": "John", "target": "\u7ea6\u7ff0"}}
+
+        with patch.object(
+            audio_to_subtitle,
+            "call_llm",
+            side_effect=responses,
+        ) as call:
+            output = audio_to_subtitle.retry_single_segment_llm(
+                source,
+                "",
+                "",
+                None,
+                1.0,
+                3.0,
+                "system",
+                "qwen3:30b",
+                "English",
+                terminology_text="John => \u7ea6\u7ff0",
+                terminology_glossary=glossary,
+            )
+
+        self.assertEqual(call.call_count, 2)
+        self.assertEqual(output["chinese_translation"], "\u7ea6\u7ff0\u5230\u4e86\u3002")
+
+    def test_single_item_retry_reports_exact_missing_full_name(self) -> None:
+        source = {
+            "id": 557,
+            "start": 2292.665,
+            "end": 2296.127,
+            "text": "No, no. Karen Underwood, as in Ogden Morrow's wife?",
+            "en": "No, no. Karen Underwood, as in Ogden Morrow's wife?",
+            "zh": "\u4e0d\u4f1a\u5427\uff1b\u51ef\u4f26\u5b89\u5fb7\u4f0d\u6b27\u683c\u987f\u83ab\u6d1b\u7684\u8001\u5a46\uff1f",
+        }
+        responses = [
+            (
+                '[{"index":0,"corrected_english":"No, no. Karen Underwood, '
+                "as in Ogden Morrow's wife?\","
+                '"corrected_chinese":"\u4e0d\u4f1a\u5427\uff0c\u51ef\u4f26\u00b7\u5b89\u5fb7\u4f0d\u5fb7\uff1f'
+                '\u83ab\u6d1b\u7684\u8001\u5a46\uff1f","display":true,"terminology":[]}]'
+            ),
+            (
+                '[{"index":0,"corrected_english":"No, no. Karen Underwood, '
+                "as in Ogden Morrow's wife?\","
+                '"corrected_chinese":"\u4e0d\u4f1a\u5427\uff0c\u51ef\u4f26\u00b7\u5b89\u5fb7\u4f0d\u5fb7\uff1f'
+                '\u6b27\u683c\u987f\u00b7\u83ab\u6d1b\u7684\u59bb\u5b50\uff1f","display":true,"terminology":[]}]'
+            ),
+        ]
+        glossary = {
+            "karen underwood": {
+                "source": "Karen Underwood",
+                "target": "\u51ef\u4f26\u00b7\u5b89\u5fb7\u4f0d\u5fb7",
+            },
+            "morrow": {"source": "Morrow", "target": "\u83ab\u6d1b"},
+            "ogden morrow": {
+                "source": "Ogden Morrow",
+                "target": "\u6b27\u683c\u987f\u00b7\u83ab\u6d1b",
+            },
+        }
+        prompts = []
+
+        def call_llm(prompt, *_args, **_kwargs):
+            prompts.append(prompt)
+            return responses[len(prompts) - 1]
+
+        with patch.object(
+            audio_to_subtitle,
+            "call_llm",
+            side_effect=call_llm,
+        ) as call:
+            output = audio_to_subtitle.retry_single_segment_llm(
+                source,
+                "",
+                "",
+                None,
+                2292.665,
+                2296.127,
+                "system",
+                "qwen3.5:122b",
+                "English",
+                is_proofread=True,
+                terminology_glossary=glossary,
+            )
+
+        self.assertEqual(call.call_count, 2)
+        self.assertIn("REQUIRED TERMINOLOGY FOR THIS TARGET", prompts[0])
+        self.assertIn(
+            "Ogden Morrow => \u6b27\u683c\u987f\u00b7\u83ab\u6d1b",
+            prompts[0],
+        )
+        self.assertIn("AUTOMATIC VALIDATION FEEDBACK", prompts[1])
+        self.assertIn(
+            "Ogden Morrow => \u6b27\u683c\u987f\u00b7\u83ab\u6d1b",
+            prompts[1],
+        )
+        self.assertIn(
+            "\u51ef\u4f26\u00b7\u5b89\u5fb7\u4f0d\u5fb7",
+            output["corrected_chinese"],
+        )
+        self.assertIn(
+            "\u6b27\u683c\u987f\u00b7\u83ab\u6d1b",
+            output["corrected_chinese"],
+        )
+
+    def test_language_validation_preserves_existing_short_latin_token(self) -> None:
+        self.assertTrue(
+            audio_to_subtitle.is_language_valid(
+                "Z!",
+                "Z!",
+                "Z",
+                original_translation="Z",
+            )
+        )
+        self.assertFalse(
+            audio_to_subtitle.is_language_valid(
+                "Z!",
+                "Z!",
+                "Z",
+            )
+        )
+        self.assertFalse(
+            audio_to_subtitle.is_language_valid(
+                "Go!",
+                "Go!",
+                "Go",
+                original_translation="\u8d70\uff01",
+            )
+        )
+
+    def test_proofreading_keeps_existing_short_latin_token(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 6069.981,
+                "end": 6070.982,
+                "text": "Z!",
+                "en": "Z!",
+                "zh": "Z",
+                "source_language": "en",
+                "source_text_authority": "ocr",
+            }
+        ]
+        response = (
+            '[{"index":0,"corrected_english":"Z!",'
+            '"corrected_chinese":"Z","display":true,"terminology":[]}]'
+        )
+
+        with (
+            patch.object(audio_to_subtitle, "call_llm", return_value=response),
+            patch.object(
+                audio_to_subtitle,
+                "retry_single_segment_llm",
+                side_effect=AssertionError("the existing Latin token is valid"),
+            ),
+        ):
+            output = proofread_existing_chinese_segments(
+                source,
+                llm_model="qwen3.5:122b",
+                batch_size=1,
+                context_lines=0,
+            )
+
+        self.assertEqual(output[0]["en"], "Z!")
+        self.assertEqual(output[0]["zh"], "Z")
+
     def test_movie_style_prepass_is_cached_and_seeds_name_policy(self) -> None:
         source = [
             {"id": 0, "start": 1.0, "end": 2.0, "text": "John arrived."},
@@ -601,6 +890,207 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertEqual(call.call_count, 1)
         self.assertEqual(first["terminology"], [{"source": "John", "target": "\u7ea6\u7ff0"}])
         self.assertEqual(second["input_fingerprint"], first["input_fingerprint"])
+
+    def test_movie_terminology_review_only_applies_high_confidence_fixes(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 1.0,
+                "end": 2.0,
+                "text": "Aech arrived.",
+                "en": "Aech arrived.",
+                "zh": "\u827e\u533a\u6765\u4e86\u3002",
+                "source_language": "en",
+                "processing_mode": "proofread_existing_chinese",
+                "terminology": [{"source": "Aech", "target": "\u827e\u533a"}],
+            },
+            {
+                "id": 1,
+                "start": 2.0,
+                "end": 3.0,
+                "text": "i-R0k.",
+                "en": "i-R0k.",
+                "zh": "\u6211\u6700\u5e1a\u3002",
+                "source_language": "en",
+                "processing_mode": "proofread_existing_chinese",
+                "terminology": [{"source": "i-R0k", "target": "\u6211\u6700\u5e1a"}],
+            },
+        ]
+        response = json.dumps(
+            [
+                {
+                    "index": 0,
+                    "target": "\u827e\u5947",
+                    "confidence": 1.0,
+                    "decision": "ocr_repair",
+                },
+                {
+                    "index": 1,
+                    "target": "\u827e\u6d1b\u514b",
+                    "confidence": 1.0,
+                    "decision": "retranslate",
+                },
+            ],
+            ensure_ascii=False,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_path = Path(tmpdir) / "terminology-review.json"
+            with patch.object(
+                audio_to_subtitle,
+                "call_llm",
+                return_value=response,
+            ) as call:
+                resolved, report = audio_to_subtitle.review_movie_terminology(
+                    source,
+                    "qwen3:30b",
+                    artifact_path,
+                    title="Ready Player One",
+                )
+                cached, cached_report = (
+                    audio_to_subtitle.review_movie_terminology(
+                        [
+                            {
+                                **segment,
+                                "zh": f"{segment['zh']}\u3002",
+                                "final_qa_policy_version": 4,
+                            }
+                            for segment in source
+                        ],
+                        "qwen3:30b",
+                        artifact_path,
+                        title="Ready Player One",
+                    )
+                )
+
+        self.assertEqual(
+            resolved,
+            [
+                {"source": "Aech", "target": "\u827e\u5947"},
+                {"source": "i-R0k", "target": "\u6211\u6700\u5e1a"},
+            ],
+        )
+        self.assertEqual(cached, resolved)
+        self.assertEqual(report["correction_count"], 1)
+        self.assertEqual(report["unapplied_count"], 1)
+        self.assertEqual(cached_report["status"], "review")
+        self.assertEqual(call.call_count, 1)
+
+    def test_final_qa_fingerprint_includes_reviewed_terminology(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 1.0,
+                "end": 2.0,
+                "en": "Aech arrived.",
+                "zh": "\u827e\u533a\u6765\u4e86\u3002",
+            }
+        ]
+        first = audio_to_subtitle.final_qa_fingerprint(
+            source,
+            "qwen3:30b",
+            {
+                "input_fingerprint": "style",
+                "terminology": [{"source": "Aech", "target": "\u827e\u533a"}],
+            },
+        )
+        second = audio_to_subtitle.final_qa_fingerprint(
+            source,
+            "qwen3:30b",
+            {
+                "input_fingerprint": "style",
+                "terminology": [{"source": "Aech", "target": "\u827e\u5947"}],
+            },
+        )
+
+        self.assertNotEqual(first, second)
+
+    def test_ocr_terminology_gate_rejects_semantic_retranslations(self) -> None:
+        self.assertTrue(
+            audio_to_subtitle.is_plausible_ocr_terminology_repair(
+                "i-R0k",
+                "\u6211\u6700\u5e1a",
+                "\u6211\u6700\u5c4c",
+            )
+        )
+        self.assertTrue(
+            audio_to_subtitle.is_plausible_ocr_terminology_repair(
+                "i-R0k",
+                "\u6211\u6700\u5e1a",
+                "i-R0k",
+            )
+        )
+        self.assertFalse(
+            audio_to_subtitle.is_plausible_ocr_terminology_repair(
+                "The Distracted Globe",
+                "\u6270\u52a8\u7403",
+                "\u5206\u5fc3\u661f\u7403",
+            )
+        )
+        self.assertFalse(
+            audio_to_subtitle.is_plausible_ocr_terminology_repair(
+                "Toshiro",
+                "\u5c0f\u5200",
+                "\u654f\u90ce",
+            )
+        )
+
+    def test_manual_terminology_overrides_replace_reviewed_target(self) -> None:
+        resolved = audio_to_subtitle.apply_terminology_overrides(
+            [
+                {"source": "i-R0k", "target": "\u6211\u6700\u5e1a"},
+                {"source": "Aech", "target": "\u827e\u533a"},
+            ],
+            [{"source": "i-R0k", "target": "\u6211\u6700\u5c4c"}],
+        )
+
+        self.assertEqual(
+            resolved,
+            [
+                {"source": "i-R0k", "target": "\u6211\u6700\u5c4c"},
+                {"source": "Aech", "target": "\u827e\u533a"},
+            ],
+        )
+
+    def test_manual_terminology_overrides_remove_context_sensitive_terms(self) -> None:
+        resolved = audio_to_subtitle.apply_terminology_overrides(
+            [
+                {"source": "money", "target": "\u91d1\u5e01"},
+                {"source": "Jade Key", "target": "\u7389\u94a5"},
+            ],
+            [{"source": "money", "remove": True}],
+        )
+
+        self.assertEqual(
+            resolved,
+            [{"source": "Jade Key", "target": "\u7389\u94a5"}],
+        )
+
+    def test_load_terminology_overrides_preserves_removals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "terminology-overrides.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "entries": [
+                            {"source": "money", "remove": True},
+                            {"source": "i-R0k", "target": "\u6211\u6700\u5c4c"},
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            overrides = audio_to_subtitle.load_terminology_overrides(path)
+
+        self.assertEqual(
+            overrides,
+            [
+                {"source": "money", "remove": True},
+                {"source": "i-R0k", "target": "\u6211\u6700\u5c4c"},
+            ],
+        )
 
     def test_translation_prompt_uses_movie_wide_style_before_first_batch(self) -> None:
         source = [{"id": 0, "start": 1.0, "end": 2.0, "text": "John arrived."}]
@@ -676,6 +1166,167 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertEqual((output[0]["start"], output[0]["end"]), (1.0, 3.0))
         self.assertEqual(output[0]["zh"], "\u7ea6\u7ff0\u5230\u4e86\u3002")
         self.assertTrue(output[0]["final_qa_changed"])
+        self.assertEqual(report["status"], "pass")
+
+    def test_independent_final_qa_cannot_add_unreviewed_terminology(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 1.0,
+                "end": 3.0,
+                "text": "John met Parzival.",
+                "en": "John met Parzival.",
+                "zh": "\u7ea6\u7ff0\u89c1\u5230\u4e86\u5e15\u897f\u6cd5\u5c14\u3002",
+                "display": True,
+                "terminology": [{"source": "John", "target": "\u7ea6\u7ff0"}],
+            }
+        ]
+        style_guide = {
+            "status": "ready",
+            "input_fingerprint": "style",
+            "terminology": [{"source": "John", "target": "\u7ea6\u7ff0"}],
+        }
+        response = json.dumps(
+            [
+                {
+                    "index": 0,
+                    "corrected_english": "John met Parzival.",
+                    "corrected_chinese": "\u7ea6\u7ff0\u89c1\u5230\u4e86\u5e15\u897f\u6cd5\u5c14\u3002",
+                    "display": True,
+                    "terminology": [
+                        {"source": "John", "target": "\u7ea6\u7ff0"},
+                        {"source": "Parzival", "target": "\u5e15\u897f\u6cd5\u5c14"},
+                    ],
+                }
+            ],
+            ensure_ascii=False,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_path = Path(tmpdir) / "final-qa.json"
+            with patch.object(
+                audio_to_subtitle,
+                "call_llm",
+                return_value=response,
+            ):
+                output, _report = audio_to_subtitle.run_final_subtitle_qa(
+                    source,
+                    "qwen3:30b",
+                    artifact_path,
+                    style_guide=style_guide,
+                )
+
+        self.assertEqual(
+            output[0]["terminology"],
+            [{"source": "John", "target": "\u7ea6\u7ff0"}],
+        )
+
+    def test_independent_final_qa_preserves_labels_cues_and_quote_style(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 1.0,
+                "end": 3.0,
+                "text": "HALLIDAY: Why?",
+                "en": "HALLIDAY: Why?",
+                "zh": "\u54c8\u52d2\u4ee3\uff1a\u4e3a\u4ec0\u4e48\uff1f",
+                "source_language": "en",
+                "display": True,
+            },
+            {
+                "id": 1,
+                "start": 3.0,
+                "end": 5.0,
+                "text": "Fast. (LAUGHS)",
+                "en": "Fast. (LAUGHS)",
+                "zh": "\u5feb\u70b9\u3002\uff08\u7b11\uff09",
+                "source_language": "en",
+                "display": True,
+            },
+            {
+                "id": 2,
+                "start": 5.0,
+                "end": 7.0,
+                "text": "Fine.",
+                "en": "Fine.",
+                "zh": "\u884c\u5427\u3002",
+                "source_language": "en",
+                "display": True,
+            },
+        ]
+        response = json.dumps(
+            [
+                {
+                    "index": 0,
+                    "corrected_english": "Why?",
+                    "corrected_chinese": "\u4e3a\u4ec0\u4e48\uff1f",
+                    "display": True,
+                    "terminology": [],
+                },
+                {
+                    "index": 1,
+                    "corrected_english": "Fast.",
+                    "corrected_chinese": "\u5feb\u70b9\u3002",
+                    "display": True,
+                    "terminology": [],
+                },
+                {
+                    "index": 2,
+                    "corrected_english": "Fine.",
+                    "corrected_chinese": "\u201c\u884c\u5427\u3002\u201d",
+                    "display": True,
+                    "terminology": [],
+                },
+            ],
+            ensure_ascii=False,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_path = Path(tmpdir) / "final-qa.json"
+            with patch.object(audio_to_subtitle, "call_llm", return_value=response):
+                output, report = audio_to_subtitle.run_final_subtitle_qa(
+                    source,
+                    "qwen3:30b",
+                    artifact_path,
+                )
+
+        self.assertEqual(output[0]["en"], "HALLIDAY: Why?")
+        self.assertEqual(output[0]["zh"], "\u54c8\u52d2\u4ee3\uff1a\u4e3a\u4ec0\u4e48\uff1f")
+        self.assertEqual(output[1]["en"], "Fast. (LAUGHS)")
+        self.assertEqual(output[1]["zh"], "\u5feb\u70b9\u3002\uff08\u7b11\uff09")
+        self.assertEqual(output[2]["zh"], "\u884c\u5427\u3002")
+        self.assertEqual(report["changed_count"], 0)
+
+    def test_independent_final_qa_ignores_spurious_source_for_chinese_only(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 1.0,
+                "end": 3.0,
+                "text": "\u81ea\u7531\uff0c\u6211\u4eec\u4fe1\u4ef0\u4e0a\u5e1d",
+                "en": "",
+                "zh": "\u81ea\u7531\uff0c\u6211\u4eec\u4fe1\u4ef0\u4e0a\u5e1d",
+                "source_language": "zh",
+                "display": True,
+            }
+        ]
+        response = (
+            '[{"index":0,"corrected_english":"Freedom, in God we trust.",'
+            '"corrected_chinese":"\u81ea\u7531\uff0c\u6211\u4eec\u4fe1\u4ef0\u4e0a\u5e1d\u3002",'
+            '"display":true,"terminology":[]}]'
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_path = Path(tmpdir) / "final-qa.json"
+            with patch.object(audio_to_subtitle, "call_llm", return_value=response):
+                output, report = audio_to_subtitle.run_final_subtitle_qa(
+                    source,
+                    "qwen3:30b",
+                    artifact_path,
+                )
+
+        self.assertEqual(output[0]["en"], "")
+        self.assertEqual(output[0]["zh"], "\u81ea\u7531\uff0c\u6211\u4eec\u4fe1\u4ef0\u4e0a\u5e1d\u3002")
         self.assertEqual(report["status"], "pass")
 
     def test_independent_final_qa_rejects_translation_of_japanese_source(self) -> None:
@@ -989,6 +1640,37 @@ class DisplayCleanupTests(unittest.TestCase):
 
             self.assertNotEqual(first_fingerprint, second_fingerprint)
             self.assertFalse(source_cache_matches_request(cached, second_fingerprint))
+
+    def test_source_request_accepts_equivalent_auto_and_explicit_sync_audio(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_path = Path(tmpdir) / "subtitle-sync.report.json"
+            report_path.write_text(
+                json.dumps({"audio_stream": 1}),
+                encoding="utf-8",
+            )
+
+            explicit = audio_to_subtitle.source_request_audio_stream_variants(
+                1,
+                1,
+                "auto",
+                report_path,
+            )
+            automatic = audio_to_subtitle.source_request_audio_stream_variants(
+                None,
+                1,
+                "auto",
+                report_path,
+            )
+            changed = audio_to_subtitle.source_request_audio_stream_variants(
+                2,
+                2,
+                "auto",
+                report_path,
+            )
+
+        self.assertEqual(explicit, {None, 1})
+        self.assertEqual(automatic, {None, 1})
+        self.assertEqual(changed, {2})
 
     def test_auto_source_does_not_select_another_episodes_sidecars(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1371,6 +2053,224 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertEqual(request["options"]["num_ctx"], 65536)
         self.assertFalse(request["think"])
         self.assertEqual(request["format"]["maxItems"], 2)
+
+    def test_llm_seed_offset_makes_retries_distinct(self) -> None:
+        captured = {}
+
+        def post_chat(_base_url, payload):
+            captured["payload"] = payload
+            return {"message": {"content": "[]"}}
+
+        with patch.object(audio_to_subtitle, "post_ollama_chat", side_effect=post_chat):
+            audio_to_subtitle.call_llm(
+                "proofread",
+                model="qwen3:30b",
+                role="proofread",
+                seed_offset=2,
+            )
+
+        self.assertEqual(captured["payload"]["options"]["seed"], 45)
+
+    def test_final_qa_normalizes_local_index_and_protocol_defaults(self) -> None:
+        batch = [
+            {"id": 3, "display": True},
+            {"id": 4, "display": False},
+        ]
+        response = [
+            {
+                "local_index": 0,
+                "start_time": 1.0,
+                "corrected_english": "Hello",
+                "corrected_chinese": "\u4f60\u597d",
+            },
+            {
+                "local_index": 1,
+                "end_time": 3.0,
+                "corrected_english": "World",
+                "corrected_chinese": "\u4e16\u754c",
+            },
+        ]
+
+        normalized = audio_to_subtitle.normalize_final_qa_batch_response(
+            response,
+            batch,
+        )
+        lookup = audio_to_subtitle.validate_indexed_batch_response(
+            normalized,
+            2,
+            "proofread",
+        )
+
+        self.assertEqual(lookup[0]["index"], 0)
+        self.assertTrue(lookup[0]["display"])
+        self.assertEqual(lookup[0]["terminology"], [])
+        self.assertEqual(lookup[1]["index"], 1)
+        self.assertFalse(lookup[1]["display"])
+        self.assertEqual(lookup[1]["terminology"], [])
+
+    def test_final_qa_normalizes_controlled_text_field_aliases(self) -> None:
+        batch = [{"id": 3, "display": True}]
+        response = [
+            {
+                "local_index": 0,
+                "en": "Hello",
+                "zh": "\u4f60\u597d",
+            }
+        ]
+
+        normalized = audio_to_subtitle.normalize_final_qa_batch_response(
+            response,
+            batch,
+        )
+        lookup = audio_to_subtitle.validate_indexed_batch_response(
+            normalized,
+            1,
+            "proofread",
+        )
+
+        self.assertEqual(lookup[0]["corrected_english"], "Hello")
+        self.assertEqual(lookup[0]["corrected_chinese"], "\u4f60\u597d")
+
+    def test_final_qa_reuses_cache_for_manual_checkpoint_overrides(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 1.0,
+                "end": 2.0,
+                "text": "Hello.",
+                "en": "Hello.",
+                "zh": "\u4f60\u597d\u3002",
+                "display": True,
+                "source_language": "en",
+            },
+            {
+                "id": 1,
+                "start": 2.1,
+                "end": 3.0,
+                "text": "World.",
+                "en": "World.",
+                "zh": "\u4e16\u754c\u3002",
+                "display": True,
+                "source_language": "en",
+            },
+        ]
+        response = (
+            '[{"index":0,"corrected_english":"Hello.",'
+            '"corrected_chinese":"\u4f60\u597d\u3002","display":true,"terminology":[]},'
+            '{"index":1,"corrected_english":"World.",'
+            '"corrected_chinese":"\u4e16\u754c\u3002","display":true,"terminology":[]}]'
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_path = Path(tmpdir) / "final-qa.json"
+            with patch.object(audio_to_subtitle, "call_llm", return_value=response):
+                first, _ = audio_to_subtitle.run_final_subtitle_qa(
+                    source,
+                    "qwen3:30b",
+                    artifact_path,
+                    batch_size=2,
+                )
+            manually_reviewed = [dict(item) for item in first]
+            manually_reviewed[0].update(
+                {
+                    "en": "Hello!",
+                    "zh": "\u4f60\u597d\uff01",
+                    "manual_reviewed_at": "2026-07-31T10:00:00+00:00",
+                }
+            )
+            with patch.object(audio_to_subtitle, "call_llm") as call:
+                second, report = audio_to_subtitle.run_final_subtitle_qa(
+                    manually_reviewed,
+                    "qwen3:30b",
+                    artifact_path,
+                    batch_size=2,
+                )
+
+        call.assert_not_called()
+        self.assertEqual(second[0]["en"], "Hello!")
+        self.assertEqual(second[0]["zh"], "\u4f60\u597d\uff01")
+        self.assertTrue(second[0]["final_qa_manual_preserved"])
+        self.assertEqual(report["manual_override_count"], 1)
+        self.assertEqual(report["output_fingerprint"], report["input_fingerprint"])
+
+    def test_structured_json_repairs_only_unquoted_schema_strings(self) -> None:
+        response_schema = audio_to_subtitle.indexed_subtitle_schema(2, "proofread")
+        malformed = """[
+  {
+    "index": 0,
+    "corrected_english": "(GRUNTING)",
+    "corrected_chinese": (低吼声),
+    "display": true,
+    "terminology": []
+  },
+  {
+    "index": 1,
+    "corrected_english": "Pizza, guys.",
+    "corrected_chinese": 各位，披萨来了。
+    "display": true,
+    "terminology": []
+  }
+]"""
+
+        parsed = audio_to_subtitle.parse_json_response(
+            malformed,
+            response_schema=response_schema,
+        )
+        validated = audio_to_subtitle.validate_indexed_batch_response(
+            parsed,
+            2,
+            "proofread",
+        )
+
+        self.assertEqual(validated[0]["corrected_chinese"], "(低吼声)")
+        self.assertEqual(validated[1]["corrected_chinese"], "各位，披萨来了。")
+        with self.assertRaises(json.JSONDecodeError):
+            audio_to_subtitle.parse_json_response(malformed)
+
+    def test_structured_json_repairs_concatenated_objects_as_array(self) -> None:
+        response_schema = audio_to_subtitle.indexed_terminology_schema(2)
+        malformed = """{
+  "index": 0,
+  "target": "\u827e\u5947",
+  "confidence": 1.0,
+  "decision": "ocr_repair"
+}
+{
+  "index": 1,
+  "target": "\u827e\u6d1b\u514b",
+  "confidence": 1.0,
+  "decision": "ocr_repair"
+}"""
+
+        parsed = audio_to_subtitle.parse_json_response(
+            malformed,
+            response_schema=response_schema,
+        )
+        validated = audio_to_subtitle.validate_terminology_review_response(
+            parsed,
+            2,
+        )
+
+        self.assertEqual(validated[0]["target"], "\u827e\u5947")
+        self.assertEqual(validated[1]["target"], "\u827e\u6d1b\u514b")
+
+    def test_structured_json_does_not_repair_non_string_schema_values(self) -> None:
+        response_schema = audio_to_subtitle.indexed_subtitle_schema(1, "proofread")
+        malformed = """[
+  {
+    "index": 0,
+    "corrected_english": "",
+    "corrected_chinese": 必胜客，
+    "display": maybe,
+    "terminology": []
+  }
+]"""
+
+        with self.assertRaises(json.JSONDecodeError):
+            audio_to_subtitle.parse_json_response(
+                malformed,
+                response_schema=response_schema,
+            )
 
     def test_transcribe_audio_unloads_whisper_from_local_gpu(self) -> None:
         unloaded = []
@@ -2779,6 +3679,57 @@ class DisplayCleanupTests(unittest.TestCase):
 
         self.assertEqual(output[0]["zh"], "\u64ad\u653e\u97f3\u4e50")
         self.assertEqual(output[0]["en"], "(MUSIC PLAYING)")
+
+    def test_existing_chinese_proofreading_repairs_unquoted_model_strings(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 4.0,
+                "end": 5.0,
+                "text": "(GRUNTING)",
+                "en": "(GRUNTING)",
+                "zh": "",
+            },
+            {
+                "id": 1,
+                "start": 5.0,
+                "end": 6.0,
+                "text": "Pizza, guys.",
+                "en": "Pizza, guys.",
+                "zh": "\u5404\u4f4d\u2019\u62ab\u8428\u6765\u4e86",
+            },
+        ]
+        malformed_response = """[
+          {
+            "index": 0,
+            "corrected_english": "(GRUNTING)",
+            "corrected_chinese": (\u4f4e\u543c\u58f0),
+            "display": true,
+            "terminology": []
+          },
+          {
+            "index": 1,
+            "corrected_english": "Pizza, guys.",
+            "corrected_chinese": \u5404\u4f4d\uff0c\u62ab\u8428\u6765\u4e86\u3002",
+            "display": true,
+            "terminology": []
+          }
+        ]"""
+
+        with patch.object(
+            audio_to_subtitle,
+            "call_llm",
+            return_value=malformed_response,
+        ):
+            output = proofread_existing_chinese_segments(
+                source,
+                llm_model="qwen3.5:122b",
+                batch_size=2,
+                context_lines=0,
+            )
+
+        self.assertEqual(output[0]["zh"], "(\u4f4e\u543c\u58f0)")
+        self.assertEqual(output[1]["zh"], "\u5404\u4f4d\uff0c\u62ab\u8428\u6765\u4e86\u3002")
 
     def test_existing_chinese_proofreading_never_keeps_chinese_in_english_track(self) -> None:
         source = [

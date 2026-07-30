@@ -222,6 +222,49 @@ class SubtitleQualityTests(unittest.TestCase):
         self.assertEqual(review["segment"]["en"], "Corrected")
         self.assertEqual(review["segment"]["zh"], "\u6821\u5bf9")
 
+    def test_frontend_hides_manually_reviewed_quality_samples(self) -> None:
+        report = {
+            "checks": {
+                "recognition_confidence": {
+                    "status": "review",
+                    "samples": [
+                        {
+                            "checkpoint_segment_id": 7,
+                            "issues": ["low_ocr_confidence"],
+                        },
+                        {
+                            "checkpoint_segment_id": 8,
+                            "issues": ["low_ocr_confidence"],
+                        },
+                    ],
+                }
+            }
+        }
+        checkpoint = [
+            {
+                "id": 7,
+                "start": 1.0,
+                "end": 2.0,
+                "en": "Reviewed",
+                "zh": "\u5df2\u590d\u6838",
+                "manual_reviewed_at": "2026-07-31T10:00:00+00:00",
+            },
+            {
+                "id": 8,
+                "start": 2.0,
+                "end": 3.0,
+                "en": "Pending",
+                "zh": "\u5f85\u590d\u6838",
+            },
+        ]
+
+        review_items = subtitle_frontend.flatten_quality_review_items(
+            report,
+            checkpoint,
+        )
+
+        self.assertEqual([item["segment_id"] for item in review_items], [8])
+
     def test_frontend_updates_one_checkpoint_segment_atomically(self) -> None:
         source_segment = {
             "id": 4,
