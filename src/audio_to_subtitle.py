@@ -47,6 +47,19 @@ from subtitle_quality import (
     build_quality_report,
     write_quality_report,
 )
+from subtitle_sources import (
+    SubtitleAsset,
+    assets_from_segments,
+    attach_asset_to_segments,
+    build_audio_asset,
+    build_embedded_asset,
+    build_processing_plan,
+    build_sidecar_asset,
+    is_authored_source,
+    model_may_hide_segment,
+    normalize_language,
+    source_manifest,
+)
 
 
 Segment = Dict[str, Any]
@@ -57,12 +70,15 @@ class ExistingSubtitleTracks:
     english: Optional[List[Segment]]
     chinese: List[Segment]
     source_label: str
+    english_asset: Optional[SubtitleAsset] = None
+    chinese_asset: Optional[SubtitleAsset] = None
+    supplementary_assets: Tuple[SubtitleAsset, ...] = ()
 
 
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m2ts", ".ts", ".mov", ".wmv"}
 SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt"}
 UNKNOWN_SOURCE_LANGUAGE_TAGS = {"", "auto", "source", "cached source", "subtitle", "embedded subtitle"}
-SOURCE_CACHE_VERSION = 5
+SOURCE_CACHE_VERSION = 6
 COMPATIBLE_SYNC_POLICY_VERSIONS = (5,)
 TARGET_CHINESE_CPS = 9.0
 TARGET_ENGLISH_CPS = 20.0
@@ -169,6 +185,7 @@ def build_source_request_fingerprint(
     chinese_sidecar_path: Optional[Path] = None,
     english_sidecar_path: Optional[Path] = None,
     sync_policy_version: Optional[int] = None,
+    processing_plan_fingerprint: Optional[str] = None,
 ) -> str:
     source_mode = str(getattr(args, "source", "auto") or "auto")
     discovered_sidecars: List[Dict[str, Any]] = []
@@ -206,6 +223,8 @@ def build_source_request_fingerprint(
         "crop_pad": int(getattr(args, "crop_pad", 8) or 8),
         "fast_ocr": bool(getattr(args, "fast_ocr", False)),
     }
+    if processing_plan_fingerprint:
+        descriptor["processing_plan_fingerprint"] = processing_plan_fingerprint
     serialized = json.dumps(descriptor, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
@@ -725,6 +744,47 @@ def source_track_text(segment: Segment) -> str:
     return clean_english_track_text(text) if should_clean_english_track(segment) else text
 
 
+def source_editing_policy(segments: List[Segment]) -> str:
+    authorities = {
+        str(
+            segment.get("source_text_authority")
+            or segment.get("text_authority")
+            or "unknown"
+        )
+        for segment in segments
+    }
+    if authorities == {"authored"}:
+        return (
+            "The source text is professionally authored. Preserve it exactly after markup and "
+            "whitespace normalization. Do not rewrite wording, merge repetitions, or hide events; "
+            "only produce the Chinese translation or missing-content review."
+        )
+    if "ocr" in authorities:
+        return (
+            "The source includes OCR text. Repair only evident recognition errors, prioritizing "
+            "low-confidence or impossible text and preserving credible authored wording."
+        )
+    if "asr" in authorities:
+        return (
+            "The source includes ASR text. You may repair recognition errors and proven adjacent "
+            "hallucination loops while preserving unique spoken content."
+        )
+    return (
+        "Preserve credible source wording. Only repair an error when the supplied source evidence "
+        "supports the change."
+    )
+
+
+def preserve_authored_source(
+    segment: Segment,
+    original: str,
+    proposed: str,
+) -> str:
+    if is_authored_source(segment):
+        return clean_subtitle_text(original)
+    return clean_subtitle_text(proposed)
+
+
 def classify_subtitle_text(text: str) -> str:
     sample = text[:20_000]
     cjk_count = len(CJK_RE.findall(sample))
@@ -1028,17 +1088,36 @@ def segments_to_events(segments: List[Segment], key: str = "text") -> List[Any]:
         if end <= start:
             continue
         confidence = segment.get("ocr_confidence")
+        metadata = (
+            dict(segment.get("ocr_metadata"))
+            if isinstance(segment.get("ocr_metadata"), dict)
+            else {}
+        )
+        for field_name in (
+            "source_asset_id",
+            "source_origin",
+            "source_representation",
+            "source_role",
+            "source_text_authority",
+            "source_timing_authority",
+            "supplementary_source",
+        ):
+            if segment.get(field_name) is not None:
+                metadata[field_name] = segment[field_name]
+        source_assets = [
+            dict(item)
+            for item in segment.get("source_assets") or []
+            if isinstance(item, dict)
+        ]
+        if source_assets:
+            metadata["source_assets"] = source_assets
         events.append(
             SubtitleEvent(
                 start,
                 end,
                 text,
                 float(confidence) if confidence is not None else None,
-                (
-                    segment.get("ocr_metadata")
-                    if isinstance(segment.get("ocr_metadata"), dict)
-                    else None
-                ),
+                metadata or None,
             )
         )
     return events
@@ -1048,6 +1127,10 @@ def merge_existing_subtitle_segments(
     en_segments: Optional[List[Segment]],
     zh_segments: List[Segment],
     source_label: str,
+    *,
+    english_asset: Optional[SubtitleAsset] = None,
+    chinese_asset: Optional[SubtitleAsset] = None,
+    supplementary_assets: Tuple[SubtitleAsset, ...] = (),
 ) -> List[Segment]:
     from subtitle_pipeline import pair_events
 
@@ -1062,6 +1145,21 @@ def merge_existing_subtitle_segments(
         if not en_event and not zh_event:
             continue
         timing_event = en_event or zh_event
+        timing_asset = english_asset if en_event else chinese_asset
+        if en_event and zh_event and english_asset and chinese_asset:
+            english_timing_score = (
+                english_asset.timing_authority == "authored",
+                english_asset.origin == "embedded",
+                english_asset.representation == "authored_text",
+            )
+            chinese_timing_score = (
+                chinese_asset.timing_authority == "authored",
+                chinese_asset.origin == "embedded",
+                chinese_asset.representation == "authored_text",
+            )
+            if chinese_timing_score > english_timing_score:
+                timing_event = zh_event
+                timing_asset = chinese_asset
         start = timing_event.start
         end = timing_event.end
         en_text = clean_english_track_text(en_event.text) if en_event else ""
@@ -1076,10 +1174,37 @@ def merge_existing_subtitle_segments(
             "text": text,
             "en": en_text,
             "zh": zh_text,
-            "source_language": source_label,
+            "source_language": (
+                english_asset.language
+                if en_text and english_asset
+                else (chinese_asset.language if chinese_asset else source_label)
+            ),
+            "source_label": source_label,
             "display": True,
             "preserve_distinct_overlap": True,
         }
+        if en_event and isinstance(en_event.metadata, dict):
+            for field_name in (
+                "source_asset_id",
+                "source_origin",
+                "source_representation",
+                "source_role",
+                "source_text_authority",
+                "source_timing_authority",
+                "supplementary_source",
+            ):
+                if en_event.metadata.get(field_name) is not None:
+                    item[field_name] = en_event.metadata[field_name]
+            source_assets = [
+                dict(asset)
+                for asset in en_event.metadata.get("source_assets") or []
+                if isinstance(asset, dict)
+            ]
+            if source_assets:
+                item["source_assets"] = source_assets
+        if timing_asset is not None:
+            item["timing_asset_id"] = timing_asset.asset_id
+            item["timing_authority"] = timing_asset.timing_authority
         lane_confidences = {
             lane: event.confidence
             for lane, event in (("en", en_event), ("zh", zh_event))
@@ -1089,6 +1214,50 @@ def merge_existing_subtitle_segments(
             item["ocr_confidence"] = min(lane_confidences.values())
             item["ocr_lane_confidences"] = lane_confidences
         merged.append(item)
+    supplementary_by_id = {
+        asset.asset_id: asset
+        for asset in supplementary_assets
+    }
+    for segment in merged:
+        if segment.get("supplementary_source"):
+            source_asset_ids = {
+                str(asset.get("asset_id"))
+                for asset in segment.get("source_assets") or []
+                if isinstance(asset, dict) and asset.get("asset_id")
+            }
+            direct_asset_id = str(segment.get("source_asset_id") or "")
+            supplementary_asset = supplementary_by_id.get(direct_asset_id)
+            if supplementary_asset is None:
+                supplementary_asset = next(
+                    (
+                        asset
+                        for asset_id, asset in supplementary_by_id.items()
+                        if asset_id in source_asset_ids
+                    ),
+                    None,
+                )
+            if supplementary_asset is None and len(supplementary_assets) == 1:
+                supplementary_asset = supplementary_assets[0]
+            if supplementary_asset is not None:
+                if not segment.get("source_asset_id"):
+                    attach_asset_to_segments(
+                        [segment],
+                        supplementary_asset,
+                        lane="source",
+                    )
+                attach_asset_to_segments(
+                    [segment],
+                    supplementary_asset,
+                    lane="supplementary",
+                )
+        elif (
+            segment.get("en")
+            and english_asset is not None
+            and not segment.get("source_asset_id")
+        ):
+            attach_asset_to_segments([segment], english_asset, lane="source")
+        if segment.get("zh") and chinese_asset is not None:
+            attach_asset_to_segments([segment], chinese_asset, lane="chinese")
     return merged
 
 
@@ -1103,29 +1272,85 @@ def find_existing_sidecar_subtitle_tracks(
     if not candidates:
         return None
 
+    explicit_candidates = {
+        path.resolve()
+        for path in (explicit_path, explicit_zh_path, explicit_en_path)
+        if path is not None and path.exists()
+    }
     zh_path: Optional[Path] = explicit_zh_path if explicit_zh_path and explicit_zh_path.exists() else None
     en_path: Optional[Path] = explicit_en_path if explicit_en_path and explicit_en_path.exists() else None
+    if explicit_path is not None and explicit_path.exists():
+        explicit_language = classify_subtitle_path(explicit_path)
+        if explicit_language == "zh" and zh_path is None:
+            zh_path = explicit_path
+        elif explicit_language == "en" and en_path is None:
+            en_path = explicit_path
+    candidate_assets: List[Tuple[Path, SubtitleAsset]] = []
     for candidate in candidates:
-        language = classify_subtitle_path(candidate)
-        if language == "zh" and zh_path is None:
-            zh_path = candidate
-        elif language == "en" and en_path is None:
-            en_path = candidate
+        candidate_asset = build_sidecar_asset(
+            video_path,
+            candidate,
+            likely_match=sidecar_match_score(video_path, candidate) > 0,
+            score=sidecar_match_score(video_path, candidate),
+        )
+        if (
+            candidate.resolve() not in explicit_candidates
+            and candidate_asset.role in {"forced", "commentary"}
+        ):
+            continue
+        candidate_assets.append((candidate, candidate_asset))
+
+    automatic_plan = build_processing_plan(
+        [asset for _, asset in candidate_assets],
+        merge_existing=True,
+    )
+    assets_by_id = {
+        asset.asset_id: path
+        for path, asset in candidate_assets
+    }
+    lanes = automatic_plan.get("lanes") or {}
+    if zh_path is None and lanes.get("chinese"):
+        zh_path = assets_by_id.get(str(lanes["chinese"]))
+    if en_path is None and lanes.get("source"):
+        en_path = assets_by_id.get(str(lanes["source"]))
 
     if zh_path is None:
         return None
 
     print(f"Using existing Chinese sidecar subtitle: {zh_path}")
     zh_segments = parse_subtitle_file(zh_path)
+    zh_asset = build_sidecar_asset(
+        video_path,
+        zh_path,
+        language="zh",
+        likely_match=sidecar_match_score(video_path, zh_path) > 0,
+        score=sidecar_match_score(video_path, zh_path),
+    )
+    for segment in zh_segments:
+        segment["source_language"] = "zh"
+    attach_asset_to_segments(zh_segments, zh_asset, lane="chinese")
     en_segments: Optional[List[Segment]] = None
+    en_asset: Optional[SubtitleAsset] = None
     if en_path and en_path != zh_path:
         print(f"Merging existing English sidecar subtitle: {en_path}")
         en_segments = parse_subtitle_file(en_path)
+        en_asset = build_sidecar_asset(
+            video_path,
+            en_path,
+            language="en",
+            likely_match=sidecar_match_score(video_path, en_path) > 0,
+            score=sidecar_match_score(video_path, en_path),
+        )
+        for segment in en_segments:
+            segment["source_language"] = "en"
+        attach_asset_to_segments(en_segments, en_asset, lane="source")
 
     return ExistingSubtitleTracks(
         english=en_segments,
         chinese=zh_segments,
         source_label="existing Chinese sidecar subtitle",
+        english_asset=en_asset,
+        chinese_asset=zh_asset,
     )
 
 
@@ -1149,6 +1374,9 @@ def find_existing_sidecar_subtitle_segments(
         tracks.english,
         tracks.chinese,
         tracks.source_label,
+        english_asset=tracks.english_asset,
+        chinese_asset=tracks.chinese_asset,
+        supplementary_assets=tracks.supplementary_assets,
     )
     return merged or None
 
@@ -1158,11 +1386,32 @@ def is_english_subtitle_stream(stream: Any) -> bool:
     return stream.lang in {"eng", "en"} or "english" in label
 
 
+def is_primary_subtitle_stream(stream: Any) -> bool:
+    title = str(getattr(stream, "title", "") or "").casefold()
+    if bool(getattr(stream, "is_forced", False)):
+        return False
+    if "forced" in title or "commentary" in title or "director comment" in title:
+        return False
+    return True
+
+
+def is_supported_auto_subtitle_stream(stream: Any) -> bool:
+    return bool(
+        getattr(stream, "is_text_subtitle", False)
+        or getattr(stream, "is_pgs", False)
+    )
+
+
 def choose_best_chinese_stream(streams: List[Any]) -> Tuple[Optional[Any], Optional[str]]:
     from subtitle_pipeline import classify_chinese, stream_score
 
     ranked = []
     for stream in streams:
+        if (
+            not is_primary_subtitle_stream(stream)
+            or not is_supported_auto_subtitle_stream(stream)
+        ):
+            continue
         zh_kind = classify_chinese(stream)
         if not zh_kind:
             continue
@@ -1185,10 +1434,23 @@ def choose_best_chinese_stream(streams: List[Any]) -> Tuple[Optional[Any], Optio
 def choose_best_english_stream(streams: List[Any]) -> Optional[Any]:
     from subtitle_pipeline import stream_score
 
-    english = [stream for stream in streams if is_english_subtitle_stream(stream)]
+    english = [
+        stream
+        for stream in streams
+        if is_english_subtitle_stream(stream)
+        and is_primary_subtitle_stream(stream)
+        and is_supported_auto_subtitle_stream(stream)
+    ]
     if not english:
         return None
-    english.sort(key=stream_score, reverse=True)
+    english.sort(
+        key=lambda stream: (
+            bool(getattr(stream, "is_hearing_impaired", False))
+            or "sdh" in str(getattr(stream, "title", "") or "").casefold(),
+            stream_score(stream),
+        ),
+        reverse=True,
+    )
     return english[0]
 
 
@@ -1242,6 +1504,7 @@ def find_existing_embedded_subtitle_tracks(
         "Using existing Chinese embedded subtitle stream "
         f"0:{zh_stream.index} {zh_stream.lang or '-'} {zh_stream.codec} {zh_stream.title}"
     )
+    zh_asset = build_embedded_asset(video_path, zh_stream)
     zh_events = get_stream_events(
         video_path,
         zh_stream,
@@ -1256,7 +1519,7 @@ def find_existing_embedded_subtitle_tracks(
             "start": event.start,
             "end": event.end,
             "text": event.text,
-            "source_language": "existing Chinese embedded subtitle",
+            "source_language": zh_asset.language or "zh",
             **(
                 {"ocr_confidence": event.confidence}
                 if event.confidence is not None
@@ -1269,13 +1532,16 @@ def find_existing_embedded_subtitle_tracks(
     ]
     if not zh_segments:
         return None
+    attach_asset_to_segments(zh_segments, zh_asset, lane="chinese")
 
     en_segments: Optional[List[Segment]] = None
+    en_asset: Optional[SubtitleAsset] = None
     if en_stream and en_stream.index != zh_stream.index:
         print(
             "Merging existing English embedded subtitle stream "
             f"0:{en_stream.index} {en_stream.lang or '-'} {en_stream.codec} {en_stream.title}"
         )
+        en_asset = build_embedded_asset(video_path, en_stream)
         en_events = get_stream_events(
             video_path,
             en_stream,
@@ -1290,7 +1556,7 @@ def find_existing_embedded_subtitle_tracks(
                 "start": event.start,
                 "end": event.end,
                 "text": event.text,
-                "source_language": "existing English embedded subtitle",
+                "source_language": en_asset.language or "en",
                 **(
                     {"ocr_confidence": event.confidence}
                     if event.confidence is not None
@@ -1301,11 +1567,14 @@ def find_existing_embedded_subtitle_tracks(
             for idx, event in enumerate(en_events)
             if event.text.strip()
         ]
+        attach_asset_to_segments(en_segments, en_asset, lane="source")
 
     return ExistingSubtitleTracks(
         english=en_segments,
         chinese=zh_segments,
         source_label="existing Chinese embedded subtitle",
+        english_asset=en_asset,
+        chinese_asset=zh_asset,
     )
 
 
@@ -1329,6 +1598,9 @@ def find_existing_embedded_subtitle_segments(
         tracks.english,
         tracks.chinese,
         tracks.source_label,
+        english_asset=tracks.english_asset,
+        chinese_asset=tracks.chinese_asset,
+        supplementary_assets=tracks.supplementary_assets,
     )
     return merged or None
 
@@ -1426,6 +1698,9 @@ def synchronize_existing_subtitle_tracks(
             english=selected_english,
             chinese=selected_chinese,
             source_label=tracks.source_label,
+            english_asset=tracks.english_asset,
+            chinese_asset=tracks.chinese_asset,
+            supplementary_assets=tracks.supplementary_assets,
         ),
         report,
     )
@@ -1476,15 +1751,31 @@ def load_embedded_subtitle_events(
             raise RuntimeError(f"Embedded subtitle stream 0:{stream_index} was not found.")
         stream = matches[0]
     else:
-        requested = (source_language or "").lower()
-        preferred = [
+        pool = [
             stream
             for stream in streams
-            if requested and (stream.lang.lower() == requested or requested in stream.title.lower())
+            if is_primary_subtitle_stream(stream)
+            and is_supported_auto_subtitle_stream(stream)
         ]
-        pool = preferred or streams
-        pool.sort(key=stream_score, reverse=True)
-        stream = pool[0]
+        if not pool:
+            raise RuntimeError(
+                "Only forced/commentary subtitle streams were found; no full-dialogue "
+                "embedded subtitle is safe for automatic selection."
+            )
+        plan = build_processing_plan(
+            [build_embedded_asset(video_path, candidate) for candidate in pool],
+            preferred_source_language=source_language,
+            merge_existing=True,
+        )
+        selected_asset_id = (plan.get("lanes") or {}).get("source")
+        selected_by_id = {
+            build_embedded_asset(video_path, candidate).asset_id: candidate
+            for candidate in pool
+        }
+        stream = selected_by_id.get(str(selected_asset_id))
+        if stream is None:
+            pool.sort(key=stream_score, reverse=True)
+            stream = pool[0]
 
     language_hint = source_language if source_language and source_language != "auto" else stream.lang
     ocr_lang = args.subtitle_ocr_lang
@@ -1492,6 +1783,7 @@ def load_embedded_subtitle_events(
         ocr_lang = choose_ocr_lang(language_hint)
 
     print(f"Using embedded subtitle stream 0:{stream.index} {stream.lang or '-'} {stream.codec} {stream.title}")
+    asset = build_embedded_asset(video_path, stream)
     events = get_stream_events(video_path, stream, ffmpeg, out_dir / "embedded" / f"stream_{stream.index:02d}", ocr_lang, args)
     segments = [
         {
@@ -1499,7 +1791,7 @@ def load_embedded_subtitle_events(
             "start": event.start,
             "end": event.end,
             "text": event.text,
-            "source_language": stream.lang or source_language,
+            "source_language": asset.language or stream.lang or source_language,
             **(
                 {"ocr_confidence": event.confidence}
                 if event.confidence is not None
@@ -1512,7 +1804,339 @@ def load_embedded_subtitle_events(
     ]
     if not segments:
         raise RuntimeError(f"Embedded subtitle stream 0:{stream.index} did not produce usable subtitle events.")
+    attach_asset_to_segments(segments, asset, lane="source")
     return segments
+
+
+def discover_automatic_source_assets(
+    video_path: Path,
+    selected_path: Optional[Path],
+) -> List[SubtitleAsset]:
+    assets = [
+        build_sidecar_asset(
+            video_path,
+            path,
+            likely_match=sidecar_match_score(video_path, path) > 0,
+            score=sidecar_match_score(video_path, path),
+        )
+        for path in likely_sidecar_subtitles(video_path, selected_path)
+    ]
+    try:
+        from subtitle_pipeline import find_ffmpeg, probe_streams
+
+        ffmpeg = find_ffmpeg(None)
+        for stream in probe_streams(video_path, ffmpeg):
+            if stream.is_subtitle:
+                assets.append(build_embedded_asset(video_path, stream))
+            elif stream.is_audio:
+                assets.append(build_audio_asset(video_path, stream))
+    except Exception as exc:
+        print(f"Automatic source inventory could not read embedded streams: {exc}")
+    return assets
+
+
+def load_best_sidecar_source_track(
+    video_path: Path,
+    selected_path: Optional[Path],
+    *,
+    preferred_source_language: str = "auto",
+) -> Tuple[Optional[List[Segment]], Optional[SubtitleAsset]]:
+    candidates = likely_sidecar_subtitles(video_path, selected_path)
+    candidate_assets = [
+        (
+            path,
+            build_sidecar_asset(
+                video_path,
+                path,
+                likely_match=sidecar_match_score(video_path, path) > 0,
+                score=sidecar_match_score(video_path, path),
+            ),
+        )
+        for path in candidates
+    ]
+    plan = build_processing_plan(
+        [asset for _, asset in candidate_assets],
+        preferred_source_language=preferred_source_language,
+        merge_existing=True,
+    )
+    source_asset_id = (plan.get("lanes") or {}).get("source")
+    selected = next(
+        (
+            (path, asset)
+            for path, asset in candidate_assets
+            if asset.asset_id == source_asset_id
+        ),
+        None,
+    )
+    if selected is None:
+        return None, None
+    path, asset = selected
+    segments = parse_subtitle_file(path)
+    for segment in segments:
+        segment["source_language"] = asset.language or preferred_source_language
+    attach_asset_to_segments(segments, asset, lane="source")
+    return segments or None, asset
+
+
+def load_best_embedded_source_track(
+    video_path: Path,
+    out_dir: Path,
+    args: argparse.Namespace,
+    *,
+    preferred_source_language: str = "auto",
+) -> Tuple[Optional[List[Segment]], Optional[SubtitleAsset]]:
+    try:
+        from subtitle_pipeline import find_ffmpeg, probe_streams
+
+        ffmpeg = find_ffmpeg(None)
+        streams = [
+            stream
+            for stream in probe_streams(video_path, ffmpeg)
+            if stream.is_subtitle
+            and is_primary_subtitle_stream(stream)
+            and is_supported_auto_subtitle_stream(stream)
+        ]
+    except Exception as exc:
+        print(f"Unable to inspect embedded source tracks for cross-source merge: {exc}")
+        return None, None
+    assets_by_id = {
+        build_embedded_asset(video_path, stream).asset_id: (
+            stream,
+            build_embedded_asset(video_path, stream),
+        )
+        for stream in streams
+    }
+    plan = build_processing_plan(
+        [asset for _, asset in assets_by_id.values()],
+        preferred_source_language=preferred_source_language,
+        merge_existing=True,
+    )
+    source_asset_id = (plan.get("lanes") or {}).get("source")
+    selected = assets_by_id.get(str(source_asset_id))
+    if selected is None:
+        return None, None
+    stream, asset = selected
+    segments = load_embedded_subtitle_events(
+        video_path,
+        stream_index=stream.index,
+        source_language=asset.language or preferred_source_language,
+        out_dir=out_dir,
+        args=args,
+    )
+    return segments or None, asset
+
+
+def add_cross_origin_source_track(
+    tracks: ExistingSubtitleTracks,
+    video_path: Path,
+    selected_path: Optional[Path],
+    out_dir: Path,
+    args: argparse.Namespace,
+    *,
+    preferred_source_language: str = "auto",
+) -> ExistingSubtitleTracks:
+    if tracks.english:
+        return tracks
+    chinese_origin = tracks.chinese_asset.origin if tracks.chinese_asset else ""
+    if chinese_origin == "embedded":
+        source_segments, source_asset = load_best_sidecar_source_track(
+            video_path,
+            selected_path,
+            preferred_source_language=preferred_source_language,
+        )
+    else:
+        source_segments, source_asset = load_best_embedded_source_track(
+            video_path,
+            out_dir,
+            args,
+            preferred_source_language=preferred_source_language,
+        )
+    if not source_segments or source_asset is None:
+        return tracks
+    print(
+        "Merging cross-origin source subtitle track: "
+        f"{source_asset.origin} {source_asset.label}"
+    )
+    return ExistingSubtitleTracks(
+        english=source_segments,
+        chinese=tracks.chinese,
+        source_label=f"{tracks.source_label} + {source_asset.origin} source subtitle",
+        english_asset=source_asset,
+        chinese_asset=tracks.chinese_asset,
+        supplementary_assets=tracks.supplementary_assets,
+    )
+
+
+def _source_event_key(text: str) -> str:
+    return re.sub(
+        r"[\W_]+",
+        "",
+        clean_subtitle_text(text).casefold(),
+        flags=re.UNICODE,
+    )
+
+
+def merge_supplementary_source_segments(
+    primary: Optional[List[Segment]],
+    supplementary: List[Segment],
+) -> List[Segment]:
+    merged = [dict(segment) for segment in (primary or [])]
+    for extra in supplementary:
+        extra_key = _source_event_key(str(extra.get("text") or ""))
+        if not extra_key:
+            continue
+        extra_start = float(extra["start"])
+        extra_end = float(extra["end"])
+        extra_duration = max(0.01, extra_end - extra_start)
+        duplicate = False
+        for existing in merged:
+            existing_key = _source_event_key(str(existing.get("text") or ""))
+            if not existing_key:
+                continue
+            overlap = max(
+                0.0,
+                min(extra_end, float(existing["end"]))
+                - max(extra_start, float(existing["start"])),
+            )
+            overlap_ratio = overlap / min(
+                extra_duration,
+                max(0.01, float(existing["end"]) - float(existing["start"])),
+            )
+            text_ratio = min(len(extra_key), len(existing_key)) / max(
+                len(extra_key),
+                len(existing_key),
+            )
+            same_text = (
+                extra_key == existing_key
+                or (
+                    text_ratio >= 0.85
+                    and (
+                        extra_key in existing_key
+                        or existing_key in extra_key
+                    )
+                )
+            )
+            if overlap_ratio >= 0.5 and same_text:
+                duplicate = True
+                break
+        if duplicate:
+            continue
+        merged.append(
+            {
+                **extra,
+                "supplementary_source": True,
+            }
+        )
+    merged.sort(
+        key=lambda segment: (
+            float(segment["start"]),
+            float(segment["end"]),
+            str(segment.get("text") or ""),
+        )
+    )
+    for index, segment in enumerate(merged):
+        segment["id"] = index
+    return merged
+
+
+def load_subtitle_asset_segments(
+    asset: SubtitleAsset,
+    video_path: Path,
+    out_dir: Path,
+    args: argparse.Namespace,
+) -> Optional[List[Segment]]:
+    if asset.origin == "sidecar" and asset.path:
+        path = Path(asset.path)
+        if not path.exists():
+            return None
+        segments = parse_subtitle_file(path)
+        for segment in segments:
+            segment["source_language"] = asset.language or args.source_language
+        attach_asset_to_segments(segments, asset, lane="source")
+        return segments or None
+    if asset.origin == "embedded" and asset.stream_index is not None:
+        return load_embedded_subtitle_events(
+            video_path,
+            stream_index=asset.stream_index,
+            source_language=asset.language or args.source_language,
+            out_dir=out_dir,
+            args=args,
+        )
+    return None
+
+
+def merge_planned_supplementary_segments(
+    primary: Optional[List[Segment]],
+    assets: List[SubtitleAsset],
+    plan: Optional[Dict[str, Any]],
+    video_path: Path,
+    out_dir: Path,
+    args: argparse.Namespace,
+) -> Tuple[List[Segment], Tuple[SubtitleAsset, ...]]:
+    supplementary_ids = set(
+        (plan or {}).get("lanes", {}).get("supplementary") or []
+    )
+    selected_assets = [
+        asset
+        for asset in assets
+        if asset.asset_id in supplementary_ids
+        and normalize_language(asset.language) != "zh"
+        and asset.role in {"forced", "sdh"}
+    ]
+    if not selected_assets:
+        return [dict(segment) for segment in (primary or [])], ()
+
+    merged = [dict(segment) for segment in (primary or [])]
+    loaded_assets: List[SubtitleAsset] = []
+    for asset in selected_assets:
+        segments = load_subtitle_asset_segments(
+            asset,
+            video_path,
+            out_dir,
+            args,
+        )
+        if not segments:
+            continue
+        merged = merge_supplementary_source_segments(merged, segments)
+        loaded_assets.append(asset)
+        print(
+            "Merged supplementary subtitle track: "
+            f"{asset.origin} {asset.label}"
+        )
+    return merged, tuple(loaded_assets)
+
+
+def add_supplementary_source_tracks(
+    tracks: ExistingSubtitleTracks,
+    assets: List[SubtitleAsset],
+    plan: Optional[Dict[str, Any]],
+    video_path: Path,
+    out_dir: Path,
+    args: argparse.Namespace,
+) -> ExistingSubtitleTracks:
+    english, loaded_assets = merge_planned_supplementary_segments(
+        tracks.english,
+        assets,
+        plan,
+        video_path,
+        out_dir,
+        args,
+    )
+    if not loaded_assets:
+        return tracks
+
+    supplementary_assets = {
+        asset.asset_id: asset
+        for asset in (*tracks.supplementary_assets, *loaded_assets)
+    }
+    return ExistingSubtitleTracks(
+        english=english,
+        chinese=tracks.chinese,
+        source_label=f"{tracks.source_label} + supplementary source cues",
+        english_asset=tracks.english_asset or loaded_assets[0],
+        chinese_asset=tracks.chinese_asset,
+        supplementary_assets=tuple(supplementary_assets.values()),
+    )
 
 
 def join_words(words: List[Dict[str, Any]]) -> str:
@@ -2111,6 +2735,11 @@ def guard_model_hidden_segment_at(
         return
 
     segment["model_display_requested"] = False
+    if not model_may_hide_segment(source_segments[index]):
+        segment["display"] = True
+        segment["display_guard"] = "forced_visible"
+        segment["display_guard_reason"] = "authored_source_preserved"
+        return
     reason = model_hide_support_reason(source_segments, processed_segments, index)
     if reason:
         segment["display"] = False
@@ -2488,6 +3117,42 @@ def reading_budgets(
     return chinese_budget, english_budget
 
 
+def recognition_risk_labels(segment: Segment) -> List[str]:
+    labels: List[str] = []
+    authority = str(
+        segment.get("source_text_authority")
+        or segment.get("text_authority")
+        or ""
+    )
+    if authority == "authored":
+        return ["authored_source"]
+    if authority == "ocr":
+        try:
+            confidence = float(segment.get("ocr_confidence"))
+        except (TypeError, ValueError):
+            confidence = None
+        if confidence is None:
+            labels.append("ocr_confidence_unknown")
+        elif confidence < 0.75:
+            labels.append("low_ocr_confidence")
+    if authority == "asr":
+        for key, threshold, label, comparison in (
+            ("asr_avg_logprob", -1.0, "low_asr_log_probability", "lt"),
+            ("asr_compression_ratio", 2.4, "high_asr_compression_ratio", "gt"),
+            ("asr_no_speech_prob", 0.6, "high_no_speech_probability", "gt"),
+            ("asr_word_confidence", 0.65, "low_word_confidence", "lt"),
+        ):
+            try:
+                value = float(segment.get(key))
+            except (TypeError, ValueError):
+                continue
+            if (comparison == "lt" and value < threshold) or (
+                comparison == "gt" and value > threshold
+            ):
+                labels.append(label)
+    return labels or ["no_recognition_risk"]
+
+
 def format_prompt_segment(
     index: int,
     segment: Segment,
@@ -2499,9 +3164,16 @@ def format_prompt_segment(
     if include_readability_limits:
         chinese_budget, english_budget = reading_budgets(segment, next_start)
         suffix = f" | LIMITS: ZH_MAX={chinese_budget}, SOURCE_MAX={english_budget}"
+    authority = str(
+        segment.get("source_text_authority")
+        or segment.get("text_authority")
+        or "unknown"
+    )
+    risk = ",".join(recognition_risk_labels(segment))
     return (
         f"[{index}] {float(segment['start']):.2f}->{float(segment['end']):.2f} "
-        f"{segment['text']}{suffix}"
+        f"{segment['text']} | SOURCE_AUTHORITY={authority} "
+        f"| RECOGNITION_RISK={risk}{suffix}"
     )
 
 
@@ -2520,10 +3192,23 @@ def format_bilingual_prompt_segment(
     if include_readability_limits:
         chinese_budget, english_budget = reading_budgets(segment, next_start)
         suffix = f" | LIMITS: ZH_MAX={chinese_budget}, EN_MAX={english_budget}"
+    authority = str(
+        segment.get("source_text_authority")
+        or segment.get("text_authority")
+        or "unknown"
+    )
+    chinese_authority = str(
+        segment.get("chinese_text_authority")
+        or "unknown"
+    )
+    risk = ",".join(recognition_risk_labels(segment))
     return (
         f"[{index}] {float(segment['start']):.2f}->{float(segment['end']):.2f} "
         f"EN: {source_text or '-'} | ZH: {zh_text or '-'} "
-        f"| SOURCE_LANGUAGE={source_language}{suffix}"
+        f"| SOURCE_LANGUAGE={source_language} "
+        f"| SOURCE_AUTHORITY={authority} "
+        f"| CHINESE_AUTHORITY={chinese_authority} "
+        f"| RECOGNITION_RISK={risk}{suffix}"
     )
 
 
@@ -3025,6 +3710,8 @@ Rules:
 - One input line must still produce one output object for checkpointing.
 {display_requirement}
 - Correct obvious source-language and Chinese OCR/subtitle recognition errors.
+- When SOURCE_AUTHORITY=authored, copy the source-language text unchanged into corrected_english.
+- Only ASR/OCR events may be hidden as proven duplicate loops; authored subtitle events must remain visible.
 - Convert Traditional Chinese to natural Simplified Chinese.
 - If corrected_chinese is already non-empty and complete, preserve its meaning and only proofread it. Do not replace it with a fresh translation.
 - Translate source-track information into corrected_chinese only when the original Chinese is empty or clearly incomplete.
@@ -3087,6 +3774,9 @@ Rules:
 - Do not output previous or following context lines.
 - Do not add explanations, markdown, notes, or extra keys.
 - Correct obvious ASR/OCR/subtitle errors in the source text before translating.
+- When SOURCE_AUTHORITY=authored, copy the source text unchanged into corrected_text.
+- When SOURCE_AUTHORITY=ocr but RECOGNITION_RISK=no_recognition_risk, preserve the source unless the context proves an error.
+- Only ASR/OCR events may be hidden as proven duplicate loops; authored subtitle events must remain visible.
 - Keep corrected_text in the original source language.
 - Translate into natural Simplified Chinese.
 - LIMITS are maximum visible character budgets calculated from the available display time. Keep chinese_translation within ZH_MAX by using concise natural Chinese without dropping the intended meaning.
@@ -3184,9 +3874,11 @@ def translate_and_correct_segments(
     print("Starting sentence-level LLM correction and translation...")
     language_label = "the source language" if not source_language or source_language == "auto" else source_language
     style_text = format_style_guide(style_guide)
+    editing_policy = source_editing_policy(segments)
     system_prompt = (
         "You are a professional subtitle editor and Chinese translator. "
-        "Repair ASR/OCR errors, repeated hallucinated fragments, and duplicate subtitle loops while preserving source timing anchors. "
+        f"{editing_policy} "
+        "Preserve source timing anchors. "
         f"Follow this movie-wide style guide exactly:\n{style_text}"
     )
 
@@ -3204,6 +3896,11 @@ def translate_and_correct_segments(
                     expected_model=llm_model,
                     expected_policy_version=PROCESSING_POLICY_VERSION,
                     expected_terminology_policy_version=TERMINOLOGY_POLICY_VERSION,
+                    expected_plan_fingerprint=str(
+                        segments[0].get("processing_plan_fingerprint") or ""
+                    )
+                    if segments
+                    else "",
                 )
             ):
                 processed_segments = sanitize_checkpoint_display_timing(cached)
@@ -3280,6 +3977,9 @@ The source subtitle/audio language is: {language_label}.
 === MOVIE-WIDE STYLE GUIDE, FOLLOW THROUGHOUT ===
 {style_text}
 
+=== SOURCE AUTHORITY POLICY ===
+{editing_policy}
+
 === APPROVED MOVIE-WIDE TERMINOLOGY, USE EXACTLY ===
 {terminology_text}
 
@@ -3312,6 +4012,9 @@ Rules:
 - Do not output previous or following context lines.
 - Do not add explanations, markdown, notes, or extra keys.
 - Correct obvious ASR/OCR/subtitle errors in the source text before translating.
+- When SOURCE_AUTHORITY=authored, copy the source text unchanged into corrected_text.
+- When SOURCE_AUTHORITY=ocr but RECOGNITION_RISK=no_recognition_risk, preserve the source unless the context proves an error.
+- Only ASR/OCR events may be hidden as proven duplicate loops; authored subtitle events must remain visible.
 - Keep corrected_text in the original source language.
 - Translate into natural Simplified Chinese.
 - You MUST translate uppercase descriptive text in parentheses or brackets (e.g. "(SIGHS)" or "[MUSIC]") into Simplified Chinese.
@@ -3366,7 +4069,11 @@ Rules:
                     or item.get("corrected_english")
                     or segment["text"]
                 )
-                corrected = clean_subtitle_text(corrected_val)
+                corrected = preserve_authored_source(
+                    segment,
+                    str(segment.get("text") or ""),
+                    corrected_val,
+                )
                 translated_val = str(item.get("chinese_translation") or "")
                 translated = clean_subtitle_text(translated_val)
                 candidate_metadata = {
@@ -3441,7 +4148,11 @@ Rules:
                         or item.get("corrected_english")
                         or segment["text"]
                     )
-                    corrected = clean_subtitle_text(corrected_val)
+                    corrected = preserve_authored_source(
+                        segment,
+                        str(segment.get("text") or ""),
+                        corrected_val,
+                    )
                     translated_val = str(item.get("chinese_translation") or "")
                     translated = clean_subtitle_text(translated_val)
                     candidate_metadata.update(
@@ -3546,9 +4257,11 @@ def proofread_existing_chinese_segments(
 ) -> List[Segment]:
     print("Starting LLM proofreading for existing Chinese subtitles; translation is skipped.")
     style_text = format_style_guide(style_guide)
+    editing_policy = source_editing_policy(segments)
     system_prompt = (
         "You are a professional bilingual subtitle proofreader. "
-        "Fix English and Chinese OCR/subtitle recognition errors, repeated lines, and duplicate loops. "
+        f"{editing_policy} "
+        "Fix Chinese OCR/subtitle recognition errors conservatively. "
         "Do not translate when Chinese subtitles are already provided. "
         f"Follow this movie-wide style guide exactly:\n{style_text}"
     )
@@ -3567,6 +4280,11 @@ def proofread_existing_chinese_segments(
                     expected_model=llm_model,
                     expected_policy_version=PROCESSING_POLICY_VERSION,
                     expected_terminology_policy_version=TERMINOLOGY_POLICY_VERSION,
+                    expected_plan_fingerprint=str(
+                        segments[0].get("processing_plan_fingerprint") or ""
+                    )
+                    if segments
+                    else "",
                 )
             ):
                 processed_segments = sanitize_checkpoint_display_timing(to_simplified_segments(cached))
@@ -3646,6 +4364,9 @@ Do not retranslate a non-empty Chinese line. Translate source-track information 
 === MOVIE-WIDE STYLE GUIDE, FOLLOW THROUGHOUT ===
 {style_text}
 
+=== SOURCE AUTHORITY POLICY ===
+{editing_policy}
+
 === APPROVED MOVIE-WIDE TERMINOLOGY, USE EXACTLY ===
 {terminology_text}
 
@@ -3671,6 +4392,8 @@ Schema:
 Rules:
 - One input line must still produce one output object for checkpointing.
 - Correct obvious source-language and Chinese OCR/subtitle recognition errors.
+- When SOURCE_AUTHORITY=authored, copy the source-language text unchanged into corrected_english.
+- Only ASR/OCR events may be hidden as proven duplicate loops; authored subtitle events must remain visible.
 - Convert Traditional Chinese to natural Simplified Chinese.
 - If corrected_chinese is already non-empty and complete, preserve its meaning and only proofread it. Do not replace it with a fresh translation.
 - Translate source-track information into corrected_chinese only when the original Chinese is empty or clearly incomplete.
@@ -3730,7 +4453,11 @@ Rules:
                 original_en, original_zh = original_en_zh(segment)
                 corrected_en_val = str(item.get("corrected_english") or item.get("en") or original_en)
                 corrected_en = (
-                    clean_subtitle_text(corrected_en_val)
+                    preserve_authored_source(
+                        segment,
+                        original_en,
+                        corrected_en_val,
+                    )
                     if original_en
                     else ""
                 )
@@ -3818,7 +4545,11 @@ Rules:
                     item.update(retry_item)
                     corrected_en_val = str(item.get("corrected_english") or item.get("en") or original_en)
                     corrected_en = (
-                        clean_subtitle_text(corrected_en_val)
+                        preserve_authored_source(
+                            segment,
+                            original_en,
+                            corrected_en_val,
+                        )
                         if original_en
                         else ""
                     )
@@ -3917,6 +4648,11 @@ def final_qa_fingerprint(
             "zh": segment.get("zh"),
             "display": segment.get("display", True),
             "source_language": segment.get("source_language"),
+            "source_text_authority": segment.get("source_text_authority"),
+            "chinese_text_authority": segment.get("chinese_text_authority"),
+            "processing_plan_fingerprint": segment.get(
+                "processing_plan_fingerprint"
+            ),
             "manual_reviewed_at": segment.get("manual_reviewed_at"),
         }
         for segment in segments
@@ -4000,6 +4736,7 @@ def run_final_subtitle_qa(
             print(f"Resuming independent final QA at item {len(reviewed) + 1}.")
 
     style_text = format_style_guide(style_guide)
+    editing_policy = source_editing_policy(segments)
     glossary = terminology_from_segments(
         reviewed or segments,
         (style_guide or {}).get("terminology"),
@@ -4033,6 +4770,9 @@ Another editor already translated and proofread them. Do not trust earlier wordi
 === MOVIE-WIDE STYLE GUIDE ===
 {style_text}
 
+=== SOURCE AUTHORITY POLICY ===
+{editing_policy}
+
 === APPROVED TERMINOLOGY ===
 {format_terminology_glossary(glossary, batch_text)}
 
@@ -4049,6 +4789,8 @@ Return exactly {len(batch)} JSON objects using the provided schema.
 Rules:
 - Preserve every local index, timestamp, and display decision.
 - Correct residual ASR/OCR errors, grammar, mistranslation, inconsistent names, forms of address, and terminology.
+- When SOURCE_AUTHORITY=authored, preserve the source-language text exactly and review only the Chinese lane.
+- Treat recognition confidence as review priority, not proof that text is correct or incorrect.
 - `corrected_english` is a legacy schema field name for the SOURCE track. The source may be English, Japanese, Korean, or another language.
 - Keep `corrected_english` in the same language and script as SOURCE_LANGUAGE. Never translate the source track into English.
 - Keep a non-empty Chinese subtitle's meaning; translate only source-track information missing from Chinese.
@@ -4084,8 +4826,10 @@ Rules:
                 )
                 continue
             original_source, original_zh = original_en_zh(segment)
-            corrected_source = clean_subtitle_text(
-                str(item.get("corrected_english") or original_source)
+            corrected_source = preserve_authored_source(
+                segment,
+                original_source,
+                str(item.get("corrected_english") or original_source),
             )
             corrected_zh = to_simplified_text(
                 clean_subtitle_text(
@@ -4210,6 +4954,7 @@ def checkpoint_matches_segments(
     expected_model: Optional[str] = None,
     expected_policy_version: Optional[int] = None,
     expected_terminology_policy_version: Optional[int] = None,
+    expected_plan_fingerprint: Optional[str] = None,
 ) -> bool:
     for index, cached_segment in enumerate(cached):
         if index >= len(segments):
@@ -4251,6 +4996,16 @@ def checkpoint_matches_segments(
                 "Ignoring checkpoint because its processing policy is outdated "
                 f"at item {index}: expected {expected_policy_version}, "
                 f"got {cached_segment.get('processing_policy_version')!r}."
+            )
+            return False
+        if (
+            expected_plan_fingerprint
+            and str(cached_segment.get("processing_plan_fingerprint") or "")
+            != expected_plan_fingerprint
+        ):
+            print(
+                "Ignoring checkpoint because its processing plan does not match "
+                f"the current source plan at item {index}."
             )
             return False
         current_fingerprint = str(current.get("source_request_fingerprint") or "")
@@ -4443,6 +5198,27 @@ def segments_have_chinese(segments: List[Segment]) -> bool:
     return len(CJK_RE.findall(" ".join(text_without_english))) >= 3
 
 
+def require_safe_automatic_audio_selection(
+    audio_assets: List[SubtitleAsset],
+    *,
+    explicit_stream: Optional[int],
+    selected_asset: Optional[SubtitleAsset],
+) -> None:
+    if explicit_stream is not None or selected_asset is not None or not audio_assets:
+        return
+    rejected = ", ".join(
+        asset.label
+        for asset in audio_assets
+        if asset.role == "commentary"
+    )
+    detail = f" Detected tracks: {rejected}." if rejected else ""
+    raise RuntimeError(
+        "Only commentary or audio-description tracks are available for automatic "
+        "selection. Choose the intended dialogue audio track explicitly before "
+        f"running speech recognition.{detail}"
+    )
+
+
 def main() -> None:
     configure_output_encoding()
     parser = argparse.ArgumentParser(description="Transcribe, import, OCR, correct, and translate subtitles to ASS.")
@@ -4527,6 +5303,8 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = out_dir / f"{movie_name}.segments.checkpoint.json"
     source_segments_path = out_dir / f"{movie_name}.segments.source.json"
+    source_manifest_path = out_dir / f"{movie_name}.source-manifest.json"
+    processing_plan_path = out_dir / f"{movie_name}.processing-plan.json"
     sync_report_path = out_dir / f"{movie_name}.subtitle-sync.report.json"
     terminology_path = out_dir / f"{movie_name}.terminology.json"
     style_guide_path = out_dir / f"{movie_name}.style-guide.json"
@@ -4539,8 +5317,212 @@ def main() -> None:
     if sidecar_path is None:
         sidecar_path = english_sidecar_path or chinese_sidecar_path
     merge_existing_subtitles = args.merge_existing_subtitles == "yes"
+    automatic_inventory_plan: Optional[Dict[str, Any]] = None
+    automatic_assets: List[SubtitleAsset] = []
+    preferred_auto_existing_origin = ""
+    preferred_auto_primary_asset: Optional[SubtitleAsset] = None
+    if args.source == "auto":
+        automatic_assets = discover_automatic_source_assets(
+            video_path,
+            input_path,
+        )
+        automatic_inventory_plan = build_processing_plan(
+            automatic_assets,
+            preferred_source_language=args.source_language,
+            merge_existing=merge_existing_subtitles,
+            synchronize_existing=args.subtitle_sync != "off",
+        )
+        automatic_lanes = automatic_inventory_plan.get("lanes") or {}
+        chinese_asset_id = automatic_lanes.get("chinese")
+        chinese_asset = next(
+            (
+                asset
+                for asset in automatic_assets
+                if asset.asset_id == chinese_asset_id
+            ),
+            None,
+        )
+        if chinese_asset is not None:
+            preferred_auto_existing_origin = chinese_asset.origin
+        preferred_auto_primary_asset_id = (
+            chinese_asset_id or automatic_lanes.get("source")
+        )
+        preferred_auto_primary_asset = next(
+            (
+                asset
+                for asset in automatic_assets
+                if asset.asset_id == preferred_auto_primary_asset_id
+            ),
+            None,
+        )
+        explicit_sidecar_primary = (
+            Path(args.subtitle_file or args.srt)
+            if (args.subtitle_file or args.srt)
+            else (
+                chinese_sidecar_path
+                or (
+                    english_sidecar_path
+                    if not merge_existing_subtitles
+                    else None
+                )
+            )
+        )
+        explicit_stream_index = (
+            args.subtitle_stream
+            if args.subtitle_stream is not None
+            else (
+                args.chinese_subtitle_stream
+                if args.chinese_subtitle_stream is not None
+                else (
+                    args.english_subtitle_stream
+                    if not merge_existing_subtitles
+                    else None
+                )
+            )
+        )
+        if (
+            explicit_sidecar_primary is not None
+            and explicit_sidecar_primary.exists()
+        ):
+            preferred_auto_primary_asset = build_sidecar_asset(
+                video_path,
+                explicit_sidecar_primary,
+                likely_match=True,
+                score=max(
+                    100,
+                    sidecar_match_score(
+                        video_path,
+                        explicit_sidecar_primary,
+                    ),
+                ),
+            )
+            preferred_auto_existing_origin = "sidecar"
+        elif explicit_stream_index is not None:
+            explicit_embedded_asset = next(
+                (
+                    asset
+                    for asset in automatic_assets
+                    if asset.origin == "embedded"
+                    and asset.stream_index == explicit_stream_index
+                ),
+                None,
+            )
+            if explicit_embedded_asset is not None:
+                preferred_auto_primary_asset = explicit_embedded_asset
+                preferred_auto_existing_origin = "embedded"
+        print(
+            "Automatic source inventory recommendation: "
+            f"{automatic_inventory_plan.get('route')}, "
+            f"existing_origin={preferred_auto_existing_origin or 'none'}"
+        )
+    audio_inventory_assets = automatic_assets
+    if args.source != "auto" and args.audio_stream is None and not any(
+        asset.origin == "audio"
+        for asset in audio_inventory_assets
+    ):
+        audio_inventory_assets = discover_automatic_source_assets(
+            video_path,
+            input_path,
+        )
+    audio_assets = [
+        asset
+        for asset in audio_inventory_assets
+        if asset.origin == "audio"
+    ]
+    preferred_audio_asset: Optional[SubtitleAsset] = None
+    if args.audio_stream is None:
+        if audio_assets:
+            audio_plan = build_processing_plan(
+                audio_assets,
+                preferred_source_language=args.source_language,
+                merge_existing=False,
+            )
+            audio_asset_id = (audio_plan.get("lanes") or {}).get("source")
+            preferred_audio_asset = next(
+                (
+                    asset
+                    for asset in audio_assets
+                    if asset.asset_id == audio_asset_id
+                ),
+                None,
+            )
+    effective_audio_stream = (
+        args.audio_stream
+        if args.audio_stream is not None
+        else (
+            preferred_audio_asset.stream_index
+            if preferred_audio_asset is not None
+            else None
+        )
+    )
+    effective_audio_asset = next(
+        (
+            asset
+            for asset in audio_assets
+            if asset.stream_index == effective_audio_stream
+        ),
+        None,
+    )
+    if effective_audio_asset is None and effective_audio_stream is not None:
+        effective_audio_asset = build_audio_asset(
+            video_path,
+            stream_index=effective_audio_stream,
+            language=(
+                args.source_language
+                if args.source_language not in {"", "auto"}
+                else ""
+            ),
+        )
+    automatic_audio_selection_blocked = (
+        args.audio_stream is None
+        and bool(audio_assets)
+        and preferred_audio_asset is None
+    )
+    effective_subtitle_sync_mode = args.subtitle_sync
+    subtitle_sync_skip_reason = ""
+    if automatic_audio_selection_blocked and args.subtitle_sync != "off":
+        effective_subtitle_sync_mode = "off"
+        subtitle_sync_skip_reason = (
+            "Only commentary or audio-description tracks were available for "
+            "automatic audio selection."
+        )
+        print(
+            "Subtitle sync disabled: "
+            f"{subtitle_sync_skip_reason} Select an audio stream explicitly to sync."
+        )
+    automatic_plan_cache_fingerprint = (
+        str(automatic_inventory_plan.get("fingerprint"))
+        if automatic_inventory_plan
+        and any(
+            str(asset.get("origin") or "") in {"sidecar", "embedded"}
+            for asset in automatic_inventory_plan.get("selected_assets") or []
+            if isinstance(asset, dict)
+        )
+        else None
+    )
     if args.source in ("auto", "sidecar", "srt") and not sidecar_path:
-        sidecar_path = find_sidecar_subtitle(video_path, input_path)
+        if (
+            args.source == "auto"
+            and preferred_auto_primary_asset is not None
+            and preferred_auto_primary_asset.origin == "sidecar"
+            and preferred_auto_primary_asset.path
+        ):
+            sidecar_path = Path(preferred_auto_primary_asset.path)
+        else:
+            sidecar_path = find_sidecar_subtitle(video_path, input_path)
+    if args.source == "auto" and sidecar_path and sidecar_path.exists():
+        auto_sidecar_asset = build_sidecar_asset(
+            video_path,
+            sidecar_path,
+            likely_match=sidecar_match_score(video_path, sidecar_path) > 0,
+            score=sidecar_match_score(video_path, sidecar_path),
+        )
+        if auto_sidecar_asset.role in {"forced", "commentary"}:
+            print(
+                "Skipping automatic sidecar selection because it is a "
+                f"{auto_sidecar_asset.role} track: {sidecar_path}"
+            )
+            sidecar_path = None
     source_request_fingerprint = build_source_request_fingerprint(
         video_path,
         input_path,
@@ -4548,6 +5530,7 @@ def main() -> None:
         sidecar_path=sidecar_path,
         chinese_sidecar_path=chinese_sidecar_path,
         english_sidecar_path=english_sidecar_path,
+        processing_plan_fingerprint=automatic_plan_cache_fingerprint,
     )
     compatible_source_request_fingerprints = {
         build_source_request_fingerprint(
@@ -4558,6 +5541,7 @@ def main() -> None:
             chinese_sidecar_path=chinese_sidecar_path,
             english_sidecar_path=english_sidecar_path,
             sync_policy_version=version,
+            processing_plan_fingerprint=automatic_plan_cache_fingerprint,
         )
         for version in COMPATIBLE_SYNC_POLICY_VERSIONS
     }
@@ -4647,7 +5631,14 @@ def main() -> None:
                 print(f"Ignoring unreadable source cache {source_segments_path}: {exc}")
 
         if subtitle_segments is None:
-            if merge_existing_subtitles and args.source in ("auto", "sidecar", "srt"):
+            if (
+                merge_existing_subtitles
+                and args.source in ("auto", "sidecar", "srt")
+                and not (
+                    args.source == "auto"
+                    and preferred_auto_existing_origin == "embedded"
+                )
+            ):
                 existing_tracks = find_existing_sidecar_subtitle_tracks(
                     video_path,
                     input_path,
@@ -4657,7 +5648,11 @@ def main() -> None:
                 )
                 if existing_tracks:
                     actual_source = "existing Chinese sidecar subtitles"
-                    source_language = "existing Chinese subtitle"
+                    source_language = (
+                        existing_tracks.english_asset.language
+                        if existing_tracks.english_asset
+                        else "zh"
+                    )
 
             if existing_tracks is None and merge_existing_subtitles and args.source in ("auto", "embedded"):
                 try:
@@ -4670,25 +5665,85 @@ def main() -> None:
                     )
                     if existing_tracks:
                         actual_source = "existing Chinese embedded subtitles"
-                        source_language = "existing Chinese subtitle"
+                        source_language = (
+                            existing_tracks.english_asset.language
+                            if existing_tracks.english_asset
+                            else "zh"
+                        )
                 except Exception as exc:
                     if args.source == "embedded":
                         print(f"Failed to load embedded Chinese subtitles: {exc}", file=sys.stderr)
                         raise
                     print(f"No existing Chinese embedded subtitles available ({exc}).")
 
+            if (
+                existing_tracks is None
+                and merge_existing_subtitles
+                and args.source == "auto"
+                and preferred_auto_existing_origin == "embedded"
+            ):
+                existing_tracks = find_existing_sidecar_subtitle_tracks(
+                    video_path,
+                    input_path,
+                    explicit_path=None,
+                    explicit_zh_path=chinese_sidecar_path,
+                    explicit_en_path=english_sidecar_path,
+                )
+                if existing_tracks:
+                    actual_source = "existing Chinese sidecar subtitles"
+                    source_language = (
+                        existing_tracks.english_asset.language
+                        if existing_tracks.english_asset
+                        else "zh"
+                    )
+
+            if existing_tracks and args.source == "auto":
+                existing_tracks = add_cross_origin_source_track(
+                    existing_tracks,
+                    video_path,
+                    input_path,
+                    out_dir,
+                    args,
+                    preferred_source_language=args.source_language,
+                )
+                if existing_tracks.english_asset:
+                    source_language = (
+                        existing_tracks.english_asset.language
+                        or source_language
+                    )
+                existing_tracks = add_supplementary_source_tracks(
+                    existing_tracks,
+                    automatic_assets,
+                    automatic_inventory_plan,
+                    video_path,
+                    out_dir,
+                    args,
+                )
+
             if existing_tracks:
                 synchronized_tracks, sync_report = synchronize_existing_subtitle_tracks(
                     video_path,
                     existing_tracks,
-                    mode=args.subtitle_sync,
+                    mode=effective_subtitle_sync_mode,
                     report_path=sync_report_path,
-                    audio_stream=args.audio_stream,
+                    audio_stream=effective_audio_stream,
                 )
+                if subtitle_sync_skip_reason:
+                    sync_report.update(
+                        {
+                            "requested_mode": args.subtitle_sync,
+                            "status": "skipped_unsafe_audio_selection",
+                            "skip_reason": subtitle_sync_skip_reason,
+                        }
+                    )
+                    write_json_atomic(sync_report_path, sync_report)
                 subtitle_segments = merge_existing_subtitle_segments(
                     synchronized_tracks.english,
                     synchronized_tracks.chinese,
                     synchronized_tracks.source_label,
+                    english_asset=synchronized_tracks.english_asset,
+                    chinese_asset=synchronized_tracks.chinese_asset,
+                    supplementary_assets=synchronized_tracks.supplementary_assets,
                 )
                 track_reports = sync_report.get("tracks") or {}
                 track_statuses = ", ".join(
@@ -4704,17 +5759,49 @@ def main() -> None:
                 )
                 print("Existing Chinese subtitles detected; translation will be skipped after bilingual proofreading.")
             else:
-                if args.source in ("auto", "sidecar", "srt") and sidecar_path and sidecar_path.exists():
+                auto_primary_origin = (
+                    preferred_auto_primary_asset.origin
+                    if preferred_auto_primary_asset is not None
+                    else ""
+                )
+                auto_may_use_sidecar = auto_primary_origin in {"", "sidecar"}
+                auto_may_use_embedded = auto_primary_origin in {"", "embedded"}
+                if (
+                    args.source in ("sidecar", "srt")
+                    or (
+                        args.source == "auto"
+                        and auto_may_use_sidecar
+                    )
+                ) and sidecar_path and sidecar_path.exists():
                     actual_source = "sidecar"
                     source_segments = parse_subtitle_file(sidecar_path)
-                    if source_language == "auto":
-                        source_language = "subtitle"
+                    sidecar_asset = build_sidecar_asset(
+                        video_path,
+                        sidecar_path,
+                        language="" if source_language == "auto" else source_language,
+                        likely_match=sidecar_match_score(video_path, sidecar_path) > 0,
+                        score=sidecar_match_score(video_path, sidecar_path),
+                    )
+                    attach_asset_to_segments(source_segments, sidecar_asset, lane="source")
+                    source_language = sidecar_asset.language or source_language
                 elif args.source in ("sidecar", "srt"):
                     raise FileNotFoundError("Sidecar subtitle source requested, but no subtitle file was found.")
-                elif args.source in ("auto", "embedded"):
+                elif args.source == "embedded" or (
+                    args.source == "auto"
+                    and auto_may_use_embedded
+                ):
                     try:
                         actual_source = "embedded"
                         fallback_stream_index = args.subtitle_stream
+                        if (
+                            fallback_stream_index is None
+                            and args.source == "auto"
+                            and preferred_auto_primary_asset is not None
+                            and preferred_auto_primary_asset.origin == "embedded"
+                        ):
+                            fallback_stream_index = (
+                                preferred_auto_primary_asset.stream_index
+                            )
                         if fallback_stream_index is None:
                             fallback_stream_index = args.english_subtitle_stream
                         if fallback_stream_index is None:
@@ -4734,25 +5821,87 @@ def main() -> None:
                             raise
                         print(f"No embedded subtitles available ({exc}). Falling back to audio extraction...")
                         actual_source = "audio"
-                        extract_audio(video_path, temp_audio, audio_stream=args.audio_stream)
+                        require_safe_automatic_audio_selection(
+                            audio_assets,
+                            explicit_stream=args.audio_stream,
+                            selected_asset=preferred_audio_asset,
+                        )
+                        extract_audio(
+                            video_path,
+                            temp_audio,
+                            audio_stream=effective_audio_stream,
+                        )
                         source_segments = transcribe_audio(temp_audio, language=asr_language)
                         if source_language == "auto":
                             source_language = infer_source_language_from_segments(source_segments, asr_language)
+                        audio_asset = effective_audio_asset or build_audio_asset(
+                            video_path,
+                            stream_index=effective_audio_stream,
+                            language=source_language,
+                        )
+                        attach_asset_to_segments(source_segments, audio_asset, lane="source")
                 else:
                     actual_source = "audio"
-                    extract_audio(video_path, temp_audio, audio_stream=args.audio_stream)
+                    require_safe_automatic_audio_selection(
+                        audio_assets,
+                        explicit_stream=args.audio_stream,
+                        selected_asset=preferred_audio_asset,
+                    )
+                    extract_audio(
+                        video_path,
+                        temp_audio,
+                        audio_stream=effective_audio_stream,
+                    )
                     source_segments = transcribe_audio(temp_audio, language=asr_language)
                     if source_language == "auto":
                         source_language = infer_source_language_from_segments(source_segments, asr_language)
+                    audio_asset = effective_audio_asset or build_audio_asset(
+                        video_path,
+                        stream_index=effective_audio_stream,
+                        language=source_language,
+                    )
+                    attach_asset_to_segments(source_segments, audio_asset, lane="source")
 
+                if (
+                    args.source == "auto"
+                    and merge_existing_subtitles
+                    and automatic_inventory_plan is not None
+                ):
+                    source_segments, _ = merge_planned_supplementary_segments(
+                        source_segments,
+                        automatic_assets,
+                        automatic_inventory_plan,
+                        video_path,
+                        out_dir,
+                        args,
+                    )
                 subtitle_segments = source_segments
 
-        existing_timing_source = actual_source in {
+        selected_assets = assets_from_segments(subtitle_segments)
+        existing_timing_source = any(
+            asset.origin in {"sidecar", "embedded"}
+            for asset in selected_assets
+        ) or actual_source in {
             "sidecar",
             "embedded",
             "existing Chinese sidecar subtitles",
             "existing Chinese embedded subtitles",
         }
+        if not selected_assets and not existing_timing_source:
+            cached_audio_asset = effective_audio_asset or build_audio_asset(
+                video_path,
+                stream_index=effective_audio_stream,
+                language=infer_source_language_from_segments(
+                    subtitle_segments,
+                    source_language,
+                ),
+            )
+            attach_asset_to_segments(
+                subtitle_segments,
+                cached_audio_asset,
+                lane="source",
+            )
+            selected_assets = [cached_audio_asset]
         if existing_timing_source:
             for segment in subtitle_segments:
                 segment["preserve_distinct_overlap"] = True
@@ -4765,10 +5914,19 @@ def main() -> None:
             subtitle_segments, sync_report = synchronize_subtitle_segments(
                 video_path,
                 subtitle_segments,
-                mode=args.subtitle_sync,
+                mode=effective_subtitle_sync_mode,
                 report_path=sync_report_path,
-                audio_stream=args.audio_stream,
+                audio_stream=effective_audio_stream,
             )
+            if subtitle_sync_skip_reason:
+                sync_report.update(
+                    {
+                        "requested_mode": args.subtitle_sync,
+                        "status": "skipped_unsafe_audio_selection",
+                        "skip_reason": subtitle_sync_skip_reason,
+                    }
+                )
+                write_json_atomic(sync_report_path, sync_report)
             print(
                 "Subtitle sync: "
                 f"status={sync_report.get('status')}, "
@@ -4783,13 +5941,72 @@ def main() -> None:
             max_duration=args.max_duration,
         )
         subtitle_segments = apply_timing_sanity_rules(subtitle_segments, max_duration=args.max_duration)
+        selected_assets = assets_from_segments(subtitle_segments)
+        processing_assets = list(selected_assets)
+        should_record_audio_reference = (
+            effective_audio_asset is not None
+            and (
+                any(asset.origin == "audio" for asset in selected_assets)
+                or (
+                    existing_timing_source
+                    and effective_subtitle_sync_mode != "off"
+                )
+            )
+        )
+        if (
+            should_record_audio_reference
+            and effective_audio_asset is not None
+            and all(
+                asset.asset_id != effective_audio_asset.asset_id
+                for asset in processing_assets
+            )
+        ):
+            processing_assets.append(effective_audio_asset)
+        processing_plan = build_processing_plan(
+            processing_assets,
+            preferred_source_language=source_language,
+            merge_existing=merge_existing_subtitles,
+            synchronize_existing=effective_subtitle_sync_mode != "off",
+            allow_audio_source=args.source in {"auto", "audio"},
+        )
+        processing_plan["execution"] = {
+            "source_cache_reused": reused_source_cache,
+            "source_generation": "cache" if reused_source_cache else "generated",
+            "local_gpu": (
+                []
+                if reused_source_cache
+                else list(
+                    processing_plan.get("compute", {}).get("local_gpu") or []
+                )
+            ),
+            "remote_llm": list(
+                processing_plan.get("compute", {}).get("remote_llm") or []
+            ),
+        }
         for segment in subtitle_segments:
             segment["source_cache_version"] = SOURCE_CACHE_VERSION
+            segment["processing_plan_fingerprint"] = processing_plan["fingerprint"]
             if not loaded_legacy_source_cache:
                 segment["source_request_fingerprint"] = source_request_fingerprint
         write_json_atomic(source_segments_path, subtitle_segments)
+        write_json_atomic(
+            source_manifest_path,
+            source_manifest(
+                processing_assets,
+                processing_plan,
+                video_path=video_path,
+            ),
+        )
+        write_json_atomic(processing_plan_path, processing_plan)
 
         print(f"Actual subtitle source: {actual_source}")
+        print(
+            "Processing route: "
+            f"{processing_plan.get('route')}; "
+            f"source_generation={processing_plan['execution']['source_generation']}; "
+            f"local_gpu={','.join(processing_plan['execution']['local_gpu']) or 'none'}; "
+            f"llm={','.join(processing_plan['execution']['remote_llm']) or 'none'}"
+        )
         print_timing_report(subtitle_segments)
 
         if len(subtitle_segments) >= 12:
@@ -4823,7 +6040,10 @@ def main() -> None:
             }
             write_json_atomic(style_guide_path, style_guide)
 
-        if segments_have_chinese(subtitle_segments):
+        if (
+            processing_plan.get("route") == "proofread_existing_chinese"
+            or segments_have_chinese(subtitle_segments)
+        ):
             processed_segments = proofread_existing_chinese_segments(
                 subtitle_segments,
                 llm_model=args.llm_model,
@@ -4966,6 +6186,8 @@ def main() -> None:
             "chinese_ass": str(zh_ass),
             "bilingual_ass": str(bi_ass),
             "quality_report": str(quality_report_path),
+            "source_manifest": str(source_manifest_path),
+            "processing_plan": str(processing_plan_path),
             "style_guide": str(style_guide_path),
             "final_qa": str(final_qa_path),
             "render_validation": str(render_validation_path),

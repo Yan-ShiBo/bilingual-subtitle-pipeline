@@ -60,6 +60,7 @@ class StreamInfo:
     lang: str = ""
     title: str = ""
     metadata: dict[str, str] | None = None
+    disposition: dict[str, int] | None = None
 
     @property
     def is_subtitle(self) -> bool:
@@ -76,7 +77,20 @@ class StreamInfo:
     @property
     def is_text_subtitle(self) -> bool:
         codec = self.codec.lower()
-        return any(token in codec for token in TEXT_CODECS)
+        codec_tokens = set(re.split(r"[^a-z0-9_]+", codec))
+        return bool(codec_tokens & TEXT_CODECS)
+
+    @property
+    def is_forced(self) -> bool:
+        return bool((self.disposition or {}).get("forced"))
+
+    @property
+    def is_hearing_impaired(self) -> bool:
+        return bool((self.disposition or {}).get("hearing_impaired"))
+
+    @property
+    def is_default(self) -> bool:
+        return bool((self.disposition or {}).get("default"))
 
 
 @dataclass
@@ -258,7 +272,77 @@ def find_ffmpeg(explicit: str | None = None) -> str:
         raise RuntimeError("ffmpeg was not found. Install ffmpeg or imageio-ffmpeg.") from exc
 
 
+def find_ffprobe(ffmpeg: str) -> str | None:
+    ffmpeg_path = Path(ffmpeg)
+    executable = "ffprobe.exe" if os.name == "nt" else "ffprobe"
+    sibling = ffmpeg_path.with_name(executable)
+    if sibling.exists():
+        return str(sibling)
+    return shutil.which("ffprobe")
+
+
+def probe_streams_json(video: Path, ffprobe: str) -> list[StreamInfo]:
+    proc = run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-show_streams",
+            "-of",
+            "json",
+            str(video),
+        ],
+        check=False,
+        timeout=90,
+    )
+    if proc.returncode != 0:
+        return []
+    try:
+        payload = json.loads(proc.stdout)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    raw_streams = payload.get("streams")
+    if not isinstance(raw_streams, list):
+        return []
+
+    streams: list[StreamInfo] = []
+    for raw in raw_streams:
+        if not isinstance(raw, dict):
+            continue
+        tags = raw.get("tags") if isinstance(raw.get("tags"), dict) else {}
+        metadata = {str(key): str(value) for key, value in tags.items()}
+        for key in ("nb_frames", "bit_rate", "duration"):
+            if raw.get(key) is not None:
+                metadata[key] = str(raw[key])
+        disposition = {
+            str(key): int(bool(value))
+            for key, value in (raw.get("disposition") or {}).items()
+        }
+        try:
+            index = int(raw["index"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        streams.append(
+            StreamInfo(
+                index=index,
+                lang=str(tags.get("language") or "").casefold(),
+                kind=str(raw.get("codec_type") or ""),
+                codec=str(raw.get("codec_name") or raw.get("codec_long_name") or ""),
+                title=str(tags.get("title") or ""),
+                metadata=metadata,
+                disposition=disposition,
+            )
+        )
+    return streams
+
+
 def probe_streams(video: Path, ffmpeg: str) -> list[StreamInfo]:
+    ffprobe = find_ffprobe(ffmpeg)
+    if ffprobe:
+        streams = probe_streams_json(video, ffprobe)
+        if streams:
+            return streams
+
     proc = run([ffmpeg, "-hide_banner", "-i", str(video)], check=False, timeout=90)
     streams: list[StreamInfo] = []
     current: StreamInfo | None = None
@@ -276,6 +360,14 @@ def probe_streams(video: Path, ffmpeg: str) -> list[StreamInfo]:
                 kind=match.group(3).strip(),
                 codec=match.group(4).strip(),
                 metadata={},
+                disposition={
+                    "default": int("(default)" in line.casefold()),
+                    "forced": int("(forced)" in line.casefold()),
+                    "hearing_impaired": int(
+                        "(hearing impaired)" in line.casefold()
+                        or "(hearing_impaired)" in line.casefold()
+                    ),
+                },
             )
             in_metadata = False
             continue
@@ -301,12 +393,16 @@ def probe_streams(video: Path, ffmpeg: str) -> list[StreamInfo]:
 def stream_score(stream: StreamInfo) -> int:
     title = stream.title.lower()
     score = 0
-    if "forced" in title:
+    if stream.is_forced or "forced" in title:
         score -= 10_000
+    if "commentary" in title or "director comment" in title:
+        score -= 20_000
     if "full" in title:
         score += 2_000
-    if "sdh" in title:
+    if stream.is_hearing_impaired or "sdh" in title:
         score += 500
+    if stream.is_default:
+        score += 100
     if stream.metadata:
         frames = stream.metadata.get("NUMBER_OF_FRAMES") or stream.metadata.get("number_of_frames")
         bps = stream.metadata.get("BPS") or stream.metadata.get("bps")
@@ -1233,9 +1329,10 @@ def get_stream_events(
 
 
 def is_sdh_sound_cue(text: str) -> bool:
-    t = clean_text(text).upper()
-    if not t:
+    raw = clean_text(text)
+    if not raw:
         return False
+    t = raw.upper()
     cue_words = {
         "MUSIC",
         "PLAYING",
@@ -1257,9 +1354,86 @@ def is_sdh_sound_cue(text: str) -> bool:
         "GUNSHOT",
     }
     has_cue_word = any(word in t for word in cue_words)
-    letters = [c for c in t if c.isalpha()]
-    upper_ratio = sum(1 for c in letters if c == c.upper()) / max(1, len(letters))
+    letters = [c for c in raw if c.isalpha()]
+    upper_ratio = sum(1 for c in letters if c.isupper()) / max(1, len(letters))
     return has_cue_word and upper_ratio > 0.85
+
+
+def sdh_cue_categories(text: str) -> set[str]:
+    raw = clean_text(text)
+    if not raw:
+        return set()
+    upper = raw.upper()
+    categories: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+        "music": (
+            ("MUSIC", "SONG", "SINGING"),
+            ("音乐", "歌声", "演奏", "唱歌"),
+        ),
+        "laughter": (
+            ("LAUGH", "LAUGHS", "LAUGHING"),
+            ("笑声", "大笑", "发笑"),
+        ),
+        "sigh": (("SIGHS", "SIGHING"), ("叹气", "叹息")),
+        "groan": (("GROANS", "GROANING"), ("呻吟",)),
+        "scream": (("SCREAM", "SCREAMING"), ("尖叫",)),
+        "cheering": (("CHEERING",), ("欢呼",)),
+        "applause": (("APPLAUSE", "CLAPPING"), ("掌声", "鼓掌")),
+        "beep": (("BEEP", "BEEPING"), ("哔", "蜂鸣")),
+        "ringing": (("RINGING",), ("铃声", "电话响")),
+        "mechanical": (("WHIRRING",), ("嗡嗡", "机械声")),
+        "explosion": (("EXPLOSION",), ("爆炸",)),
+        "thunder": (("THUNDER",), ("雷声",)),
+        "gunshot": (("GUNSHOT", "GUNFIRE"), ("枪声", "枪响")),
+    }
+    has_cjk = bool(re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", raw))
+    if has_cjk:
+        compact = re.sub(r"\s+", "", raw)
+        bracketed = bool(
+            re.match(r"^[\[(（【<].*[\])）】>]$", compact)
+        )
+        cue_signals = (
+            "响起",
+            "播放",
+            "歌声",
+            "演奏",
+            "唱歌",
+            "笑声",
+            "大笑",
+            "发笑",
+            "叹气",
+            "叹息",
+            "呻吟",
+            "尖叫",
+            "欢呼",
+            "掌声",
+            "鼓掌",
+            "哔",
+            "蜂鸣",
+            "铃声",
+            "电话响",
+            "嗡嗡",
+            "机械声",
+            "爆炸",
+            "雷声",
+            "枪声",
+            "枪响",
+        )
+        if not bracketed and not (
+            len(compact) <= 12
+            and any(signal in compact for signal in cue_signals)
+        ):
+            return set()
+    elif not is_sdh_sound_cue(raw):
+        return set()
+
+    result: set[str] = set()
+    for category, (english_tokens, chinese_tokens) in categories.items():
+        if any(token in upper for token in english_tokens) or any(
+            token in raw
+            for token in chinese_tokens
+        ):
+            result.add(category)
+    return result
 
 
 def best_overlap(base: SubtitleEvent, candidates: list[tuple[int, SubtitleEvent]]) -> tuple[int, SubtitleEvent] | None:
@@ -1307,11 +1481,52 @@ def join_subtitle_events(events: list[SubtitleEvent], language: str) -> Subtitle
             previous = normalized
     separator = "" if language == "zh" else " "
     confidences = [event.confidence for event in ordered if event.confidence is not None]
+    event_metadata = [
+        event.metadata
+        for event in ordered
+        if isinstance(event.metadata, dict)
+    ]
+    metadata: dict[str, Any] = {}
+    source_assets: dict[str, dict[str, Any]] = {}
+    for item in event_metadata:
+        for asset in item.get("source_assets") or []:
+            if isinstance(asset, dict) and asset.get("asset_id"):
+                source_assets[str(asset["asset_id"])] = dict(asset)
+    if source_assets:
+        metadata["source_assets"] = list(source_assets.values())
+    authorities = [
+        str(item.get("source_text_authority") or "")
+        for item in event_metadata
+        if item.get("source_text_authority")
+    ]
+    if authorities:
+        authority_rank = {"asr": 0, "ocr": 1, "unknown": 2, "authored": 3}
+        metadata["source_text_authority"] = min(
+            authorities,
+            key=lambda value: authority_rank.get(value, 2),
+        )
+    for field_name in (
+        "source_asset_id",
+        "source_origin",
+        "source_representation",
+        "source_role",
+        "source_timing_authority",
+    ):
+        values = {
+            str(item.get(field_name))
+            for item in event_metadata
+            if item.get(field_name) is not None
+        }
+        if len(values) == 1:
+            metadata[field_name] = values.pop()
+    if any(bool(item.get("supplementary_source")) for item in event_metadata):
+        metadata["supplementary_source"] = True
     return SubtitleEvent(
         min(event.start for event in ordered),
         max(event.end for event in ordered),
         clean_text(separator.join(texts)),
         min(confidences) if confidences else None,
+        metadata or None,
     )
 
 
@@ -1363,11 +1578,52 @@ def pair_ambiguous_component(
 
 def pair_events(en_events: list[SubtitleEvent], zh_events: list[SubtitleEvent]) -> list[tuple[SubtitleEvent | None, SubtitleEvent | None]]:
     paired: list[tuple[SubtitleEvent | None, SubtitleEvent | None]] = []
+    used_en: set[int] = set()
+    used_zh: set[int] = set()
+    cue_candidates: list[tuple[float, float, float, int, int]] = []
+    for en_idx, en in enumerate(en_events):
+        en_categories = sdh_cue_categories(en.text)
+        if not en_categories:
+            continue
+        en_center = (en.start + en.end) / 2
+        for zh_idx, zh in enumerate(zh_events):
+            if not (en_categories & sdh_cue_categories(zh.text)):
+                continue
+            if not strong_overlap(en, zh):
+                continue
+            overlap = max(
+                0.0,
+                min(en.end, zh.end) - max(en.start, zh.start),
+            )
+            shorter_duration = min(
+                max(0.01, en.end - en.start),
+                max(0.01, zh.end - zh.start),
+            )
+            cue_candidates.append(
+                (
+                    -(overlap / shorter_duration),
+                    -overlap,
+                    abs(en_center - (zh.start + zh.end) / 2),
+                    en_idx,
+                    zh_idx,
+                )
+            )
+    for _ratio, _overlap, _center, en_idx, zh_idx in sorted(cue_candidates):
+        if en_idx in used_en or zh_idx in used_zh:
+            continue
+        used_en.add(en_idx)
+        used_zh.add(zh_idx)
+        paired.append((en_events[en_idx], zh_events[zh_idx]))
+
     en_edges: dict[int, set[int]] = {}
     zh_edges: dict[int, set[int]] = {}
     active_zh_start = 0
     for en_idx, en in enumerate(en_events):
-        if is_sdh_sound_cue(en.text):
+        if en_idx in used_en:
+            continue
+        if is_sdh_sound_cue(en.text) or bool(
+            (en.metadata or {}).get("supplementary_source")
+        ):
             continue
         while active_zh_start < len(zh_events) and zh_events[active_zh_start].end <= en.start:
             active_zh_start += 1
@@ -1375,12 +1631,12 @@ def pair_events(en_events: list[SubtitleEvent], zh_events: list[SubtitleEvent]) 
             zh = zh_events[zh_idx]
             if zh.start >= en.end:
                 break
+            if zh_idx in used_zh:
+                continue
             if strong_overlap(en, zh):
                 en_edges.setdefault(en_idx, set()).add(zh_idx)
                 zh_edges.setdefault(zh_idx, set()).add(en_idx)
 
-    used_en: set[int] = set()
-    used_zh: set[int] = set()
     for initial_en_idx in sorted(en_edges):
         if initial_en_idx in used_en:
             continue
@@ -1422,7 +1678,9 @@ def pair_events(en_events: list[SubtitleEvent], zh_events: list[SubtitleEvent]) 
             continue
         while start < len(zh_events) and zh_events[start].end < en.start - 5:
             start += 1
-        if is_sdh_sound_cue(en.text):
+        if is_sdh_sound_cue(en.text) or bool(
+            (en.metadata or {}).get("supplementary_source")
+        ):
             paired.append((en, None))
             continue
         window = [

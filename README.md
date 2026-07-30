@@ -19,6 +19,7 @@
 │  ├─ scene_timing.py
 │  ├─ subtitle_delivery.py
 │  ├─ subtitle_quality.py
+│  ├─ subtitle_sources.py
 │  ├─ font_delivery.py
 │  ├─ frontend_settings.py
 │  ├─ llm_policy.py
@@ -103,16 +104,18 @@ python .\src\subtitle_frontend.py --host 127.0.0.1 --port 8765
 
 ## 字幕来源优先级
 
-默认 `--source auto` 使用以下优先级：
+默认 `--source auto` 先扫描全部可用来源，再按来源证据生成确定性处理计划：
 
-1. 已有字幕文件：优先查找视频同目录或所选文件夹中与当前视频文件名匹配的 `.srt`、`.ass`、`.ssa`、`.vtt`。目录中存在多个其他影片/剧集的字幕时不会任意选择。
-2. 视频内封字幕：读取 MKV/M2TS 等视频内部字幕轨。文本字幕直接抽取；PGS 等图像字幕使用 OCR。
-3. 音频识别：前两类都没有时，使用 faster-whisper `large-v3` 从音频生成源语言字幕。
+1. 人工文本优先于图像 OCR，图像 OCR 优先于音频 ASR。
+2. 同等条件下优先内封人工文本；与视频文件名匹配的外置 `.srt/.ass/.ssa/.vtt` 会获得同版本匹配加权，目录中其他影片的字幕不会自动选择。
+3. 中文轨优先普通完整对白和简体；繁体会先转简体再校对。英文源轨优先 SDH，以保留普通英文轨没有的音乐、说话者和环境提示。
+4. forced 轨只作补充，并且只选择与主源语言匹配的最佳一条；commentary/无障碍解说音轨不参与自动选择。只有这类音轨时不会静默运行 Whisper，必须由用户明确指定音轨。
+5. 中文和源语言轨可以来自不同位置，例如内封中文配外置英文 SDH；跨来源轨仍分别同步后再合并。
 
 也可以手动指定：
 
 ```powershell
---source auto       # 自动：已有字幕 -> 内封字幕 -> 音频识别
+--source auto       # 自动：按来源质量、语言、角色和匹配关系生成处理计划
 --source sidecar    # 只使用已有字幕文件
 --source embedded   # 只使用视频内封字幕
 --source audio      # 只使用 Whisper 音频识别
@@ -131,10 +134,13 @@ python .\src\subtitle_frontend.py --host 127.0.0.1 --port 8765
 
 注意：源字幕和音频不一定是英文。只有英文字幕时，英译中会走和“英文语音识别后再英译中”一致的 5 句分组纠错翻译流程；其他源语言也会先纠错源文，再翻译成简体中文。
 
-## 纠错翻译规则
+## 来源感知的纠错翻译规则
 
-无论来源是已有字幕、内封字幕 OCR，还是 Whisper 语音识别，都会进入同一套纠错翻译流程：
+不同来源共用输出契约和终审，但采用不同的源文编辑权限：
 
+- 人工源字幕只做标记和空白归一化，Qwen 不能改写或隐藏其源文；已有中文先繁转简并保守校对，不重新翻译。
+- OCR 只在低置信度或上下文能够证明错误时修复；ASR 可修复低置信片段和有相邻证据的重复幻觉。
+- 中文为空时才翻译源语言独有内容，包括英文 SDH、音乐、音效和说话者提示；已有中文不会被补译流程覆盖。
 - 长句、词很多的句子、持续时间太长的句子，会先拆成半句或词组级字幕单元。
 - 默认每组处理 `5` 个字幕单元。
 - 每组参考前 `30` 个和后 `30` 个字幕单元。
@@ -172,7 +178,7 @@ python .\src\subtitle_frontend.py --host 127.0.0.1 --port 8765
 - 画面以低分辨率 6 FPS 检测并缓存镜头切点，字幕边缘只在 0.25 秒安全窗口内吸附，且不能截断词锚点或越过相邻字幕。
 - 程序会打印中文、英文和东亚源文的最大 CPS、超目标事件数及超单行目标事件数，便于对整片做量化复核。
 
-已有中英文字幕合并时，先让中文轨和英文轨分别用 `ffsubsync 0.5.1` 对齐到同一条所选音频，再进行中英事件配对；只有两条轨都通过质量门槛才整体采用，任一轨失败就同时回退原时间，避免只移动一条轨破坏双语对应。没有重叠且间隔超过 0.75 秒的中英文事件不会强行配对。程序用稳定事件标记恢复原顺序，并检查搜索边界、乱序、分段跳变和时长变化；不安全的分段候选会自动降级到全局对齐，两者都不合格时保持原时间。逐轨结果写入 `<片名>.subtitle-sync.report.json` 的 `tracks` 字段。`detect` 只报告候选偏移，`off` 完全跳过；音频 ASR 来源不执行这一步，也不会因此占用本地 GPU。
+已有中英文字幕合并时，先让中文轨和英文轨分别用 `ffsubsync 0.5.1` 对齐到同一条所选音频，再进行中英事件配对；只有两条轨都通过质量门槛才整体采用，任一轨失败就同时回退原时间，避免只移动一条轨破坏双语对应。自动选择的同步音轨会写入处理计划和来源指纹；如果只发现 commentary/无障碍解说音轨，则保留已有字幕时间并要求用户明确选轨，不会用错误音频静默同步。没有重叠且间隔超过 0.75 秒的中英文事件不会强行配对。程序用稳定事件标记恢复原顺序，并检查搜索边界、乱序、分段跳变和时长变化；不安全的分段候选会自动降级到全局对齐，两者都不合格时保持原时间。逐轨结果写入 `<片名>.subtitle-sync.report.json` 的 `tracks` 字段。`detect` 只报告候选偏移，`off` 完全跳过；音频 ASR 来源不执行这一步，也不会因此占用本地 GPU。
 
 阅读速度与行宽参考 [Netflix 简体中文规范](https://partnerhelp.netflixstudios.com/hc/en-us/articles/215986007-Chinese-Simplified-Timed-Text-Style-Guide)、[Netflix 英文规范](https://partnerhelp.netflixstudios.com/hc/en-us/articles/217350977-English-USA-Timed-Text-Style-Guide)、[Netflix 时间规范](https://partnerhelp.netflixstudios.com/hc/en-us/articles/360051554394-Timed-Text-Style-Guide-Subtitle-Timing-Guidelines) 和 [Prime Video 字幕规范](https://videocentral.amazon.com/support/delivery-specifications/prime-video-subtitling-guidelines?language=en_US)。项目采用较保守的中文 9 CPS、英文 20 CPS 作为诊断目标；这不是承诺每条旧来源字幕都能在不删减原意的前提下自动达标。
 
@@ -218,9 +224,13 @@ ASS 的自适应基于视频画面比例，无法在生成时获知手机的物�
 
 ```text
 <输出目录>\<片名>.segments.source.json
+<输出目录>\<片名>.source-manifest.json
+<输出目录>\<片名>.processing-plan.json
 ```
 
-重新运行同一任务时会先校验 checkpoint 是否和当前字幕切分及来源请求一致。一致才继续，不一致会忽略旧 checkpoint。
+`source-manifest` 记录每条实际来源的类型、语言、文字系统、角色、权威和文件/轨道；`processing-plan` 记录中英轨、补充轨、时间基准、处理步骤及本地/远程计算位置。`execution.source_cache_reused=true` 时，本次不会重新 OCR/ASR，`execution.local_gpu` 为空。
+
+重新运行同一任务时会先校验 checkpoint 是否和当前字幕切分、来源请求及处理计划一致。一致才继续，不一致会忽略旧 checkpoint。
 
 校验还包含 `llm_model` 和 `processing_policy_version`。模型或提示词/阅读策略升级后，网页会明确提示 checkpoint 需要重新校对，并默认选择“重新校对（保留识别）”，不会删除 source cache。片级术语表写入：
 
@@ -356,6 +366,7 @@ python .\src\audio_to_subtitle.py `
 
 ## 更新日志
 
+* `0.5.0`：新增来源资产清单和处理计划；按人工文本/OCR/ASR分别保护或修复；支持内封/外置跨来源中英合并、英文 SDH/forced 缺失内容补译、运行期 GPU/cache 可见性及前端层级来源方案。
 * `0.4.0`：新增片级风格预分析、可恢复独立终审、ASR/OCR 置信度、镜头切点吸附、可编辑成片复核、英文/中文/双语 SRT 和真实 libass 渲染验证。
 * 已有字幕默认使用 ffsubsync 做低质量保护的全局/分段音频同步，并生成可审计报告；音频 ASR 来源不重复同步。
 * 新增模型隐藏保护：只有已被较早相邻可见字幕覆盖的重复/片段才允许隐藏，唯一字幕会恢复显示并在必要时重新请求完整中文。

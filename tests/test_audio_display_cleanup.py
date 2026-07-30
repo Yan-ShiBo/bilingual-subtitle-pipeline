@@ -859,6 +859,19 @@ class DisplayCleanupTests(unittest.TestCase):
             self.assertTrue((out_dir / "Episode.bilingual.ass").exists())
             upgraded_cache = json.loads(source_cache.read_text(encoding="utf-8"))
             self.assertTrue(upgraded_cache[0]["source_request_fingerprint"])
+            source_manifest = json.loads(
+                (out_dir / "Episode.source-manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            processing_plan = json.loads(
+                (out_dir / "Episode.processing-plan.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertTrue(source_manifest["assets"])
+            self.assertTrue(processing_plan["execution"]["source_cache_reused"])
+            self.assertEqual(processing_plan["execution"]["local_gpu"], [])
 
     def test_main_reuses_audio_cache_from_previous_sync_policy(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2961,10 +2974,22 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertIn('id="audioRecognitionOptions"', page)
         self.assertIn('id="advancedSettings"', page)
         self.assertIn("function updateWorkflowVisibility()", page)
-        self.assertIn("source.addEventListener('change', updateWorkflowVisibility)", page)
-        self.assertIn("subtitleSync').addEventListener('change', updateWorkflowVisibility)", page)
-        self.assertIn("subtitle_file: usesSidecar && !mergeExisting", page)
-        self.assertIn("chinese_subtitle_stream: usesEmbedded && mergeExisting", page)
+        self.assertIn("source.addEventListener('change', () => {", page)
+        self.assertIn(
+            "invalidateProcessingPlanPreview();\n    updateWorkflowVisibility();",
+            page,
+        )
+        self.assertIn(
+            "subtitleSync').addEventListener('change', () => {",
+            page,
+        )
+        self.assertIn("subtitle_file: explicitSource && usesSidecar && !mergeExisting", page)
+        self.assertIn("chinese_subtitle_stream: explicitSource && usesEmbedded && mergeExisting", page)
+        self.assertIn("setHidden('sidecarOptions', !usesSidecar || automaticSource)", page)
+        self.assertIn("const automaticPlanNeedsOcr = automaticSource", page)
+        self.assertIn("'embeddedOptions',", page)
+        self.assertIn("automaticSource || !usesEmbedded || merge", page)
+        self.assertIn("const automaticPlanUsesExisting = automaticSource", page)
         self.assertIn("const mayUseExisting = usesExisting || (source === 'auto' && mode === 'auto')", page)
         self.assertIn("usesExisting && subtitleSync !== 'off'", page)
         self.assertIn("audio_stream: usesSelectedAudioTrack ?", page)

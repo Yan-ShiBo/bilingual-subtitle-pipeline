@@ -20,6 +20,14 @@ from ass_styles import STYLE_PROFILE_NAMES
 from frontend_settings import settings_store
 from output_paths import resolve_output_root
 from pipeline_policy import PROCESSING_POLICY_VERSION, TERMINOLOGY_POLICY_VERSION
+from subtitle_sources import (
+    SubtitleAsset,
+    asset_from_dict,
+    build_audio_asset,
+    build_embedded_asset,
+    build_processing_plan,
+    build_sidecar_asset,
+)
 from subtitle_sync import SUBTITLE_SYNC_MODES
 
 try:
@@ -294,17 +302,33 @@ def list_sidecar_subtitles(selected_path: Path, video_path: Path) -> List[Dict[s
                 paths[candidate] = max(paths.get(candidate, 0), score)
     has_matched_candidate = any(sidecar_match_score(video_path, path) > 0 for path in paths)
     allow_single_fallback = len(paths) == 1 and not has_matched_candidate
-    return [
-        {
+    items: List[Dict[str, Any]] = []
+    for path, score in sorted(paths.items(), key=lambda item: (item[1], item[0].name.lower()), reverse=True):
+        likely_match = sidecar_match_score(video_path, path) > 0 or allow_single_fallback
+        asset = build_sidecar_asset(
+            video_path,
+            path,
+            likely_match=likely_match,
+            score=score,
+        )
+        items.append(
+            {
             "path": str(path),
             "name": path.name,
             "extension": path.suffix.lower(),
             "size_kb": round(path.stat().st_size / 1024, 1),
             "score": score,
-            "likely_match": sidecar_match_score(video_path, path) > 0 or allow_single_fallback,
-        }
-        for path, score in sorted(paths.items(), key=lambda item: (item[1], item[0].name.lower()), reverse=True)
-    ]
+                "likely_match": likely_match,
+                "language": asset.language,
+                "script": asset.script,
+                "role": asset.role,
+                "representation": asset.representation,
+                "text_authority": asset.text_authority,
+                "timing_authority": asset.timing_authority,
+                "asset": asset.to_dict(),
+            }
+        )
+    return items
 
 
 def list_embedded_subtitles(video_path: Path) -> List[Dict[str, Any]]:
@@ -313,19 +337,30 @@ def list_embedded_subtitles(video_path: Path) -> List[Dict[str, Any]]:
 
         ffmpeg = find_ffmpeg(None)
         streams = [stream for stream in probe_streams(video_path, ffmpeg) if stream.is_subtitle]
-        return [
-            {
+        items: List[Dict[str, Any]] = []
+        for stream in streams:
+            asset = build_embedded_asset(video_path, stream)
+            items.append(
+                {
                 "index": stream.index,
                 "label": f"0:{stream.index} {stream.lang or '-'} {stream.codec} {stream.title}".strip(),
                 "language": stream.lang,
                 "codec": stream.codec,
                 "title": stream.title,
-                "is_image": stream.is_pgs,
-                "is_text": stream.is_text_subtitle,
+                "is_image": asset.representation == "bitmap_ocr",
+                "is_text": asset.representation == "authored_text",
                 "score": stream_score(stream),
-            }
-            for stream in streams
-        ]
+                    "disposition": stream.disposition or {},
+                    "script": asset.script,
+                    "role": asset.role,
+                    "representation": asset.representation,
+                    "text_authority": asset.text_authority,
+                    "timing_authority": asset.timing_authority,
+                    "supported": asset.supported,
+                    "asset": asset.to_dict(),
+                }
+            )
+        return items
     except Exception as exc:
         return [{"error": str(exc)}]
 
@@ -336,18 +371,147 @@ def list_embedded_audio(video_path: Path) -> List[Dict[str, Any]]:
 
         ffmpeg = find_ffmpeg(None)
         streams = [stream for stream in probe_streams(video_path, ffmpeg) if stream.is_audio]
-        return [
-            {
+        items: List[Dict[str, Any]] = []
+        for stream in streams:
+            asset = build_audio_asset(video_path, stream)
+            items.append(
+                {
                 "index": stream.index,
                 "label": f"0:{stream.index} {stream.lang or '-'} {stream.codec} {stream.title}".strip(),
                 "language": stream.lang,
                 "codec": stream.codec,
                 "title": stream.title,
-            }
-            for stream in streams
-        ]
+                    "role": asset.role,
+                    "disposition": stream.disposition or {},
+                    "asset": asset.to_dict(),
+                }
+            )
+        return items
     except Exception as exc:
         return [{"error": str(exc)}]
+
+
+def _normalized_selected_path(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        path = Path(raw).expanduser().resolve()
+    except OSError:
+        path = Path(raw).expanduser().absolute()
+    return os.path.normcase(str(path))
+
+
+def _payload_bool(value: Any, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().casefold() not in {"", "0", "false", "no", "off"}
+
+
+def select_assets_for_request(
+    asset_items: List[tuple[Dict[str, Any], SubtitleAsset]],
+    payload: Dict[str, Any],
+) -> List[SubtitleAsset]:
+    source_mode = str(payload.get("source") or "auto").strip().casefold()
+    if source_mode == "srt":
+        source_mode = "sidecar"
+    subtitle_sync = str(payload.get("subtitle_sync") or "auto").strip().casefold()
+    merge_existing = _payload_bool(
+        payload.get("merge_existing_subtitles"),
+        default=True,
+    )
+    sidecar_selections = {
+        key: _normalized_selected_path(payload.get(key))
+        for key in (
+            "subtitle_file",
+            "chinese_subtitle_file",
+            "english_subtitle_file",
+        )
+    }
+    stream_selections: dict[str, int | None] = {}
+    for key in (
+        "subtitle_stream",
+        "chinese_subtitle_stream",
+        "english_subtitle_stream",
+    ):
+        value = payload.get(key)
+        if value in (None, ""):
+            stream_selections[key] = None
+            continue
+        try:
+            stream_selections[key] = int(value)
+        except (TypeError, ValueError):
+            stream_selections[key] = None
+    explicit_audio_stream: int | None = None
+    if payload.get("audio_stream") not in (None, ""):
+        try:
+            explicit_audio_stream = int(payload["audio_stream"])
+        except (TypeError, ValueError):
+            explicit_audio_stream = None
+
+    selected: List[SubtitleAsset] = []
+    for item, asset in asset_items:
+        if asset.origin == "sidecar":
+            if source_mode not in {"auto", "sidecar"}:
+                continue
+            asset_path = _normalized_selected_path(asset.path)
+            if merge_existing:
+                chinese_path = sidecar_selections["chinese_subtitle_file"]
+                source_path = sidecar_selections["english_subtitle_file"]
+                if asset_path in {chinese_path, source_path} - {""}:
+                    pass
+                elif asset.language == "zh" and chinese_path:
+                    continue
+                elif asset.language != "zh" and source_path:
+                    continue
+                elif not bool(item.get("likely_match")):
+                    continue
+            else:
+                selected_path = sidecar_selections["subtitle_file"]
+                if selected_path and asset_path != selected_path:
+                    continue
+                if not selected_path and not bool(item.get("likely_match")):
+                    continue
+        elif asset.origin == "embedded":
+            if source_mode not in {"auto", "embedded"}:
+                continue
+            if merge_existing:
+                chinese_stream = stream_selections["chinese_subtitle_stream"]
+                source_stream = stream_selections["english_subtitle_stream"]
+                if asset.stream_index in {
+                    chinese_stream,
+                    source_stream,
+                } - {None}:
+                    pass
+                elif asset.language == "zh" and chinese_stream is not None:
+                    continue
+                elif asset.language != "zh" and source_stream is not None:
+                    continue
+            else:
+                selected_stream = stream_selections["subtitle_stream"]
+                if (
+                    selected_stream is not None
+                    and asset.stream_index != selected_stream
+                ):
+                    continue
+        elif asset.origin == "audio":
+            uses_audio = source_mode in {"auto", "audio"} or (
+                source_mode in {"sidecar", "embedded"}
+                and subtitle_sync != "off"
+            )
+            if not uses_audio:
+                continue
+            if (
+                explicit_audio_stream is not None
+                and asset.stream_index != explicit_audio_stream
+            ):
+                continue
+        else:
+            continue
+        selected.append(asset)
+    return selected
 
 
 def default_names(input_path: Path, video_path: Path, llm_model: str = "qwen3:14b") -> Dict[str, str]:
@@ -563,14 +727,17 @@ def checkpoint_info(
     out_dir = output_dir(output_root, series_name, movie_name)
     checkpoint = out_dir / f"{movie_name}.segments.checkpoint.json"
     source = out_dir / f"{movie_name}.segments.source.json"
+    processing_plan = out_dir / f"{movie_name}.processing-plan.json"
     quality_report = out_dir / f"{movie_name}.quality-report.json"
     info: Dict[str, Any] = {
         "output_dir": str(out_dir),
         "checkpoint_path": str(checkpoint),
         "source_segments_path": str(source),
+        "processing_plan_path": str(processing_plan),
         "quality_report_path": str(quality_report),
         "checkpoint_exists": checkpoint.exists(),
         "source_segments_exists": source.exists(),
+        "processing_plan_exists": processing_plan.exists(),
         "quality_report_exists": quality_report.exists(),
         "completed_count": 0,
         "total_count": None,
@@ -588,6 +755,14 @@ def checkpoint_info(
                 info["total_count"] = len(source_items)
         except Exception as exc:
             info["source_error"] = str(exc)
+
+    if processing_plan.exists():
+        try:
+            plan = read_json(processing_plan)
+            if isinstance(plan, dict):
+                info["processing_plan"] = plan
+        except Exception as exc:
+            info["processing_plan_error"] = str(exc)
 
     if checkpoint.exists():
         try:
@@ -772,12 +947,27 @@ def analyze_input(payload: Dict[str, Any]) -> Dict[str, Any]:
     embedded_audio = list_embedded_audio(video)
     embedded_tracks = [item for item in embedded if "error" not in item]
     audio_tracks = [item for item in embedded_audio if "error" not in item]
-    if any(item.get("likely_match") for item in sidecars):
-        auto_source = "sidecar"
-    elif embedded_tracks:
-        auto_source = "embedded"
-    else:
-        auto_source = "audio"
+    asset_items = [
+        (item, asset)
+        for item in [*sidecars, *embedded_tracks, *audio_tracks]
+        if isinstance(item.get("asset"), dict)
+        for asset in [asset_from_dict(item["asset"])]
+        if asset is not None
+    ]
+    assets = [asset for _, asset in asset_items]
+    eligible_assets = select_assets_for_request(asset_items, payload)
+    source_mode = str(payload.get("source") or "auto").strip().casefold()
+    processing_plan = build_processing_plan(
+        eligible_assets,
+        preferred_source_language=str(payload.get("source_language") or "auto"),
+        merge_existing=_payload_bool(
+            payload.get("merge_existing_subtitles"),
+            default=True,
+        ),
+        synchronize_existing=str(payload.get("subtitle_sync") or "auto") != "off",
+        allow_audio_source=source_mode in {"auto", "audio"},
+    )
+    auto_source = str(processing_plan.get("recommended_source") or "audio")
     info.update(
         {
             "selected_path": str(selected),
@@ -798,6 +988,8 @@ def analyze_input(payload: Dict[str, Any]) -> Dict[str, Any]:
             "embedded_subtitles": embedded,
             "embedded_audio": embedded_audio,
             "auto_source": auto_source,
+            "source_assets": [asset.to_dict() for asset in assets],
+            "processing_plan": processing_plan,
         }
     )
     return info
@@ -1355,6 +1547,14 @@ def html_page() -> str:
     .workflow-grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 12px; align-items: end; }
     .workflow-group { grid-column: span 12; border-top: 1px solid #e5e7eb; padding-top: 14px; margin-top: 2px; }
     .workflow-group h3 { font-size: 14px; margin: 0 0 12px; color: #303842; }
+    .source-plan-header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+    .source-plan-header h3 { margin-bottom: 8px; }
+    .source-plan-route { color: #1f6feb; font-size: 13px; font-weight: 600; }
+    .source-plan-list { border-top: 1px solid #eef0f3; }
+    .source-plan-row { display: grid; grid-template-columns: 132px minmax(0, 1fr); gap: 12px; padding: 9px 0; border-bottom: 1px solid #eef0f3; }
+    .source-plan-key { color: #66717f; font-size: 13px; }
+    .source-plan-value { min-width: 0; overflow-wrap: anywhere; font-size: 13px; }
+    .source-plan-warning { color: #854d0e; margin-top: 9px; font-size: 13px; }
     .checkbox-control { display: flex; align-items: center; gap: 8px; min-height: 38px; margin: 0; color: #20242a; }
     .checkbox-control input { width: auto; height: auto; }
     .field-actions { display: flex; gap: 8px; align-items: end; }
@@ -1426,6 +1626,8 @@ def html_page() -> str:
       .quality-toolbar { align-items: stretch; flex-direction: column; }
       .quality-toolbar > div { width: 100%; }
       .quality-toolbar .muted { margin-left: 0; padding-bottom: 0; }
+      .source-plan-header { align-items: flex-start; flex-direction: column; gap: 2px; }
+      .source-plan-row { grid-template-columns: 1fr; gap: 3px; }
     }
     .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); align-items: center; justify-content: center; z-index: 1000; }
     .modal { background: white; padding: 24px; border-radius: 8px; width: 100%; max-width: 400px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
@@ -1559,6 +1761,15 @@ def html_page() -> str:
         </div>
       </div>
 
+      <div class="workflow-group" id="sourcePlan" hidden>
+        <div class="source-plan-header">
+          <h3>推荐处理方案</h3>
+          <span class="source-plan-route" id="sourcePlanRoute"></span>
+        </div>
+        <div class="source-plan-list" id="sourcePlanRows"></div>
+        <div class="source-plan-warning" id="sourcePlanWarning" hidden></div>
+      </div>
+
       <div class="workflow-group" id="existingSubtitleOptions" hidden>
         <h3>已有字幕</h3>
         <div class="workflow-grid">
@@ -1601,7 +1812,7 @@ def html_page() -> str:
               <label for="englishSubtitleStream">内封英文字幕轨</label>
               <select id="englishSubtitleStream"><option value="">可选：自动选择</option></select>
             </div>
-            <div class="span-4">
+            <div class="span-4" id="subtitleOcrLangGroup">
               <label for="subtitleOcrLang">图像字幕 OCR 语言</label>
               <select id="subtitleOcrLang">
                 <option value="auto" selected>自动</option>
@@ -1837,12 +2048,30 @@ async function selectFont() {
 function setSelectedPath(path) {
   const input = document.getElementById('path');
   if (input.value !== path) {
+    clearSourceSelections();
     clearLastAnalysis();
     state.pid = 0;
     document.getElementById('seriesName').value = '';
     document.getElementById('movieName').value = '';
   }
   input.value = path;
+}
+
+const SOURCE_SELECTION_IDS = [
+  'sidecarPath',
+  'chineseSidecarPath',
+  'englishSidecarPath',
+  'subtitleStream',
+  'chineseSubtitleStream',
+  'englishSubtitleStream',
+  'audioStream'
+];
+
+function clearSourceSelections() {
+  SOURCE_SELECTION_IDS.forEach(id => {
+    const element = document.getElementById(id);
+    if (element) element.value = '';
+  });
 }
 
 function activeSourceMode() {
@@ -1857,26 +2086,82 @@ function setHidden(id, hidden) {
   if (element) element.hidden = hidden;
 }
 
+function selectedEmbeddedAssets() {
+  const analysis = getMatchingAnalysis();
+  if (!analysis) return [];
+  const items = (analysis.embedded_subtitles || []).filter(item => !item.error);
+  const merge = document.getElementById('mergeExistingSubtitles').checked;
+  const streamIds = (
+    merge
+      ? ['chineseSubtitleStream', 'englishSubtitleStream']
+      : ['subtitleStream']
+  ).map(id => document.getElementById(id)?.value).filter(Boolean);
+  if (streamIds.length) {
+    return streamIds
+      .map(value => items.find(item => String(item.index) === String(value)))
+      .filter(Boolean);
+  }
+
+  const plan = analysis.processing_plan;
+  const lane = plan?.lanes || {};
+  const selectedIds = [
+    lane.chinese,
+    lane.source,
+    ...(lane.supplementary || [])
+  ].filter(Boolean);
+  return (plan?.selected_assets || []).filter(
+    asset => asset.origin === 'embedded' && selectedIds.includes(asset.asset_id)
+  );
+}
+
+function embeddedSelectionNeedsOcr() {
+  const analysis = getMatchingAnalysis();
+  if (!analysis) return true;
+  const selected = selectedEmbeddedAssets();
+  if (selected.length) {
+    return selected.some(
+      asset => asset.representation === 'bitmap_ocr' || asset.is_image === true
+    );
+  }
+  return (analysis.embedded_subtitles || []).some(
+    asset => asset.representation === 'bitmap_ocr' || asset.is_image === true
+  );
+}
+
 function updateWorkflowVisibility() {
   const mode = activeSourceMode();
+  const automaticSource = document.getElementById('source').value === 'auto';
   const usesSidecar = mode === 'sidecar';
   const usesEmbedded = mode === 'embedded';
   const usesAudio = mode === 'audio';
-  const usesExisting = usesSidecar || usesEmbedded;
+  const automaticPlanUsesExisting = automaticSource && (
+    getMatchingAnalysis()?.processing_plan?.selected_assets || []
+  ).some(asset => ['sidecar', 'embedded'].includes(asset.origin));
+  const automaticPlanNeedsOcr = automaticSource && (
+    getMatchingAnalysis()?.processing_plan?.selected_assets || []
+  ).some(asset => asset.representation === 'bitmap_ocr');
+  const usesExisting = usesSidecar || usesEmbedded || automaticPlanUsesExisting;
   const merge = document.getElementById('mergeExistingSubtitles').checked;
   const syncsExisting = usesExisting && document.getElementById('subtitleSync').value !== 'off';
 
   setHidden('existingSubtitleOptions', !usesExisting);
-  setHidden('sidecarOptions', !usesSidecar);
-  setHidden('embeddedOptions', !usesEmbedded);
+  setHidden('sidecarOptions', !usesSidecar || automaticSource);
+  setHidden(
+    'embeddedOptions',
+    !((usesEmbedded && !automaticSource) || automaticPlanNeedsOcr)
+  );
   setHidden('audioRecognitionOptions', !(usesAudio || syncsExisting));
   setHidden('asrLanguageGroup', !usesAudio);
   setHidden('sidecarPathGroup', !usesSidecar || merge);
   setHidden('chineseSidecarPathGroup', !usesSidecar || !merge);
   setHidden('englishSidecarPathGroup', !usesSidecar || !merge);
-  setHidden('subtitleStreamGroup', !usesEmbedded || merge);
-  setHidden('chineseSubtitleStreamGroup', !usesEmbedded || !merge);
-  setHidden('englishSubtitleStreamGroup', !usesEmbedded || !merge);
+  setHidden('subtitleStreamGroup', automaticSource || !usesEmbedded || merge);
+  setHidden('chineseSubtitleStreamGroup', automaticSource || !usesEmbedded || !merge);
+  setHidden('englishSubtitleStreamGroup', automaticSource || !usesEmbedded || !merge);
+  setHidden(
+    'subtitleOcrLangGroup',
+    !(usesEmbedded || automaticPlanNeedsOcr) || !embeddedSelectionNeedsOcr()
+  );
   document.getElementById('audioRecognitionHeading').textContent =
     usesAudio ? '音频识别' : '字幕同步音轨';
   document.getElementById('audioStreamLabel').textContent =
@@ -1891,6 +2176,7 @@ function payload() {
   const usesEmbedded = mode === 'embedded';
   const usesAudio = mode === 'audio';
   const usesExisting = usesSidecar || usesEmbedded;
+  const explicitSource = source !== 'auto';
   const subtitleSync = document.getElementById('subtitleSync').value;
   const mayUseExisting = usesExisting || (source === 'auto' && mode === 'auto');
   const mergeExisting = mayUseExisting && document.getElementById('mergeExistingSubtitles').checked;
@@ -1903,13 +2189,13 @@ function payload() {
     movie_name: document.getElementById('movieName').value,
     source,
     subtitle_sync: usesAudio ? 'off' : subtitleSync,
-    subtitle_file: usesSidecar && !mergeExisting ? document.getElementById('sidecarPath').value : '',
+    subtitle_file: explicitSource && usesSidecar && !mergeExisting ? document.getElementById('sidecarPath').value : '',
     merge_existing_subtitles: mergeExisting,
-    chinese_subtitle_file: usesSidecar && mergeExisting ? document.getElementById('chineseSidecarPath').value : '',
-    english_subtitle_file: usesSidecar && mergeExisting ? document.getElementById('englishSidecarPath').value : '',
-    subtitle_stream: usesEmbedded && !mergeExisting ? document.getElementById('subtitleStream').value : '',
-    chinese_subtitle_stream: usesEmbedded && mergeExisting ? document.getElementById('chineseSubtitleStream').value : '',
-    english_subtitle_stream: usesEmbedded && mergeExisting ? document.getElementById('englishSubtitleStream').value : '',
+    chinese_subtitle_file: explicitSource && usesSidecar && mergeExisting ? document.getElementById('chineseSidecarPath').value : '',
+    english_subtitle_file: explicitSource && usesSidecar && mergeExisting ? document.getElementById('englishSidecarPath').value : '',
+    subtitle_stream: explicitSource && usesEmbedded && !mergeExisting ? document.getElementById('subtitleStream').value : '',
+    chinese_subtitle_stream: explicitSource && usesEmbedded && mergeExisting ? document.getElementById('chineseSubtitleStream').value : '',
+    english_subtitle_stream: explicitSource && usesEmbedded && mergeExisting ? document.getElementById('englishSubtitleStream').value : '',
     audio_stream: usesSelectedAudioTrack ? document.getElementById('audioStream').value : '',
     source_language: sourceLanguage,
     asr_language: source === 'auto' || usesAudio ? resolveAsrLanguageForPayload() : 'auto',
@@ -2250,10 +2536,105 @@ async function saveCheckpointReview() {
   }
 }
 
+const SOURCE_ROUTE_LABELS = {
+  proofread_existing_chinese: '已有中文：转简与保守校对',
+  translate_existing_source: '已有源字幕：翻译为简体中文',
+  transcribe_translate: '语音识别后翻译',
+  no_safe_source: '没有可安全自动使用的完整对白来源'
+};
+
+const SOURCE_OPERATION_LABELS = {
+  extract_bitmap_subtitles: '图像字幕 OCR',
+  repair_low_confidence_ocr: '低置信 OCR 修复',
+  transcribe_audio: 'Whisper 语音识别',
+  repair_asr_risk_windows: 'ASR 风险片段修复',
+  traditional_to_simplified: '繁体转简体',
+  proofread_existing_chinese: '校对已有中文',
+  translate_source: '翻译源字幕',
+  synchronize_existing_tracks: '按音频校准时间',
+  merge_language_lanes: '合并中英轨',
+  translate_missing_chinese_only: '只补译中文缺失内容',
+  final_bilingual_quality_review: '整片终审'
+};
+
+function sourceAssetLabel(asset) {
+  if (!asset) return '不使用';
+  const origins = {embedded: '内封', sidecar: '外置', audio: '音频'};
+  const representations = {
+    authored_text: '人工文本',
+    bitmap_ocr: '图像字幕',
+    speech_asr: '语音识别',
+    unsupported: '不支持'
+  };
+  const roles = {dialogue: '完整对白', sdh: 'SDH', forced: '强制字幕', commentary: '评论', unknown: '角色待确认'};
+  const scripts = {simplified: '简体', traditional: '繁体', unknown: ''};
+  return [
+    origins[asset.origin] || asset.origin,
+    asset.label,
+    asset.language || '语言待确认',
+    scripts[asset.script] || '',
+    representations[asset.representation] || asset.representation,
+    roles[asset.role] || asset.role
+  ].filter(Boolean).join(' · ');
+}
+
+function renderProcessingPlan(plan) {
+  const section = document.getElementById('sourcePlan');
+  if (!plan || !Array.isArray(plan.selected_assets)) {
+    section.hidden = true;
+    return;
+  }
+  section.hidden = false;
+  const assets = new Map(plan.selected_assets.map(asset => [asset.asset_id, asset]));
+  const lane = plan.lanes || {};
+  const supplementary = (lane.supplementary || []).map(id => assets.get(id)).filter(Boolean);
+  const execution = plan.execution || null;
+  const localGpu = execution?.local_gpu || plan.compute?.local_gpu || [];
+  const remoteLlm = execution?.remote_llm || plan.compute?.remote_llm || [];
+  const localLabels = {subtitle_ocr: '字幕 OCR', speech_recognition: '语音识别'};
+  const localPrefix = execution ? '本次本地 GPU' : '来源需重建时本地 GPU';
+  const compute = [
+    localGpu.length ? `${localPrefix}：${localGpu.map(item => localLabels[item] || item).join('、')}` : `${localPrefix}：不执行识别`,
+    remoteLlm.length ? '远程/所选 Qwen：翻译、校对与终审' : 'Qwen：不调用'
+  ];
+  const rows = [
+    ['中文轨', sourceAssetLabel(assets.get(lane.chinese))],
+    ['源语言轨', sourceAssetLabel(assets.get(lane.source))],
+    ['补充轨', supplementary.length ? supplementary.map(sourceAssetLabel).join('；') : '不使用'],
+    ['时间基准', sourceAssetLabel(assets.get(lane.timing_reference))],
+    ['同步音轨', sourceAssetLabel(assets.get(lane.audio_reference))],
+    ['来源生成', execution?.source_cache_reused ? '复用已有来源缓存，不重新 OCR/ASR' : '按所选来源生成或读取'],
+    ['处理步骤', (plan.operations || []).map(item => SOURCE_OPERATION_LABELS[item] || item).join(' → ')],
+    ['计算位置', compute.join('；')]
+  ];
+  document.getElementById('sourcePlanRoute').textContent =
+    SOURCE_ROUTE_LABELS[plan.route] || plan.route || '自动推荐';
+  document.getElementById('sourcePlanRows').innerHTML = rows.map(([key, value]) =>
+    `<div class="source-plan-row"><div class="source-plan-key">${escapeHtml(key)}</div><div class="source-plan-value">${escapeHtml(value)}</div></div>`
+  ).join('');
+  const warning = document.getElementById('sourcePlanWarning');
+  const warnings = Array.isArray(plan.warnings) ? plan.warnings : [];
+  warning.hidden = warnings.length === 0;
+  warning.textContent = warnings.join('；');
+}
+
+function invalidateProcessingPlanPreview() {
+  const analysis = getMatchingAnalysis();
+  if (analysis) {
+    setLastAnalysis({
+      ...analysis,
+      auto_source: 'auto',
+      processing_plan: null
+    });
+  }
+  renderProcessingPlan(null);
+}
+
 function render(data) {
   if (data.sidecar_subtitles) updateSidecarOptions(data.sidecar_subtitles);
   if (data.embedded_subtitles) updateEmbeddedOptions(data.embedded_subtitles);
   if (data.embedded_audio) updateAudioOptions(data.embedded_audio);
+  renderProcessingPlan(data.processing_plan);
 
   document.getElementById('videoSize').textContent = data.video_size_gb ? `${data.video_size_gb} GB` : '-';
   document.getElementById('totalCount').textContent = data.total_count ?? '未知';
@@ -2370,26 +2751,32 @@ function render(data) {
 
 function updateSidecarOptions(items) {
   const rows = (items || []).map(item => {
-    const label = `${item.name || item.path} (${item.extension || '字幕'}, ${item.size_kb ?? '?'} KB)`;
+    const role = {dialogue: '完整对白', sdh: 'SDH', forced: '强制字幕', commentary: '评论', unknown: '角色待确认'}[item.role] || item.role || '';
+    const label = `${item.name || item.path} (${item.language || 'und'} · ${role || '文本'} · ${item.size_kb ?? '?'} KB)`;
     return `<option value="${escapeHtml(item.path || '')}">${escapeHtml(label)}</option>`;
   }).join('');
   fillSubtitleSelect('sidecarPath', '自动选择', rows, null);
   fillSubtitleSelect('chineseSidecarPath', '自动选择', rows, value => {
     const item = (items || []).find(entry => entry.path === value);
-    return languageHint(item?.name || item?.path || '') === 'zh';
+    return languageHint(`${item?.language || ''} ${item?.name || item?.path || ''}`) === 'zh';
   });
   fillSubtitleSelect('englishSidecarPath', '可选：自动选择', rows, value => {
     const item = (items || []).find(entry => entry.path === value);
-    return languageHint(item?.name || item?.path || '') === 'en';
+    return languageHint(`${item?.language || ''} ${item?.name || item?.path || ''}`) === 'en';
   });
 }
 
 function updateEmbeddedOptions(items) {
   const valid = (items || []).filter(item => !item.error);
   const rows = valid.map(item => {
-    const kind = item.is_image ? '图像' : (item.is_text ? '文本' : '字幕');
-    const label = `${item.label || item.index} | ${kind} | ${item.language || 'und'} | ${item.title || ''}`.trim();
-    return `<option value="${escapeHtml(item.index)}">${escapeHtml(label)}</option>`;
+    const supported = item.supported !== false;
+    const kind = supported
+      ? (item.is_image ? '图像' : (item.is_text ? '文本' : '字幕'))
+      : `不支持编码 ${item.codec || ''}`;
+    const role = {dialogue: '完整对白', sdh: 'SDH', forced: '强制字幕', commentary: '评论', unknown: '角色待确认'}[item.role] || item.role || '';
+    const script = {simplified: '简体', traditional: '繁体', unknown: ''}[item.script] || '';
+    const label = `${item.label || item.index} | ${kind} | ${item.language || 'und'} | ${script} ${role}`.trim();
+    return `<option value="${escapeHtml(item.index)}"${supported ? '' : ' disabled'}>${escapeHtml(label)}</option>`;
   }).join('');
   fillSubtitleSelect('subtitleStream', '自动选择', rows, null);
   fillSubtitleSelect('chineseSubtitleStream', '自动选择', rows, value => {
@@ -2408,10 +2795,12 @@ function fillSubtitleSelect(id, placeholder, rows, prefer) {
   const current = select.value;
   select.innerHTML = `<option value="">${escapeHtml(placeholder)}</option>` + rows;
   const options = [...select.options];
-  if (current && options.some(option => option.value === current)) {
+  if (current && options.some(option => option.value === current && !option.disabled)) {
     select.value = current;
   } else if (prefer) {
-    const preferred = options.find(option => option.value && prefer(option.value));
+    const preferred = options.find(
+      option => option.value && !option.disabled && prefer(option.value)
+    );
     if (preferred) select.value = preferred.value;
   }
 }
@@ -2431,11 +2820,15 @@ function updateAudioOptions(items) {
   const current = select.value;
   const rows = (items || []).filter(item => !item.error).map(item => {
     let scoreInfo = item.language ? `[${item.language}]` : "";
-    const label = `0:${item.index} ${item.codec} ${scoreInfo} ${item.title || ''}`.trim();
-    return `<option value="${escapeHtml(item.index)}">${escapeHtml(label)}</option>`;
+    const selectable = item.role !== 'commentary';
+    const roleInfo = selectable ? '' : ' · 评论/解说（不用于对白）';
+    const label = `0:${item.index} ${item.codec} ${scoreInfo} ${item.title || ''}${roleInfo}`.trim();
+    return `<option value="${escapeHtml(item.index)}"${selectable ? '' : ' disabled'}>${escapeHtml(label)}</option>`;
   }).join('');
   select.innerHTML = '<option value="">自动选择</option>' + rows;
-  if ([...select.options].some(option => option.value === current)) select.value = current;
+  if ([...select.options].some(option => option.value === current && !option.disabled)) {
+    select.value = current;
+  }
 }
 
 function sourceLabel(value) {
@@ -2456,8 +2849,7 @@ function escapeHtml(value) {
 
 const INPUT_IDS = [
   'path', 'outputRoot', 'seriesName', 'movieName', 'source',
-  'mergeExistingSubtitles', 'subtitleSync', 'sidecarPath', 'chineseSidecarPath', 'englishSidecarPath',
-  'subtitleStream', 'chineseSubtitleStream', 'englishSubtitleStream', 'audioStream',
+  'mergeExistingSubtitles', 'subtitleSync',
   'source_language', 'asrLanguage', 'subtitleOcrLang', 'llmModel',
   'batchSize', 'contextLines', 'maxWords', 'maxChars', 'maxDuration',
   'subtitleStyleProfile', 'subtitleFontName', 'subtitleFontScale', 'subtitleFontFile'
@@ -2597,6 +2989,7 @@ async function checkRemoteStatus() {
 
 function saveFormState() {
   if (state.lastAnalysis && !analysisMatchesCurrentPath(state.lastAnalysis)) {
+    clearSourceSelections();
     clearLastAnalysis();
   }
   const data = {};
@@ -2717,11 +3110,28 @@ document.addEventListener('DOMContentLoaded', async () => {
   migrateRecognitionLanguageState();
   migrateDisplayLimitDefaults();
   const source = document.getElementById('source');
-  source.addEventListener('change', updateWorkflowVisibility);
-  document.getElementById('mergeExistingSubtitles').addEventListener('change', updateWorkflowVisibility);
-  document.getElementById('subtitleSync').addEventListener('change', updateWorkflowVisibility);
+  source.addEventListener('change', () => {
+    invalidateProcessingPlanPreview();
+    updateWorkflowVisibility();
+  });
+  document.getElementById('mergeExistingSubtitles').addEventListener('change', () => {
+    invalidateProcessingPlanPreview();
+    updateWorkflowVisibility();
+  });
+  document.getElementById('subtitleSync').addEventListener('change', () => {
+    invalidateProcessingPlanPreview();
+    updateWorkflowVisibility();
+  });
+  SOURCE_SELECTION_IDS.forEach(id => {
+    document.getElementById(id)?.addEventListener('change', () => {
+      invalidateProcessingPlanPreview();
+      updateWorkflowVisibility();
+    });
+  });
   document.getElementById('source_language')?.addEventListener('change', () => {
     migrateRecognitionLanguageState();
+    invalidateProcessingPlanPreview();
+    updateWorkflowVisibility();
     saveFormState();
   });
   updateWorkflowVisibility();

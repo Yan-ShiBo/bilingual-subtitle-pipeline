@@ -1122,3 +1122,67 @@ ASS 能保留专业排版和字体附件，但手机播放器可能覆盖 ASS �
 - 没有视觉检测底部人脸、片内烧录字幕和 UI；此类避让不能仅凭文本时间轴可靠完成。
 - 整片风格抽样不是完整剧情理解。独立终审覆盖所有字幕，但角色关系特别复杂时仍应人工检查名字和称谓。
 - OCR/ASR 置信度在不同模型、语言和片源上未校准为统一概率，只用于排序复核优先级。
+
+## 55. 内封文本、图像字幕、外置字幕和 ASR 被同一种策略处理
+
+### 现象与根因
+
+旧流程只有 `sidecar / embedded / audio` 三个入口，没有持久化“这段文字是人工字幕、OCR 还是 ASR”“它是完整对白、SDH、forced 还是评论轨”“时间轴是否来自片源本身”等证据。因此会出现几类相互冲突的问题：
+
+- 人工英文字幕可能被 Qwen 当作识别结果改写或隐藏。
+- OCR/ASR 的明显错误又可能因为“保留原文”而没有被修复。
+- 有中文时仍可能走音频识别，远程 Qwen 翻译期间本地 GPU 看起来仍在执行。
+- 普通英文轨没有音乐或环境提示，而英文 SDH 独有内容没有进入中文轨。
+- 网页推荐的来源和后端 `auto` 实际选择不同；内封中文与外置英文也不能组合。
+- source cache、翻译 checkpoint 和最终终审没有共同绑定来源处理方案。
+
+### 修复
+
+- 新增 `src/subtitle_sources.py`，为每条候选来源建立稳定的 `SubtitleAsset`：
+  - `origin`：`embedded / sidecar / audio`
+  - `representation`：`authored_text / bitmap_ocr / speech_asr`
+  - `language / script / role / codec`
+  - `text_authority / timing_authority`
+  - 文件路径或容器 stream index、disposition、匹配分数和可用性
+- 优先使用 ffprobe JSON 读取 `default / forced / hearing_impaired` 等 disposition；ffprobe 不可用时继续兼容原 ffmpeg 文本解析。
+- codec 采用完整 token 分类，避免把 `dvb_teletext` 因包含 `text` 误判为可提取文本。当前只有 PGS 进入图像 OCR；DVD/DVB/XSub/Teletext 等未实现格式在计划中警告，网页选项禁用，不会运行错误的 OCR 路径。
+- 自动选择改为确定性处理计划：
+  - 人工文本优先于图像 OCR，图像 OCR 优先于音频 ASR。
+  - 同等条件下内封人工轨获得质量加权；同片名外置轨仍保留匹配加权。
+  - 中文轨优先普通完整对白和简体，繁体先确定性转简体再保守校对。
+  - 源语言轨优先英文 SDH，使普通轨没有的音乐、说话者和环境提示进入“中文为空才补译”的流程。
+  - forced 轨不能冒充完整对白，只从与主源语言匹配的候选中选择质量最高的一条作为补充；评论轨不参与自动选择。
+- 后端 `auto` 使用与网页相同的来源评分，不再固定先尝试外置字幕。支持内封中文与外置英文、外置中文与内封英文的跨来源组合。
+- 多来源合并会按时间和标准化文本去重；不同的 forced/SDH 提示保留为独立事件。补充来源只绑定它实际贡献的事件，不再把补充轨错误写进每条主对白的来源记录。英文音效提示会先按音效类别和强时间重叠查找已有中文提示，匹配成功就组成同一事件；只有中文确实为空时才交给 Qwen 补译。
+- 处理计划新增 `audio_reference`。自动选择的同步/识别音轨进入处理计划指纹；音轨变化后不会误用旧 source cache。只有 commentary/无障碍解说音轨时：
+  - 已有字幕保留原时间，`subtitle-sync.report.json` 标记 `skipped_unsafe_audio_selection`。
+  - 需要 Whisper 时直接停止并要求明确选轨，避免把评论内容识别成电影对白。
+- 人工源文增加硬保护：
+  - 模型即使返回不同 `corrected_english`，程序也恢复人工原文。
+  - 模型不能隐藏人工来源事件。
+  - OCR 和 ASR 仍可依据置信度、上下文和重复证据修复。
+- prompt 为每个事件携带 `SOURCE_AUTHORITY`、`CHINESE_AUTHORITY` 和 `RECOGNITION_RISK`。OCR `<0.75`、ASR 低 log probability、高压缩率、高无语音概率或低词置信度会进入优先复核。
+- 每次任务输出：
+  - `<片名>.source-manifest.json`
+  - `<片名>.processing-plan.json`
+- 处理计划记录中文轨、源语言轨、补充轨、字幕时间基准、同步音轨、操作步骤和计算位置。运行期另记 `execution.source_cache_reused`：
+  - 首次 PGS/OCR 或 ASR 才列入本次本地 GPU。
+  - 从 source cache 继续时，本次 `execution.local_gpu=[]`，不会把“来源重建所需 GPU”误报为“本次正在执行”。
+- source cache 继续独立于翻译 checkpoint：
+  - `SOURCE_CACHE_VERSION` 升至 6，只让旧的已有字幕时间策略重建；纯音频 ASR 旧缓存仍可兼容。
+  - `PROCESSING_POLICY_VERSION` 升至 6、`FINAL_QA_POLICY_VERSION` 升至 3。
+  - 翻译 checkpoint 校验 `processing_plan_fingerprint`；最终终审指纹同时包含来源权威和处理计划。
+- 网页增加“推荐处理方案”，明确显示具体中文轨、源语言轨、补充轨、字幕时间基准、同步音轨、处理步骤和本地/远程计算位置。只有实际选择图像字幕时才显示 OCR 语言；混合来源保持 `auto`，不伪装成单一 sidecar 或 embedded 模式。
+- “分析视频”严格按当前 `auto / sidecar / embedded / audio` 模式、具体字幕文件/stream、同步音轨和同步开关生成方案，不再用全局自动结果覆盖显式选择。改动任一来源条件后立即隐藏旧方案，重新分析前不会继续展示过期结论。
+- 字幕文件、字幕 stream 和音频 stream 选择只属于当前分析的视频，不再写入全局表单设置；切换路径时立即清空，避免另一部电影恰好使用相同 stream index 时被误判为用户明确选轨。评论/解说音轨在网页选项中单独标记并禁用；命令行显式指定仍保留为诊断边界。
+- 与视频无文件名匹配关系的同目录字幕仍显示供手动选择，但不会进入自动处理计划。
+
+## 56. 本轮来源感知改造验证
+
+2026-07-30 验证：
+
+- Ruff：通过。
+- Windows 单元回归：177 项通过。
+- 新增覆盖包括：disposition/角色识别、内封与外置质量排序、英文 SDH 选择、forced 补充去重与语言约束、跨来源中英合并、逐事件来源归属、繁转简路线、OCR/ASR GPU 路由、同步音轨指纹、评论音轨拒绝、人工源文保护、处理计划 checkpoint 失配、source manifest、缓存续跑不执行本地识别、无关外置字幕不自动选中和前端层级控件。
+
+本轮没有在用户浏览器中执行视觉 QA。网页结构和行为已有静态及接口回归；实际浏览器布局检查需在用户指定 Chrome 或应用内浏览器后进行。
