@@ -48,7 +48,8 @@ TEXT_CODECS = {
 
 EXTRACT_CACHE_VERSION = 1
 PGS_IMAGE_CACHE_VERSION = 2
-OCR_CACHE_VERSION = 2
+OCR_CACHE_VERSION = 3
+COMPATIBLE_OCR_CACHE_VERSIONS = {2, OCR_CACHE_VERSION}
 
 
 @dataclass
@@ -83,6 +84,15 @@ class SubtitleEvent:
     start: float
     end: float
     text: str
+    confidence: float | None = None
+    metadata: dict[str, Any] | None = None
+
+
+@dataclass
+class OcrObservation:
+    text: str
+    confidence: float | None = None
+    line_confidences: list[float] | None = None
 
 
 @dataclass
@@ -441,7 +451,16 @@ def convert_traditional_to_simplified(events: list[SubtitleEvent]) -> list[Subti
     except Exception as exc:
         raise RuntimeError("opencc is required for Traditional Chinese conversion.") from exc
     converter = OpenCC("t2s")
-    return [SubtitleEvent(e.start, e.end, converter.convert(e.text)) for e in events]
+    return [
+        SubtitleEvent(
+            e.start,
+            e.end,
+            converter.convert(e.text),
+            e.confidence,
+            e.metadata,
+        )
+        for e in events
+    ]
 
 
 def ycbcr_to_rgba(y: int, cr: int, cb: int, alpha: int) -> tuple[int, int, int, int]:
@@ -826,18 +845,18 @@ class PaddleOcrEngine:
         if self.device.startswith("gpu") and "gpu" not in str(device).lower():
             raise RuntimeError(f"Paddle is not using GPU. Current device: {device!r}")
 
-    def recognize(self, image_path: Path) -> str:
+    def recognize(self, image_path: Path) -> OcrObservation:
         if hasattr(self.ocr, "predict"):
             result = self.ocr.predict(str(image_path))
         else:
             result = self.ocr.ocr(str(image_path), cls=False)
-        return extract_ocr_text(result, self.lang)
+        return extract_ocr_observation(result, self.lang)
 
 
-def extract_ocr_text(result: Any, lang: str) -> str:
-    lines: list[tuple[float, float, str]] = []
+def extract_ocr_observation(result: Any, lang: str) -> OcrObservation:
+    lines: list[tuple[float, float, str, float | None]] = []
 
-    def add_line(box: Any, text: str) -> None:
+    def add_line(box: Any, text: str, confidence: Any = None) -> None:
         if not text:
             return
         try:
@@ -848,7 +867,15 @@ def extract_ocr_text(result: Any, lang: str) -> str:
         except Exception:
             y = float(len(lines))
             x = 0.0
-        lines.append((y, x, clean_text(str(text))))
+        try:
+            normalized_confidence = float(confidence)
+            if not math.isfinite(normalized_confidence):
+                normalized_confidence = None
+            elif normalized_confidence < 0 or normalized_confidence > 1:
+                normalized_confidence = None
+        except (TypeError, ValueError):
+            normalized_confidence = None
+        lines.append((y, x, clean_text(str(text)), normalized_confidence))
 
     def walk(obj: Any) -> None:
         if obj is None:
@@ -864,7 +891,12 @@ def extract_ocr_text(result: Any, lang: str) -> str:
                 pass
         if isinstance(obj, dict):
             if "rec_texts" in obj:
-                texts = obj.get("rec_texts") or []
+                texts = obj.get("rec_texts")
+                if texts is None:
+                    texts = []
+                scores = obj.get("rec_scores")
+                if scores is None:
+                    scores = []
                 boxes = obj.get("rec_boxes")
                 if boxes is None or (hasattr(boxes, "__len__") and len(boxes) == 0):
                     boxes = obj.get("rec_polys")
@@ -874,7 +906,8 @@ def extract_ocr_text(result: Any, lang: str) -> str:
                     box = boxes[idx] if idx < len(boxes) else None
                     if box is not None and hasattr(box, "tolist"):
                         box = box.tolist()
-                    add_line(box, text)
+                    score = scores[idx] if idx < len(scores) else None
+                    add_line(box, text, score)
                 return
             if "res" in obj:
                 walk(obj["res"])
@@ -887,19 +920,31 @@ def extract_ocr_text(result: Any, lang: str) -> str:
         if isinstance(obj, (list, tuple)):
             if len(obj) == 2 and isinstance(obj[1], (list, tuple)) and len(obj[1]) >= 1:
                 text = obj[1][0]
-                add_line(obj[0], text)
+                confidence = obj[1][1] if len(obj[1]) > 1 else None
+                add_line(obj[0], text, confidence)
                 return
             for item in obj:
                 walk(item)
 
     walk(result)
     if not lines:
-        return ""
+        return OcrObservation(text="")
     lines.sort(key=lambda item: (round(item[0] / 12), item[1]))
     texts = [item[2] for item in lines if item[2]]
+    confidences = [item[3] for item in lines if item[2] and item[3] is not None]
     if lang in {"ch", "chinese_cht"}:
-        return clean_text("".join(texts))
-    return clean_text(" ".join(texts))
+        text = clean_text("".join(texts))
+    else:
+        text = clean_text(" ".join(texts))
+    return OcrObservation(
+        text=text,
+        confidence=round(sum(confidences) / len(confidences), 6) if confidences else None,
+        line_confidences=[round(value, 6) for value in confidences] or None,
+    )
+
+
+def extract_ocr_text(result: Any, lang: str) -> str:
+    return extract_ocr_observation(result, lang).text
 
 
 def ocr_pgs_events(
@@ -930,7 +975,7 @@ def ocr_pgs_events(
             cached = None
         if (
             isinstance(cached, dict)
-            and cached.get("version") == OCR_CACHE_VERSION
+            and cached.get("version") in COMPATIBLE_OCR_CACHE_VERSIONS
             and cached.get("config") == config
             and cached.get("images") == image_signatures
             and isinstance(cached.get("events"), list)
@@ -938,7 +983,17 @@ def ocr_pgs_events(
         ):
             try:
                 out = [
-                    SubtitleEvent(float(item["start"]), float(item["end"]), str(item["text"]))
+                    SubtitleEvent(
+                        float(item["start"]),
+                        float(item["end"]),
+                        str(item["text"]),
+                        (
+                            float(item["confidence"])
+                            if item.get("confidence") is not None
+                            else None
+                        ),
+                        item.get("metadata") if isinstance(item.get("metadata"), dict) else None,
+                    )
                     for item in cached["events"]
                 ]
             except (KeyError, TypeError, ValueError):
@@ -963,8 +1018,21 @@ def ocr_pgs_events(
     iterator = tqdm(remaining, desc=f"OCR {lang}", unit="line") if tqdm else remaining
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     for idx, item in enumerate(iterator, len(out) + 1):
-        text = engine.recognize(item.image_path)
-        event = SubtitleEvent(item.start, item.end, text)
+        observation = engine.recognize(item.image_path)
+        if isinstance(observation, OcrObservation):
+            event = SubtitleEvent(
+                item.start,
+                item.end,
+                observation.text,
+                observation.confidence,
+                (
+                    {"line_confidences": observation.line_confidences}
+                    if observation.line_confidences
+                    else None
+                ),
+            )
+        else:
+            event = SubtitleEvent(item.start, item.end, str(observation))
         out.append(event)
         if idx % 20 == 0:
             write_json_atomic(
@@ -1238,10 +1306,12 @@ def join_subtitle_events(events: list[SubtitleEvent], language: str) -> Subtitle
             texts.append(text)
             previous = normalized
     separator = "" if language == "zh" else " "
+    confidences = [event.confidence for event in ordered if event.confidence is not None]
     return SubtitleEvent(
         min(event.start for event in ordered),
         max(event.end for event in ordered),
         clean_text(separator.join(texts)),
+        min(confidences) if confidences else None,
     )
 
 

@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import socket
@@ -8,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -475,6 +477,83 @@ def read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def write_json_atomic(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def flatten_quality_review_items(
+    report: Dict[str, Any],
+    checkpoint_items: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    segments_by_id = {
+        str(item.get("id")): summarize_segment(item)
+        for item in checkpoint_items
+        if isinstance(item, dict) and item.get("id") is not None
+    }
+    review_items: List[Dict[str, Any]] = []
+    checks = report.get("checks")
+    if not isinstance(checks, dict):
+        return review_items
+
+    for check_name, check in checks.items():
+        if not isinstance(check, dict):
+            continue
+        status = str(check.get("status") or "")
+        if status not in {"review", "fail"}:
+            continue
+        samples = check.get("samples")
+        sample_items = samples if isinstance(samples, list) else []
+        if not sample_items:
+            reasons = check.get("reasons")
+            normalized_reasons = (
+                [str(reason) for reason in reasons if str(reason).strip()]
+                if isinstance(reasons, list)
+                else []
+            )
+            review_items.append(
+                {
+                    "check": str(check_name),
+                    "status": status,
+                    "issue": normalized_reasons[0] if normalized_reasons else str(check_name),
+                    "reasons": normalized_reasons,
+                    "segment": None,
+                    "details": {
+                        key: value
+                        for key, value in check.items()
+                        if key not in {"samples", "reasons"}
+                    },
+                }
+            )
+            continue
+        for sample in sample_items:
+            if not isinstance(sample, dict):
+                continue
+            segment_id = sample.get("checkpoint_segment_id", sample.get("id"))
+            issues = sample.get("issues")
+            issue = sample.get("issue")
+            if not issue and isinstance(issues, list):
+                issue = ", ".join(str(value) for value in issues)
+            review_items.append(
+                {
+                    "check": str(check_name),
+                    "status": status,
+                    "issue": str(issue or check_name),
+                    "segment_id": segment_id,
+                    "start": sample.get("start"),
+                    "end": sample.get("end"),
+                    "segment": segments_by_id.get(str(segment_id)),
+                    "details": sample,
+                }
+            )
+    return review_items[:200]
+
+
 def checkpoint_info(
     output_root: Path,
     series_name: str,
@@ -498,7 +577,9 @@ def checkpoint_info(
         "last_item": None,
         "preview": [],
         "checkpoint_compatible": None,
+        "quality_review_items": [],
     }
+    checkpoint_items: List[Dict[str, Any]] = []
 
     if source.exists():
         try:
@@ -512,6 +593,7 @@ def checkpoint_info(
         try:
             items = read_json(checkpoint)
             if isinstance(items, list):
+                checkpoint_items = [item for item in items if isinstance(item, dict)]
                 info["completed_count"] = len(items)
                 if items:
                     checkpoint_model = str(items[0].get("llm_model") or "")
@@ -545,6 +627,11 @@ def checkpoint_info(
             info["quality_status"] = str(report.get("status") or "")
             info["quality_summary"] = report.get("summary") or {}
             info["quality_checks"] = report.get("checks") or {}
+            info["quality_review_items"] = flatten_quality_review_items(
+                report,
+                checkpoint_items,
+            )
+            info["manual_review_pending"] = bool(report.get("manual_review_pending"))
         except Exception as exc:
             info["quality_report_error"] = str(exc)
 
@@ -562,6 +649,103 @@ def summarize_segment(item: Dict[str, Any]) -> Dict[str, Any]:
         "source_language": item.get("source_language"),
         "processing_mode": item.get("processing_mode"),
         "display": item.get("display", True),
+        "manual_reviewed_at": item.get("manual_reviewed_at"),
+    }
+
+
+def update_checkpoint_segment(payload: Dict[str, Any]) -> Dict[str, Any]:
+    output_root = Path(str(payload.get("output_root") or DEFAULT_OUTPUT_ROOT)).expanduser()
+    series_name = str(payload.get("series_name") or "").strip()
+    movie_name = str(payload.get("movie_name") or "").strip()
+    if not series_name or not movie_name:
+        raise RequestValidationError("系列名和片名不能为空")
+
+    with RUNS_LOCK:
+        active_runs = list(RUNS.values())
+    if any(
+        info.get("series_name") == series_name
+        and info.get("movie_name") == movie_name
+        and process_matches_run(info)
+        for info in active_runs
+    ):
+        raise RequestValidationError("任务运行中，不能同时修改 checkpoint", status=409)
+
+    out_dir = output_dir(output_root, series_name, movie_name)
+    checkpoint_path = out_dir / f"{movie_name}.segments.checkpoint.json"
+    if not checkpoint_path.exists():
+        raise RequestValidationError("没有可编辑的 checkpoint", status=404)
+    items = read_json(checkpoint_path)
+    if not isinstance(items, list):
+        raise RequestValidationError("checkpoint 格式无效")
+
+    target_id = payload.get("id")
+    expected_start = payload.get("expected_start")
+    target: Dict[str, Any] | None = None
+    for item in items:
+        if not isinstance(item, dict) or str(item.get("id")) != str(target_id):
+            continue
+        if expected_start is not None:
+            try:
+                if abs(float(item.get("start")) - float(expected_start)) > 0.001:
+                    continue
+            except (TypeError, ValueError):
+                continue
+        target = item
+        break
+    if target is None:
+        raise RequestValidationError(
+            "该字幕已被其他处理更新，请刷新后重试",
+            status=409,
+        )
+
+    try:
+        start = float(payload.get("start"))
+        end = float(payload.get("end"))
+    except (TypeError, ValueError) as exc:
+        raise RequestValidationError("开始和结束时间必须是数字") from exc
+    if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start:
+        raise RequestValidationError("字幕时间范围无效")
+
+    en = str(payload.get("en") or "").strip()
+    zh = str(payload.get("zh") or "").strip()
+    if not en and not zh:
+        raise RequestValidationError("英文和中文不能同时为空")
+    if len(en) > 1000 or len(zh) > 1000:
+        raise RequestValidationError("单条字幕内容过长")
+
+    target.setdefault("manual_source_start", float(target["start"]))
+    target.setdefault("manual_source_end", float(target["end"]))
+    target.setdefault("manual_source_text", str(target.get("text") or ""))
+    target.update(
+        {
+            "start": start,
+            "end": end,
+            "en": en,
+            "zh": zh,
+            "display": bool(payload.get("display", True)),
+            "manual_reviewed_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    write_json_atomic(checkpoint_path, items)
+
+    quality_report_path = out_dir / f"{movie_name}.quality-report.json"
+    if quality_report_path.exists():
+        try:
+            report = read_json(quality_report_path)
+            if isinstance(report, dict):
+                report["status"] = "review"
+                report["manual_review_pending"] = True
+                report["manual_review_checkpoint_path"] = str(checkpoint_path)
+                write_json_atomic(quality_report_path, report)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+
+    return {
+        "updated": True,
+        "segment": summarize_segment(target),
+        "checkpoint_path": str(checkpoint_path),
+        "regeneration_required": True,
+        "message": "已保存人工复核；请运行“继续任务”重新生成 ASS 和质检报告。",
     }
 
 
@@ -1159,7 +1343,9 @@ def html_page() -> str:
     h2 { font-size: 17px; margin: 0 0 12px; }
     section { background: white; border: 1px solid #dde1e7; border-radius: 8px; padding: 18px; margin-bottom: 16px; }
     label { display: block; font-size: 13px; color: #4f5a66; margin-bottom: 6px; }
-    input, select { width: 100%; box-sizing: border-box; height: 38px; border: 1px solid #c8ced8; border-radius: 6px; padding: 0 10px; background: white; color: #1f242b; }
+    input, select, textarea { width: 100%; box-sizing: border-box; border: 1px solid #c8ced8; border-radius: 6px; padding: 0 10px; background: white; color: #1f242b; font: inherit; }
+    input, select { height: 38px; }
+    textarea { min-height: 88px; padding: 9px 10px; resize: vertical; line-height: 1.5; }
     button { height: 38px; border: 1px solid #1f6feb; background: #1f6feb; color: white; border-radius: 6px; padding: 0 14px; cursor: pointer; }
     button.secondary { background: white; color: #1f6feb; }
     button.danger { background: #b42318; border-color: #b42318; }
@@ -1213,6 +1399,14 @@ def html_page() -> str:
     .stage-line { flex: 1; height: 2px; background: #dde1e7; margin: 0 16px; }
     .status-message { margin: 14px 0 0; padding: 10px 12px; border-left: 4px solid #bf8700; background: #fff8c5; color: #633c01; line-height: 1.55; overflow-wrap: anywhere; }
     .status-message.error { border-left-color: #da3633; background: #ffebe9; color: #82071e; }
+    .quality-toolbar { display: flex; align-items: end; gap: 12px; margin-bottom: 10px; }
+    .quality-toolbar > div { width: min(320px, 100%); }
+    .quality-toolbar .muted { margin-left: auto; padding-bottom: 10px; }
+    .table-scroll { width: 100%; overflow-x: auto; }
+    .quality-status { display: inline-block; min-width: 52px; font-weight: 600; }
+    .quality-status.fail { color: #b42318; }
+    .quality-status.review { color: #854d0e; }
+    .compact-button { height: 30px; padding: 0 10px; white-space: nowrap; }
     @media (max-width: 800px) {
       main { padding: 14px; }
       .grid { grid-template-columns: 1fr; }
@@ -1229,11 +1423,23 @@ def html_page() -> str:
       .stage-container { overflow-x: auto; padding: 14px; gap: 6px; }
       .stage-step { flex: 0 0 auto; white-space: nowrap; }
       .stage-line { min-width: 24px; margin: 0 6px; }
+      .quality-toolbar { align-items: stretch; flex-direction: column; }
+      .quality-toolbar > div { width: 100%; }
+      .quality-toolbar .muted { margin-left: 0; padding-bottom: 0; }
     }
     .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); align-items: center; justify-content: center; z-index: 1000; }
     .modal { background: white; padding: 24px; border-radius: 8px; width: 100%; max-width: 400px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
+    .modal.review-modal { max-width: 720px; }
     .modal h2 { margin-top: 0; }
     .modal .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+    .review-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .review-grid .full { grid-column: 1 / -1; }
+    @media (max-width: 640px) {
+      .modal-overlay { align-items: stretch; }
+      .modal { max-width: none; margin: 12px; overflow-y: auto; }
+      .review-grid { grid-template-columns: 1fr; }
+      .review-grid .full { grid-column: 1; }
+    }
   </style>
 </head>
 <body>
@@ -1262,6 +1468,38 @@ def html_page() -> str:
     <div class="actions">
       <button class="secondary" onclick="closeRemoteModal()">取消</button>
       <button onclick="connectRemoteServer()" id="remoteConnectBtn">连接</button>
+    </div>
+  </div>
+</div>
+<div class="modal-overlay" id="reviewModal">
+  <div class="modal review-modal" role="dialog" aria-modal="true" aria-labelledby="reviewModalTitle">
+    <h2 id="reviewModalTitle">复核字幕</h2>
+    <p class="muted" id="reviewIssue"></p>
+    <div class="review-grid">
+      <div>
+        <label for="reviewStart">开始时间（秒）</label>
+        <input id="reviewStart" type="number" min="0" step="0.001">
+      </div>
+      <div>
+        <label for="reviewEnd">结束时间（秒）</label>
+        <input id="reviewEnd" type="number" min="0" step="0.001">
+      </div>
+      <div class="full">
+        <label for="reviewEnglish">源文 / 英文</label>
+        <textarea id="reviewEnglish"></textarea>
+      </div>
+      <div class="full">
+        <label for="reviewChinese">中文</label>
+        <textarea id="reviewChinese"></textarea>
+      </div>
+      <div class="full">
+        <label class="checkbox-control"><input id="reviewDisplay" type="checkbox" checked>在成片中显示</label>
+      </div>
+    </div>
+    <p class="status-message error" id="reviewError" hidden></p>
+    <div class="actions">
+      <button class="secondary" onclick="closeReviewModal()">取消</button>
+      <button onclick="saveCheckpointReview()" id="reviewSaveBtn">保存复核</button>
     </div>
   </div>
 </div>
@@ -1501,6 +1739,25 @@ def html_page() -> str:
     <div class="stage-step" id="step-3"><span class="dot"></span><span class="step-text">完成</span></div>
   </div>
 
+  <section id="qualityReview" hidden>
+    <h2>成片复核</h2>
+    <div class="quality-toolbar">
+      <div>
+        <label for="qualityFilter">问题类型</label>
+        <select id="qualityFilter" onchange="renderQualityReviewRows()">
+          <option value="">全部问题</option>
+        </select>
+      </div>
+      <span class="muted" id="qualityReviewCount"></span>
+    </div>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>状态</th><th>检查</th><th>时间</th><th>问题</th><th>字幕</th><th>操作</th></tr></thead>
+        <tbody id="qualityReviewRows"></tbody>
+      </table>
+    </div>
+  </section>
+
   <section>
     <h2>Checkpoint 预览</h2>
     <table>
@@ -1527,7 +1784,9 @@ const state = {
   lastAnalysis: null,
   analyzing: false,
   restoringSettings: false,
-  serverSettings: {form: {}, remote: {}}
+  serverSettings: {form: {}, remote: {}},
+  qualityReviewItems: [],
+  currentReviewItem: null
 };
 let settingsSaveTimer = 0;
 document.getElementById('outputRoot').value = CONFIGURED_OUTPUT_ROOT;
@@ -1852,6 +2111,145 @@ function previewEnglishText(item) {
   return value;
 }
 
+const QUALITY_CHECK_LABELS = {
+  pixel_width: '画面宽度',
+  readability: '阅读速度',
+  timing: '时间轴',
+  completeness: '内容完整性',
+  model_display_guard: '显示保护',
+  terminology: '术语一致性',
+  subtitle_sync: '字幕同步',
+  source_completeness: '字幕源完整性',
+  recognition_confidence: '识别置信度',
+  movie_style: '整片风格分析',
+  independent_final_qa: '独立终审',
+  delivery_render: '成片渲染'
+};
+
+const QUALITY_ISSUE_LABELS = {
+  invalid_duration: '时间范围无效',
+  timeline_overlap: '字幕时间重叠',
+  over_max_duration: '持续时间过长',
+  under_min_duration: '持续时间过短',
+  missing_chinese: '缺少中文',
+  chinese_target_has_no_cjk: '中文轨没有中文',
+  english_track_contains_cjk: '英文轨混入东亚文字',
+  empty_visible_event: '可见字幕为空',
+  low_ocr_confidence: 'OCR 置信度偏低',
+  low_asr_log_probability: '语音识别置信度偏低',
+  high_asr_compression_ratio: '语音识别疑似重复',
+  high_no_speech_probability: '可能并非语音',
+  low_word_confidence: '多个词识别不确定',
+  chinese_cps: '中文阅读速度过快',
+  english_cps: '英文阅读速度过快',
+  east_asian_source_cps: '源文阅读速度过快'
+};
+
+function qualityIssueLabel(value) {
+  return String(value || '')
+    .split(',')
+    .map(item => QUALITY_ISSUE_LABELS[item.trim()] || item.trim())
+    .filter(Boolean)
+    .join('、');
+}
+
+function renderQualityReview(data) {
+  state.qualityReviewItems = Array.isArray(data.quality_review_items)
+    ? data.quality_review_items
+    : [];
+  const section = document.getElementById('qualityReview');
+  section.hidden = state.qualityReviewItems.length === 0;
+
+  const filter = document.getElementById('qualityFilter');
+  const selected = filter.value;
+  const checks = [...new Set(state.qualityReviewItems.map(item => item.check).filter(Boolean))];
+  filter.innerHTML = '<option value="">全部问题</option>' + checks.map(check =>
+    `<option value="${escapeHtml(check)}">${escapeHtml(QUALITY_CHECK_LABELS[check] || check)}</option>`
+  ).join('');
+  filter.value = checks.includes(selected) ? selected : '';
+  renderQualityReviewRows();
+}
+
+function renderQualityReviewRows() {
+  const filter = document.getElementById('qualityFilter').value;
+  const rows = state.qualityReviewItems
+    .map((item, index) => ({item, index}))
+    .filter(entry => !filter || entry.item.check === filter);
+  document.getElementById('qualityReviewCount').textContent =
+    `${rows.length} 条待复核`;
+  document.getElementById('qualityReviewRows').innerHTML = rows.map(({item, index}) => {
+    const segment = item.segment;
+    const start = segment?.start ?? item.start ?? '';
+    const end = segment?.end ?? item.end ?? '';
+    const time = start === '' ? '-' : `${start} → ${end}`;
+    const text = segment
+      ? [previewEnglishText(segment), segment.zh || ''].filter(Boolean).join(' / ')
+      : (item.details?.text || item.reasons?.join('；') || '-');
+    const action = segment
+      ? `<button class="secondary compact-button" onclick="openQualityReview(${index})">复核</button>`
+      : '<span class="muted">查看报告</span>';
+    return `<tr>
+      <td><span class="quality-status ${escapeHtml(item.status)}">${item.status === 'fail' ? '未通过' : '复核'}</span></td>
+      <td>${escapeHtml(QUALITY_CHECK_LABELS[item.check] || item.check)}</td>
+      <td>${escapeHtml(time)}</td>
+      <td>${escapeHtml(qualityIssueLabel(item.issue))}</td>
+      <td>${escapeHtml(text)}</td>
+      <td>${action}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="6" class="muted">当前筛选没有待复核项目</td></tr>';
+}
+
+function openQualityReview(index) {
+  const item = state.qualityReviewItems[index];
+  if (!item?.segment) return;
+  state.currentReviewItem = item;
+  const segment = item.segment;
+  document.getElementById('reviewIssue').textContent =
+    `${QUALITY_CHECK_LABELS[item.check] || item.check}：${qualityIssueLabel(item.issue)}`;
+  document.getElementById('reviewStart').value = segment.start ?? '';
+  document.getElementById('reviewEnd').value = segment.end ?? '';
+  document.getElementById('reviewEnglish').value = previewEnglishText(segment);
+  document.getElementById('reviewChinese').value = segment.zh || '';
+  document.getElementById('reviewDisplay').checked = segment.display !== false;
+  document.getElementById('reviewError').hidden = true;
+  document.getElementById('reviewModal').style.display = 'flex';
+}
+
+function closeReviewModal() {
+  state.currentReviewItem = null;
+  document.getElementById('reviewModal').style.display = 'none';
+}
+
+async function saveCheckpointReview() {
+  const item = state.currentReviewItem;
+  if (!item?.segment) return;
+  const button = document.getElementById('reviewSaveBtn');
+  const error = document.getElementById('reviewError');
+  button.disabled = true;
+  error.hidden = true;
+  try {
+    const request = payload();
+    Object.assign(request, {
+      id: item.segment.id,
+      expected_start: item.segment.start,
+      start: Number(document.getElementById('reviewStart').value),
+      end: Number(document.getElementById('reviewEnd').value),
+      en: document.getElementById('reviewEnglish').value,
+      zh: document.getElementById('reviewChinese').value,
+      display: document.getElementById('reviewDisplay').checked
+    });
+    const result = await api('/api/checkpoint/update', request);
+    closeReviewModal();
+    document.getElementById('log').textContent = result.message || '复核已保存。';
+    await refreshStatus();
+  } catch (e) {
+    error.textContent = `保存失败：${e.message}`;
+    error.hidden = false;
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function render(data) {
   if (data.sidecar_subtitles) updateSidecarOptions(data.sidecar_subtitles);
   if (data.embedded_subtitles) updateEmbeddedOptions(data.embedded_subtitles);
@@ -1966,6 +2364,7 @@ function render(data) {
     return `<tr><td>${escapeHtml(item.id)}</td><td>${escapeHtml(time)}</td><td>${escapeHtml(previewEnglishText(item))}</td><td>${escapeHtml(item.zh || '')}</td></tr>`;
   }).join('');
   document.getElementById('preview').innerHTML = rows || '<tr><td colspan="4" class="muted">暂无 checkpoint 内容</td></tr>';
+  renderQualityReview(data);
   updateWorkflowVisibility();
 }
 
@@ -2418,6 +2817,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(stop_processing(self.read_json_body()))
             elif self.path == "/api/status":
                 self.send_json(run_status(self.read_json_body()))
+            elif self.path == "/api/checkpoint/update":
+                self.send_json(update_checkpoint_segment(self.read_json_body()))
             elif self.path == "/api/remote/connect":
                 if not tunnel_manager:
                     self.send_json({"error": "paramiko not installed or ssh_tunnel not found"}, status=500)

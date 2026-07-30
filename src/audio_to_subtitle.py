@@ -14,15 +14,28 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from ass_styles import STYLE_PROFILE_NAMES, ass_style_header, probe_video_play_resolution
+from ass_styles import (
+    STYLE_PROFILE_NAMES,
+    ass_style_header,
+    probe_video_duration_seconds,
+    probe_video_play_resolution,
+)
 from font_delivery import font_family_name, package_ass_with_font, validate_font_path
 from llm_policy import (
     generation_profile,
     indexed_subtitle_schema,
     movie_name_schema,
+    movie_style_schema,
 )
 from output_paths import OUTPUT_DIRECTORY_NAME, resolve_output_root, suggested_output_root
-from pipeline_policy import PROCESSING_POLICY_VERSION, TERMINOLOGY_POLICY_VERSION
+from pipeline_policy import (
+    FINAL_QA_POLICY_VERSION,
+    PROCESSING_POLICY_VERSION,
+    STYLE_GUIDE_POLICY_VERSION,
+    TERMINOLOGY_POLICY_VERSION,
+)
+from scene_timing import align_subtitles_to_scene_cuts, detect_scene_cuts
+from subtitle_delivery import validate_ass_rendering, write_delivery_srts
 from subtitle_sync import (
     SUBTITLE_SYNC_MODES,
     SYNC_POLICY_VERSION,
@@ -49,7 +62,7 @@ class ExistingSubtitleTracks:
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m2ts", ".ts", ".mov", ".wmv"}
 SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt"}
 UNKNOWN_SOURCE_LANGUAGE_TAGS = {"", "auto", "source", "cached source", "subtitle", "embedded subtitle"}
-SOURCE_CACHE_VERSION = 4
+SOURCE_CACHE_VERSION = 5
 COMPATIBLE_SYNC_POLICY_VERSIONS = (5,)
 TARGET_CHINESE_CPS = 9.0
 TARGET_ENGLISH_CPS = 20.0
@@ -356,7 +369,9 @@ def transcribe_audio(audio_path: Path, language: Optional[str] = "auto") -> List
             str(audio_path),
             beam_size=5,
             language=requested_language,
+            multilingual=requested_language is None,
             word_timestamps=True,
+            hallucination_silence_threshold=2.0,
             vad_filter=True,
             vad_parameters={
                 "min_silence_duration_ms": 500,
@@ -365,21 +380,35 @@ def transcribe_audio(audio_path: Path, language: Optional[str] = "auto") -> List
         )
 
         detected_language = str(getattr(info, "language", "") or requested_language or language or "auto")
-        print(f"Detected language '{detected_language}' with probability {info.language_probability}")
+        language_probability = float(getattr(info, "language_probability", 0.0) or 0.0)
+        print(f"Detected language '{detected_language}' with probability {language_probability}")
 
         results: List[Segment] = []
         for segment in segments:
             words = []
+            word_probabilities: List[float] = []
             for word in getattr(segment, "words", None) or []:
                 text = getattr(word, "word", "").strip()
                 if text:
-                    words.append(
-                        {
-                            "start": float(getattr(word, "start", segment.start)),
-                            "end": float(getattr(word, "end", segment.end)),
-                            "word": text,
-                        }
-                    )
+                    word_item = {
+                        "start": float(getattr(word, "start", segment.start)),
+                        "end": float(getattr(word, "end", segment.end)),
+                        "word": text,
+                    }
+                    probability = getattr(word, "probability", None)
+                    if probability is not None:
+                        try:
+                            normalized_probability = float(probability)
+                        except (TypeError, ValueError):
+                            normalized_probability = None
+                        if (
+                            normalized_probability is not None
+                            and math.isfinite(normalized_probability)
+                            and 0 <= normalized_probability <= 1
+                        ):
+                            word_item["probability"] = normalized_probability
+                            word_probabilities.append(normalized_probability)
+                    words.append(word_item)
 
             text = normalize_space(segment.text)
             if not text:
@@ -390,9 +419,25 @@ def transcribe_audio(audio_path: Path, language: Optional[str] = "auto") -> List
                 "end": float(segment.end),
                 "text": text,
                 "source_language": detected_language,
+                "asr_language_probability": language_probability,
             }
+            for key, attribute in (
+                ("asr_avg_logprob", "avg_logprob"),
+                ("asr_compression_ratio", "compression_ratio"),
+                ("asr_no_speech_prob", "no_speech_prob"),
+                ("asr_temperature", "temperature"),
+            ):
+                value = getattr(segment, attribute, None)
+                try:
+                    normalized_value = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(normalized_value):
+                    item[key] = normalized_value
             if words:
                 item["words"] = words
+            if word_probabilities:
+                item["asr_word_confidence"] = sum(word_probabilities) / len(word_probabilities)
             results.append(item)
             print(f"[{segment.start:.2f}s -> {segment.end:.2f}s] {text}")
 
@@ -615,6 +660,8 @@ def clean_subtitle_text(text: str) -> str:
 
 CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 EAST_ASIAN_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]")
+JAPANESE_SCRIPT_RE = re.compile(r"[\u3040-\u30ff]")
+KOREAN_SCRIPT_RE = re.compile(r"[\uac00-\ud7af]")
 
 
 def contains_cjk(text: str) -> bool:
@@ -623,6 +670,40 @@ def contains_cjk(text: str) -> bool:
 
 def contains_east_asian(text: str) -> bool:
     return bool(EAST_ASIAN_RE.search(text or ""))
+
+
+def source_language_preserved(
+    segment: Segment,
+    original_source: str,
+    corrected_source: str,
+) -> bool:
+    original = clean_subtitle_text(original_source)
+    corrected = clean_subtitle_text(corrected_source)
+    if not original:
+        return not corrected
+    if not corrected:
+        return False
+
+    language = normalize_language_tag(str(segment.get("source_language") or ""))
+    if language == "en":
+        return not contains_east_asian(corrected) or contains_east_asian(original)
+    if language == "ja":
+        if JAPANESE_SCRIPT_RE.search(original) and not JAPANESE_SCRIPT_RE.search(corrected):
+            return False
+        return not contains_east_asian(original) or contains_east_asian(corrected)
+    if language == "ko":
+        if KOREAN_SCRIPT_RE.search(original) and not KOREAN_SCRIPT_RE.search(corrected):
+            return False
+        return not contains_east_asian(original) or contains_east_asian(corrected)
+    if language == "zh":
+        return not contains_east_asian(original) or contains_east_asian(corrected)
+    if JAPANESE_SCRIPT_RE.search(original):
+        return bool(JAPANESE_SCRIPT_RE.search(corrected))
+    if KOREAN_SCRIPT_RE.search(original):
+        return bool(KOREAN_SCRIPT_RE.search(corrected))
+    if contains_east_asian(original) and not contains_east_asian(corrected):
+        return False
+    return True
 
 
 def clean_english_track_text(text: str) -> str:
@@ -946,7 +1027,20 @@ def segments_to_events(segments: List[Segment], key: str = "text") -> List[Any]:
         end = float(segment["end"])
         if end <= start:
             continue
-        events.append(SubtitleEvent(start, end, text))
+        confidence = segment.get("ocr_confidence")
+        events.append(
+            SubtitleEvent(
+                start,
+                end,
+                text,
+                float(confidence) if confidence is not None else None,
+                (
+                    segment.get("ocr_metadata")
+                    if isinstance(segment.get("ocr_metadata"), dict)
+                    else None
+                ),
+            )
+        )
     return events
 
 
@@ -975,19 +1069,26 @@ def merge_existing_subtitle_segments(
         text = en_text or zh_text
         if not text and not zh_text:
             continue
-        merged.append(
-            {
-                "id": len(merged),
-                "start": start,
-                "end": end,
-                "text": text,
-                "en": en_text,
-                "zh": zh_text,
-                "source_language": source_label,
-                "display": True,
-                "preserve_distinct_overlap": True,
-            }
-        )
+        item: Segment = {
+            "id": len(merged),
+            "start": start,
+            "end": end,
+            "text": text,
+            "en": en_text,
+            "zh": zh_text,
+            "source_language": source_label,
+            "display": True,
+            "preserve_distinct_overlap": True,
+        }
+        lane_confidences = {
+            lane: event.confidence
+            for lane, event in (("en", en_event), ("zh", zh_event))
+            if event is not None and event.confidence is not None
+        }
+        if lane_confidences:
+            item["ocr_confidence"] = min(lane_confidences.values())
+            item["ocr_lane_confidences"] = lane_confidences
+        merged.append(item)
     return merged
 
 
@@ -1156,6 +1257,12 @@ def find_existing_embedded_subtitle_tracks(
             "end": event.end,
             "text": event.text,
             "source_language": "existing Chinese embedded subtitle",
+            **(
+                {"ocr_confidence": event.confidence}
+                if event.confidence is not None
+                else {}
+            ),
+            **({"ocr_metadata": event.metadata} if event.metadata else {}),
         }
         for idx, event in enumerate(zh_events)
         if event.text.strip()
@@ -1184,6 +1291,12 @@ def find_existing_embedded_subtitle_tracks(
                 "end": event.end,
                 "text": event.text,
                 "source_language": "existing English embedded subtitle",
+                **(
+                    {"ocr_confidence": event.confidence}
+                    if event.confidence is not None
+                    else {}
+                ),
+                **({"ocr_metadata": event.metadata} if event.metadata else {}),
             }
             for idx, event in enumerate(en_events)
             if event.text.strip()
@@ -1381,7 +1494,19 @@ def load_embedded_subtitle_events(
     print(f"Using embedded subtitle stream 0:{stream.index} {stream.lang or '-'} {stream.codec} {stream.title}")
     events = get_stream_events(video_path, stream, ffmpeg, out_dir / "embedded" / f"stream_{stream.index:02d}", ocr_lang, args)
     segments = [
-        {"id": idx, "start": event.start, "end": event.end, "text": event.text, "source_language": stream.lang or source_language}
+        {
+            "id": idx,
+            "start": event.start,
+            "end": event.end,
+            "text": event.text,
+            "source_language": stream.lang or source_language,
+            **(
+                {"ocr_confidence": event.confidence}
+                if event.confidence is not None
+                else {}
+            ),
+            **({"ocr_metadata": event.metadata} if event.metadata else {}),
+        }
         for idx, event in enumerate(events)
         if event.text.strip()
     ]
@@ -1518,6 +1643,51 @@ def track_chunk_count(text: str, max_words: int, max_chars: int, is_cjk: bool) -
     )
 
 
+def valid_word_timestamps(segment: Segment) -> List[Dict[str, Any]]:
+    words: List[Dict[str, Any]] = []
+    for word in segment.get("words") or []:
+        if not isinstance(word, dict) or not str(word.get("word") or "").strip():
+            continue
+        try:
+            start = float(word["start"])
+            end = float(word["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if math.isfinite(start) and math.isfinite(end) and end > start:
+            words.append({**word, "start": start, "end": end})
+    return sorted(words, key=lambda item: (float(item["start"]), float(item["end"])))
+
+
+def allocate_words_to_chunks(
+    words: List[Dict[str, Any]],
+    chunks: List[str],
+    *,
+    compact_text: bool,
+) -> List[List[Dict[str, Any]]]:
+    if len(chunks) <= 1:
+        return [words]
+    if len(words) < len(chunks):
+        return []
+    weights = [
+        max(1, len(chunk) if compact_text else len(chunk.split()))
+        for chunk in chunks
+    ]
+    total_weight = sum(weights)
+    boundaries = [0]
+    cumulative_weight = 0
+    for index, weight in enumerate(weights[:-1], 1):
+        cumulative_weight += weight
+        ideal = round(len(words) * cumulative_weight / total_weight)
+        minimum = boundaries[-1] + 1
+        maximum = len(words) - (len(chunks) - index)
+        boundaries.append(max(minimum, min(maximum, ideal)))
+    boundaries.append(len(words))
+    return [
+        words[boundaries[index] : boundaries[index + 1]]
+        for index in range(len(chunks))
+    ]
+
+
 def split_bilingual_segment(
     segment: Segment,
     max_words: int,
@@ -1544,6 +1714,7 @@ def split_bilingual_segment(
     source_char_limit = zh_max_chars if source_is_cjk else en_max_chars
     source_joiner = "" if source_is_cjk else " "
     bilingual = bool(en_text and zh_text)
+    word_timestamps = valid_word_timestamps(segment)
     available_chunk_counts: List[int] = []
     if en_text:
         available_chunk_counts.append(
@@ -1556,6 +1727,8 @@ def split_bilingual_segment(
             max(1, len(source_text) if source_is_cjk else len(source_text.split()))
         )
     max_available_chunks = min(available_chunk_counts) if available_chunk_counts else 1
+    if word_timestamps:
+        max_available_chunks = min(max_available_chunks, len(word_timestamps))
     chunk_count = max(
         1,
         math.ceil(duration / max_duration),
@@ -1640,10 +1813,44 @@ def split_bilingual_segment(
         for key, value in segment.items()
         if key not in {"id", "start", "end", "text", "en", "zh", "words", "display_start", "display_end"}
     }
+    if (
+        chunk_count > 1
+        and segment.get("timing_origin")
+        and not word_timestamps
+    ):
+        return [
+            {
+                **metadata,
+                "id": 0,
+                "start": start,
+                "end": end,
+                "text": source_text or en_text or zh_text,
+                "en": en_text,
+                "zh": zh_text,
+                "unanchored_split_avoided": True,
+                "split_timing_basis": "source_cue",
+            }
+        ]
+
+    timing_chunks = (
+        en_chunks
+        if source_is_en
+        else (zh_chunks if source_is_zh else text_chunks)
+    )
+    word_groups = allocate_words_to_chunks(
+        word_timestamps,
+        timing_chunks,
+        compact_text=source_is_cjk,
+    )
     output: List[Segment] = []
     for index in range(chunk_count):
-        piece_start = start + duration * index / chunk_count
-        piece_end = end if index == chunk_count - 1 else start + duration * (index + 1) / chunk_count
+        word_group = word_groups[index] if word_groups else []
+        if word_group:
+            piece_start = float(word_group[0]["start"])
+            piece_end = float(word_group[-1]["end"])
+        else:
+            piece_start = start + duration * index / chunk_count
+            piece_end = end if index == chunk_count - 1 else start + duration * (index + 1) / chunk_count
         piece_en = en_chunks[index]
         piece_zh = zh_chunks[index]
         piece_text = text_chunks[index] or piece_en or piece_zh
@@ -1658,6 +1865,8 @@ def split_bilingual_segment(
                 "text": piece_text,
                 "en": piece_en,
                 "zh": piece_zh,
+                **({"words": word_group} if word_group else {}),
+                "split_timing_basis": "word_timestamps" if word_group else "proportional",
             }
         )
     return output
@@ -2022,6 +2231,7 @@ def prepare_segments_for_output(
     max_chars: int,
     max_duration: float,
     layout_policy: Optional[SubtitleLayoutPolicy] = None,
+    scene_cuts: Optional[List[float]] = None,
 ) -> List[Segment]:
     visible: List[Segment] = []
     deduplicated = suppress_recent_exact_duplicates(segments, max_duration=max_duration)
@@ -2029,6 +2239,7 @@ def prepare_segments_for_output(
         if segment.get("display", True) is False:
             continue
         item = dict(segment)
+        item.setdefault("checkpoint_segment_id", item.get("id"))
         item["start"] = float(item.get("display_start", item["start"]))
         item["end"] = float(item.get("display_end", item["end"]))
         item.pop("display_start", None)
@@ -2046,7 +2257,15 @@ def prepare_segments_for_output(
     sanitized = apply_timing_sanity_rules(split, max_duration=max_duration)
     ordered = sorted(sanitized, key=lambda item: (float(item["start"]), float(item["end"])))
     non_overlapping = resolve_timeline_overlaps(ordered)
-    return optimize_readability_timing(non_overlapping, max_duration=max_duration)
+    readable = optimize_readability_timing(non_overlapping, max_duration=max_duration)
+    scene_aligned = align_subtitles_to_scene_cuts(
+        readable,
+        scene_cuts or [],
+        max_duration_seconds=max_duration,
+        min_duration_seconds=MIN_SUBTITLE_DURATION,
+        min_gap_seconds=MIN_SUBTITLE_GAP,
+    )
+    return resolve_timeline_overlaps(scene_aligned)
 
 
 def apply_timing_sanity_rules(segments: List[Segment], max_duration: float = 6.0) -> List[Segment]:
@@ -2293,16 +2512,18 @@ def format_bilingual_prompt_segment(
     next_start: Optional[float] = None,
     include_readability_limits: bool = False,
 ) -> str:
-    text = str(segment.get("text", ""))
-    en_text = clean_english_track_text(str(segment.get("en") or ("" if contains_cjk(text) else text)))
-    zh_text = to_simplified_text(clean_subtitle_text(str(segment.get("zh") or (text if contains_cjk(text) else ""))))
+    source_text, zh_text = original_en_zh(segment)
+    source_language = normalize_language_tag(
+        str(segment.get("source_language") or "")
+    ) or "unknown"
     suffix = ""
     if include_readability_limits:
         chinese_budget, english_budget = reading_budgets(segment, next_start)
         suffix = f" | LIMITS: ZH_MAX={chinese_budget}, EN_MAX={english_budget}"
     return (
         f"[{index}] {float(segment['start']):.2f}->{float(segment['end']):.2f} "
-        f"EN: {en_text or '-'} | ZH: {zh_text or '-'}{suffix}"
+        f"EN: {source_text or '-'} | ZH: {zh_text or '-'} "
+        f"| SOURCE_LANGUAGE={source_language}{suffix}"
     )
 
 
@@ -2348,8 +2569,12 @@ def extract_terminology_entries(item: Dict[str, Any]) -> List[Dict[str, str]]:
     return entries
 
 
-def terminology_from_segments(segments: List[Segment]) -> Dict[str, Dict[str, str]]:
+def terminology_from_segments(
+    segments: List[Segment],
+    seeded_entries: Any = None,
+) -> Dict[str, Dict[str, str]]:
     glossary: Dict[str, Dict[str, str]] = {}
+    register_terminology(glossary, seeded_entries)
     for segment in segments:
         register_terminology(glossary, segment.get("terminology"))
     return glossary
@@ -2464,6 +2689,185 @@ def write_terminology_artifact(
             "llm_model": llm_model,
             "entries": list(glossary.values()),
         },
+    )
+
+
+def style_guide_fingerprint(
+    segments: List[Segment],
+    llm_model: str,
+) -> str:
+    source = [
+        {
+            "id": segment.get("id"),
+            "text": clean_subtitle_text(str(segment.get("text") or "")),
+            "en": clean_subtitle_text(str(segment.get("en") or "")),
+            "zh": clean_subtitle_text(str(segment.get("zh") or "")),
+            "source_language": str(segment.get("source_language") or ""),
+        }
+        for segment in segments
+    ]
+    serialized = json.dumps(
+        {
+            "policy_version": STYLE_GUIDE_POLICY_VERSION,
+            "llm_model": llm_model,
+            "segments": source,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def style_guide_sample(
+    segments: List[Segment],
+    *,
+    max_items: int = 180,
+    max_chars: int = 24000,
+) -> str:
+    if not segments:
+        return "(no subtitles)"
+    if len(segments) <= max_items:
+        indices = list(range(len(segments)))
+    else:
+        indices = sorted(
+            {
+                round(index * (len(segments) - 1) / (max_items - 1))
+                for index in range(max_items)
+            }
+        )
+    rows: List[str] = []
+    used = 0
+    for index in indices:
+        segment = segments[index]
+        source = clean_subtitle_text(
+            str(segment.get("en") or segment.get("text") or "")
+        )
+        chinese = clean_subtitle_text(str(segment.get("zh") or ""))
+        row = f"[{index}] SOURCE: {source or '-'} | ZH: {chinese or '-'}"
+        if rows and used + len(row) + 1 > max_chars:
+            break
+        rows.append(row)
+        used += len(row) + 1
+    return "\n".join(rows)
+
+
+def normalize_style_guide(
+    raw: Dict[str, Any],
+    *,
+    llm_model: str,
+    input_fingerprint: str,
+) -> Dict[str, Any]:
+    def text_field(name: str, fallback: str) -> str:
+        value = normalize_space(str(raw.get(name) or fallback))
+        return value[:600]
+
+    terminology = extract_terminology_entries(
+        {"terminology": raw.get("terminology")}
+    )
+    return {
+        "version": STYLE_GUIDE_POLICY_VERSION,
+        "status": "ready",
+        "llm_model": llm_model,
+        "input_fingerprint": input_fingerprint,
+        "register": text_field(
+            "register",
+            "Natural, concise spoken Simplified Chinese suitable for film subtitles.",
+        ),
+        "name_policy": text_field(
+            "name_policy",
+            "Use one movie-wide rendering for every recurring personal name.",
+        ),
+        "address_policy": text_field(
+            "address_policy",
+            "Translate forms of address consistently according to relationships.",
+        ),
+        "sdh_policy": text_field(
+            "sdh_policy",
+            "When Chinese lacks an English-only SDH cue, add a concise Chinese translation.",
+        ),
+        "punctuation_policy": text_field(
+            "punctuation_policy",
+            "Use concise Chinese subtitle punctuation and avoid unnecessary sentence-final marks.",
+        ),
+        "terminology": terminology,
+    }
+
+
+def analyze_movie_style(
+    segments: List[Segment],
+    llm_model: str,
+    artifact_path: Path,
+) -> Dict[str, Any]:
+    input_fingerprint = style_guide_fingerprint(segments, llm_model)
+    if artifact_path.exists():
+        try:
+            cached = json.loads(artifact_path.read_text(encoding="utf-8"))
+            if (
+                isinstance(cached, dict)
+                and cached.get("version") == STYLE_GUIDE_POLICY_VERSION
+                and cached.get("status") == "ready"
+                and cached.get("llm_model") == llm_model
+                and cached.get("input_fingerprint") == input_fingerprint
+            ):
+                print(f"Using cached movie-wide style guide: {artifact_path}")
+                return cached
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+
+    prompt = f"""
+Analyze this representative, movie-wide subtitle sample before line-by-line work.
+
+Return one JSON object that defines a concise professional style guide for the entire movie.
+Identify recurring personal names and important recurring terms only when the sample supports them.
+
+=== MOVIE-WIDE SAMPLE ===
+{style_guide_sample(segments)}
+
+Required decisions:
+- register: conversational/formal/technical tone and how concise the Chinese should be.
+- name_policy: one consistent treatment for names; never alternate translated and untranslated forms.
+- address_policy: consistent Chinese forms of address and relationship-sensitive pronouns.
+- sdh_policy: English-only SDH, music, laughter, speaker labels, and sound descriptions must be translated into concise Chinese only when Chinese lacks that information.
+- punctuation_policy: punctuation suitable for professional on-screen Simplified Chinese.
+- terminology: only recurring names or terms with a stable source-to-Chinese mapping.
+
+Do not edit individual subtitle lines. Do not add markdown or explanations.
+"""
+    raw = parse_json_response(
+        call_llm(
+            prompt,
+            (
+                "You are the lead subtitle editor establishing a movie-wide style bible "
+                "before independent translators begin."
+            ),
+            llm_model,
+            role="proofread",
+            response_schema=movie_style_schema(),
+        )
+    )
+    if not isinstance(raw, dict):
+        raise ValueError("Movie-wide style analysis did not return a JSON object")
+    style_guide = normalize_style_guide(
+        raw,
+        llm_model=llm_model,
+        input_fingerprint=input_fingerprint,
+    )
+    write_json_atomic(artifact_path, style_guide)
+    return style_guide
+
+
+def format_style_guide(style_guide: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(style_guide, dict) or style_guide.get("status") != "ready":
+        return "(default professional subtitle style)"
+    return "\n".join(
+        [
+            f"- Register: {style_guide.get('register') or '-'}",
+            f"- Names: {style_guide.get('name_policy') or '-'}",
+            f"- Address: {style_guide.get('address_policy') or '-'}",
+            f"- SDH: {style_guide.get('sdh_policy') or '-'}",
+            f"- Punctuation: {style_guide.get('punctuation_policy') or '-'}",
+        ]
     )
 
 
@@ -2588,9 +2992,9 @@ def retry_single_segment_llm(
         prompt = f"""
 You will proofread only the TARGET LINE(S).
 
-These subtitles may already contain Chinese. Proofread existing English and Chinese text.
-English may also be OCR output and may contain recognition errors.
-Do not retranslate a non-empty Chinese line. Translate from English only when the Chinese line is empty or misses information that exists only in English.
+These subtitles may already contain Chinese. Proofread the existing source-language and Chinese tracks.
+The source track may also be OCR output and may contain recognition errors.
+Do not retranslate a non-empty Chinese line. Translate source-track information only when the Chinese line is empty or incomplete.
 
 === PREVIOUS CONTEXT, REFERENCE ONLY ===
 {before_text}
@@ -2620,21 +3024,20 @@ Schema:
 Rules:
 - One input line must still produce one output object for checkpointing.
 {display_requirement}
-- Correct obvious English and Chinese OCR/subtitle recognition errors.
+- Correct obvious source-language and Chinese OCR/subtitle recognition errors.
 - Convert Traditional Chinese to natural Simplified Chinese.
 - If corrected_chinese is already non-empty and complete, preserve its meaning and only proofread it. Do not replace it with a fresh translation.
-- Translate from English into corrected_chinese only when the original Chinese is empty or clearly lacks information present in the English line.
-- Keep corrected_english in natural English when an English source exists.
-- IMPORTANT: The `corrected_english` field MUST be purely English. If the input `English:` field contains Chinese characters, you MUST translate them into English, or leave the field empty. Do not put Chinese characters in `corrected_english`.
-- If English contains SDH/non-speech cues such as music, applause, laughter, or speaker labels and the Chinese line lacks that information, add only that missing cue in concise Simplified Chinese.
+- Translate source-track information into corrected_chinese only when the original Chinese is empty or clearly incomplete.
+- `corrected_english` is a legacy field name for the source track. Keep it in SOURCE_LANGUAGE and never translate it into English.
+- If the source contains SDH/non-speech cues such as music, applause, laughter, or speaker labels and the Chinese line lacks that information, add only that missing cue in concise Simplified Chinese.
 - You MUST translate uppercase descriptive text in parentheses or brackets (e.g. "(SIGHS)" or "[MUSIC]") into Simplified Chinese.
 - LIMITS are maximum visible character budgets calculated from the available display time. If Chinese exceeds ZH_MAX, condense it without losing the intended meaning. Otherwise preserve the existing Chinese meaning and wording as much as possible.
-- Keep each Chinese line within 16 characters and each English line within 42 characters where the text permits.
+- Keep each Chinese line within 16 characters and each source line within 42 characters where the text permits.
 - Keep names and recurring terminology consistent across the context. Do not translate a name in one line and leave the same name untranslated in another unless the context clearly requires it.
 - Reuse every applicable APPROVED MOVIE-WIDE TERMINOLOGY mapping exactly.
 - In terminology, return only personal names or recurring terms that occur in this target line. Use an empty list when there are none.
 - Never output or change timestamps. Timing is enforced by the subtitle pipeline.
-- Keep corrected_english empty only when no English source exists or when the original English text contains no useful translatable English.
+- Keep corrected_english empty only when no source track exists.
 - Do not output previous or following context lines.
 - Do not add explanations, markdown, notes, or extra keys.
 """
@@ -2722,9 +3125,19 @@ Rules:
                     return item
                 if is_proofread:
                     orig_en, orig_zh = original_en_zh(segment)
-                    corrected = clean_english_track_text(str(item.get("corrected_english") or orig_en))
+                    corrected = (
+                        clean_subtitle_text(
+                            str(item.get("corrected_english") or orig_en)
+                        )
+                        if orig_en
+                        else ""
+                    )
                     translated = str(item.get("corrected_chinese") or item.get("chinese_translation") or "")
-                    if is_language_valid(
+                    if source_language_preserved(
+                        segment,
+                        orig_en,
+                        corrected,
+                    ) and is_language_valid(
                         orig_en or orig_zh,
                         corrected,
                         translated,
@@ -2734,7 +3147,15 @@ Rules:
                 else:
                     corrected = str(item.get("corrected_text") or item.get("corrected_source") or segment.get("text", ""))
                     translated = str(item.get("chinese_translation") or "")
-                    if is_language_valid(segment.get("text", ""), corrected, translated):
+                    if source_language_preserved(
+                        segment,
+                        str(segment.get("text") or ""),
+                        corrected,
+                    ) and is_language_valid(
+                        str(segment.get("text") or ""),
+                        corrected,
+                        translated,
+                    ):
                         return item
             print(
                 f"Single-item retry {attempt + 1} still failed language "
@@ -2758,12 +3179,15 @@ def translate_and_correct_segments(
     source_language: str,
     checkpoint_path: Optional[Path] = None,
     terminology_path: Optional[Path] = None,
+    style_guide: Optional[Dict[str, Any]] = None,
 ) -> List[Segment]:
     print("Starting sentence-level LLM correction and translation...")
     language_label = "the source language" if not source_language or source_language == "auto" else source_language
+    style_text = format_style_guide(style_guide)
     system_prompt = (
         "You are a professional subtitle editor and Chinese translator. "
-        "Repair ASR/OCR errors, repeated hallucinated fragments, and duplicate subtitle loops while preserving source timing anchors."
+        "Repair ASR/OCR errors, repeated hallucinated fragments, and duplicate subtitle loops while preserving source timing anchors. "
+        f"Follow this movie-wide style guide exactly:\n{style_text}"
     )
 
     processed_segments: List[Segment] = []
@@ -2808,7 +3232,10 @@ def translate_and_correct_segments(
     if start_index < len(segments):
         start_index -= start_index % batch_size
         processed_segments = processed_segments[:start_index]
-    glossary = terminology_from_segments(processed_segments)
+    glossary = terminology_from_segments(
+        processed_segments,
+        (style_guide or {}).get("terminology"),
+    )
     write_terminology_artifact(terminology_path, glossary, llm_model)
 
     for i in range(start_index, len(segments), batch_size):
@@ -2849,6 +3276,9 @@ The source subtitle/audio language is: {language_label}.
 
 === PREVIOUS APPROVED OUTPUT, MATCH NAMES AND TERMINOLOGY ===
 {approved_output_context}
+
+=== MOVIE-WIDE STYLE GUIDE, FOLLOW THROUGHOUT ===
+{style_text}
 
 === APPROVED MOVIE-WIDE TERMINOLOGY, USE EXACTLY ===
 {terminology_text}
@@ -2973,7 +3403,12 @@ Rules:
                 )
 
                 if display and (
-                    not is_language_valid(segment["text"], corrected, translated)
+                    not source_language_preserved(
+                        segment,
+                        str(segment.get("text") or ""),
+                        corrected,
+                    )
+                    or not is_language_valid(segment["text"], corrected, translated)
                     or conflicts
                 ):
                     forced_model_hide = (
@@ -3043,7 +3478,12 @@ Rules:
                         proposed_terminology,
                     )
                     if display and (
-                        not is_language_valid(segment["text"], corrected, translated)
+                        not source_language_preserved(
+                            segment,
+                            str(segment.get("text") or ""),
+                            corrected,
+                        )
+                        or not is_language_valid(segment["text"], corrected, translated)
                         or conflicts
                     ):
                         raise RuntimeError(f"LLM returned an invalid translation for segment {i + j}")
@@ -3102,12 +3542,15 @@ def proofread_existing_chinese_segments(
     context_lines: int,
     checkpoint_path: Optional[Path] = None,
     terminology_path: Optional[Path] = None,
+    style_guide: Optional[Dict[str, Any]] = None,
 ) -> List[Segment]:
     print("Starting LLM proofreading for existing Chinese subtitles; translation is skipped.")
+    style_text = format_style_guide(style_guide)
     system_prompt = (
         "You are a professional bilingual subtitle proofreader. "
         "Fix English and Chinese OCR/subtitle recognition errors, repeated lines, and duplicate loops. "
-        "Do not translate when Chinese subtitles are already provided."
+        "Do not translate when Chinese subtitles are already provided. "
+        f"Follow this movie-wide style guide exactly:\n{style_text}"
     )
 
     processed_segments: List[Segment] = []
@@ -3152,7 +3595,10 @@ def proofread_existing_chinese_segments(
     if start_index < len(segments):
         start_index -= start_index % batch_size
         processed_segments = processed_segments[:start_index]
-    glossary = terminology_from_segments(processed_segments)
+    glossary = terminology_from_segments(
+        processed_segments,
+        (style_guide or {}).get("terminology"),
+    )
     write_terminology_artifact(terminology_path, glossary, llm_model)
 
     for i in range(start_index, len(segments), batch_size):
@@ -3187,15 +3633,18 @@ def proofread_existing_chinese_segments(
         prompt = f"""
 You will proofread only the TARGET LINE(S).
 
-These subtitles may already contain Chinese. Proofread existing English and Chinese text.
-English may also be OCR output and may contain recognition errors.
-Do not retranslate a non-empty Chinese line. Translate from English only when the Chinese line is empty or misses information that exists only in English.
+These subtitles may already contain Chinese. Proofread the existing source-language and Chinese tracks.
+The source track may also be OCR output and may contain recognition errors.
+Do not retranslate a non-empty Chinese line. Translate source-track information only when the Chinese line is empty or incomplete.
 
 === PREVIOUS CONTEXT, REFERENCE ONLY ===
 {before_text}
 
 === PREVIOUS APPROVED OUTPUT, MATCH NAMES AND TERMINOLOGY ===
 {approved_output_context}
+
+=== MOVIE-WIDE STYLE GUIDE, FOLLOW THROUGHOUT ===
+{style_text}
 
 === APPROVED MOVIE-WIDE TERMINOLOGY, USE EXACTLY ===
 {terminology_text}
@@ -3221,22 +3670,21 @@ Schema:
 
 Rules:
 - One input line must still produce one output object for checkpointing.
-- Correct obvious English and Chinese OCR/subtitle recognition errors.
+- Correct obvious source-language and Chinese OCR/subtitle recognition errors.
 - Convert Traditional Chinese to natural Simplified Chinese.
 - If corrected_chinese is already non-empty and complete, preserve its meaning and only proofread it. Do not replace it with a fresh translation.
-- Translate from English into corrected_chinese only when the original Chinese is empty or clearly lacks information present in the English line.
-- Keep corrected_english in natural English when an English source exists.
-- IMPORTANT: The `corrected_english` field MUST be purely English. If the input `English:` field contains Chinese characters, you MUST translate them into English, or leave the field empty. Do not put Chinese characters in `corrected_english`.
-- If English contains SDH/non-speech cues such as music, applause, laughter, or speaker labels and the Chinese line lacks that information, add only that missing cue in concise Simplified Chinese.
+- Translate source-track information into corrected_chinese only when the original Chinese is empty or clearly incomplete.
+- `corrected_english` is a legacy field name for the source track. Keep it in SOURCE_LANGUAGE and never translate it into English.
+- If the source contains SDH/non-speech cues such as music, applause, laughter, or speaker labels and the Chinese line lacks that information, add only that missing cue in concise Simplified Chinese.
 - You MUST translate uppercase descriptive text in parentheses or brackets (e.g. "(SIGHS)" or "[MUSIC]") into Simplified Chinese.
 - LIMITS are maximum visible character budgets calculated from the available display time. If Chinese exceeds ZH_MAX, condense it without losing the intended meaning. Otherwise preserve the existing Chinese meaning and wording as much as possible.
-- Keep each Chinese line within 16 characters and each English line within 42 characters where the text permits.
+- Keep each Chinese line within 16 characters and each source line within 42 characters where the text permits.
 - Keep names and recurring terminology consistent across the context. Do not translate a name in one line and leave the same name untranslated in another unless the context clearly requires it.
 - Reuse every applicable APPROVED MOVIE-WIDE TERMINOLOGY mapping exactly.
 - In terminology, return only personal names or recurring terms that occur in that target line. Once a mapping is approved, never propose a different target. Use an empty list when there are none.
 - If adjacent TARGET lines are repeated, overlapping, or fragments of the same subtitle, keep the earliest suitable object visible and set only later redundant objects to "display": false.
 - Never output or change timestamps. Timing is enforced by the subtitle pipeline.
-- Keep corrected_english empty only when no English source exists or when the original English text contains no useful translatable English.
+- Keep corrected_english empty only when no source track exists.
 - Do not output previous or following context lines.
 - Do not add explanations, markdown, notes, or extra keys.
 """
@@ -3281,7 +3729,11 @@ Rules:
                 item = lookup[j]
                 original_en, original_zh = original_en_zh(segment)
                 corrected_en_val = str(item.get("corrected_english") or item.get("en") or original_en)
-                corrected_en = clean_english_track_text(corrected_en_val)
+                corrected_en = (
+                    clean_subtitle_text(corrected_en_val)
+                    if original_en
+                    else ""
+                )
                 corrected_zh_val = str(
                     item.get("corrected_chinese")
                     or item.get("chinese")
@@ -3324,7 +3776,12 @@ Rules:
                 )
 
                 if display and (
-                    not is_language_valid(
+                    not source_language_preserved(
+                        segment,
+                        original_en,
+                        corrected_en,
+                    )
+                    or not is_language_valid(
                         original_en or original_zh,
                         corrected_en,
                         corrected_zh,
@@ -3360,7 +3817,11 @@ Rules:
                         raise RuntimeError(f"LLM could not produce a valid proofread result for segment {i + j}")
                     item.update(retry_item)
                     corrected_en_val = str(item.get("corrected_english") or item.get("en") or original_en)
-                    corrected_en = clean_english_track_text(corrected_en_val)
+                    corrected_en = (
+                        clean_subtitle_text(corrected_en_val)
+                        if original_en
+                        else ""
+                    )
                     corrected_zh_val = str(
                         item.get("corrected_chinese")
                         or item.get("chinese")
@@ -3403,7 +3864,12 @@ Rules:
                         proposed_terminology,
                     )
                     if display and (
-                        not is_language_valid(
+                        not source_language_preserved(
+                            segment,
+                            original_en,
+                            corrected_en,
+                        )
+                        or not is_language_valid(
                             original_en or original_zh,
                             corrected_en,
                             corrected_zh,
@@ -3437,6 +3903,306 @@ Rules:
     return processed_segments
 
 
+def final_qa_fingerprint(
+    segments: List[Segment],
+    llm_model: str,
+    style_guide: Optional[Dict[str, Any]],
+) -> str:
+    rows = [
+        {
+            "id": segment.get("id"),
+            "start": segment.get("start"),
+            "end": segment.get("end"),
+            "en": segment.get("en"),
+            "zh": segment.get("zh"),
+            "display": segment.get("display", True),
+            "source_language": segment.get("source_language"),
+            "manual_reviewed_at": segment.get("manual_reviewed_at"),
+        }
+        for segment in segments
+    ]
+    serialized = json.dumps(
+        {
+            "policy_version": FINAL_QA_POLICY_VERSION,
+            "llm_model": llm_model,
+            "style_fingerprint": (style_guide or {}).get("input_fingerprint"),
+            "segments": rows,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def run_final_subtitle_qa(
+    segments: List[Segment],
+    llm_model: str,
+    artifact_path: Path,
+    *,
+    style_guide: Optional[Dict[str, Any]] = None,
+    batch_size: int = 16,
+) -> Tuple[List[Segment], Dict[str, Any]]:
+    input_fingerprint = final_qa_fingerprint(segments, llm_model, style_guide)
+    cached: Optional[Dict[str, Any]] = None
+    if artifact_path.exists():
+        try:
+            raw = json.loads(artifact_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict) and raw.get("version") == FINAL_QA_POLICY_VERSION:
+                cached = raw
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+    if (
+        cached
+        and cached.get("status") in {"pass", "review"}
+        and cached.get("llm_model") == llm_model
+        and cached.get("output_fingerprint") == input_fingerprint
+    ):
+        print(f"Final subtitle QA already matches the checkpoint: {artifact_path}")
+        return [dict(segment) for segment in segments], cached
+    if (
+        cached
+        and cached.get("status") in {"pass", "review"}
+        and cached.get("llm_model") == llm_model
+        and cached.get("input_fingerprint") == input_fingerprint
+        and isinstance(cached.get("segments"), list)
+        and len(cached["segments"]) == len(segments)
+    ):
+        print(f"Using cached independent final subtitle QA: {artifact_path}")
+        return [dict(segment) for segment in cached["segments"]], cached
+
+    reviewed: List[Segment] = []
+    changes: List[Dict[str, Any]] = []
+    rejected_items: List[Dict[str, Any]] = []
+    if (
+        cached
+        and cached.get("status") == "running"
+        and cached.get("llm_model") == llm_model
+        and cached.get("input_fingerprint") == input_fingerprint
+        and isinstance(cached.get("segments"), list)
+    ):
+        reviewed = [dict(segment) for segment in cached["segments"]]
+        changes = [
+            dict(item)
+            for item in cached.get("changes") or []
+            if isinstance(item, dict)
+        ]
+        rejected_items = [
+            dict(item)
+            for item in cached.get("rejected_items") or []
+            if isinstance(item, dict)
+        ]
+        if len(reviewed) > len(segments):
+            reviewed = []
+            changes = []
+            rejected_items = []
+        elif reviewed:
+            print(f"Resuming independent final QA at item {len(reviewed) + 1}.")
+
+    style_text = format_style_guide(style_guide)
+    glossary = terminology_from_segments(
+        reviewed or segments,
+        (style_guide or {}).get("terminology"),
+    )
+    start_index = len(reviewed)
+    start_index -= start_index % max(1, batch_size)
+    reviewed = reviewed[:start_index]
+
+    for batch_start in range(start_index, len(segments), max(1, batch_size)):
+        batch = segments[batch_start : batch_start + max(1, batch_size)]
+        before = build_approved_output_context(
+            segments[max(0, batch_start - 8) : batch_start],
+            8,
+        )
+        after = "\n".join(
+            format_bilingual_prompt_segment(index, segment)
+            for index, segment in enumerate(
+                segments[
+                    batch_start + len(batch) : batch_start + len(batch) + 8
+                ]
+            )
+        ) or "(none)"
+        batch_text = "\n".join(
+            format_bilingual_prompt_segment(index, segment)
+            for index, segment in enumerate(batch)
+        )
+        prompt = f"""
+Perform an independent final quality review of only the TARGET LINE(S).
+Another editor already translated and proofread them. Do not trust earlier wording blindly.
+
+=== MOVIE-WIDE STYLE GUIDE ===
+{style_text}
+
+=== APPROVED TERMINOLOGY ===
+{format_terminology_glossary(glossary, batch_text)}
+
+=== PREVIOUS CONTEXT, REFERENCE ONLY ===
+{before}
+
+=== TARGET LINE(S) ===
+{batch_text}
+
+=== FOLLOWING CONTEXT, REFERENCE ONLY ===
+{after}
+
+Return exactly {len(batch)} JSON objects using the provided schema.
+Rules:
+- Preserve every local index, timestamp, and display decision.
+- Correct residual ASR/OCR errors, grammar, mistranslation, inconsistent names, forms of address, and terminology.
+- `corrected_english` is a legacy schema field name for the SOURCE track. The source may be English, Japanese, Korean, or another language.
+- Keep `corrected_english` in the same language and script as SOURCE_LANGUAGE. Never translate the source track into English.
+- Keep a non-empty Chinese subtitle's meaning; translate only source-track information missing from Chinese.
+- Translate source-only SDH/music/sound/speaker cues into concise Simplified Chinese when Chinese lacks them.
+- Apply one rendering for every recurring personal name throughout the movie.
+- Keep source/English within 42 characters and Chinese within 16 characters where meaning permits.
+- Never add commentary or keys outside the schema.
+"""
+        data = parse_json_response(
+            call_llm(
+                prompt,
+                (
+                    "You are the independent senior subtitle QC editor. "
+                    "Review the completed bilingual deliverable against the movie-wide style guide."
+                ),
+                llm_model,
+                role="proofread",
+                response_schema=indexed_subtitle_schema(len(batch), "proofread"),
+            )
+        )
+        lookup = validate_indexed_batch_response(data, len(batch), "proofread")
+        batch_reviewed: List[Segment] = []
+        for local_index, segment in enumerate(batch):
+            item = lookup[local_index]
+            if segment.get("manual_reviewed_at"):
+                batch_reviewed.append(
+                    {
+                        **segment,
+                        "final_qa_policy_version": FINAL_QA_POLICY_VERSION,
+                        "final_qa_model": llm_model,
+                        "final_qa_manual_preserved": True,
+                    }
+                )
+                continue
+            original_source, original_zh = original_en_zh(segment)
+            corrected_source = clean_subtitle_text(
+                str(item.get("corrected_english") or original_source)
+            )
+            corrected_zh = to_simplified_text(
+                clean_subtitle_text(
+                    str(item.get("corrected_chinese") or original_zh)
+                )
+            )
+            proposed_terminology = applicable_terminology_entries(
+                extract_terminology_entries(item),
+                corrected_source or original_source,
+            )
+            conflicts = terminology_conflicts(
+                glossary,
+                corrected_source or original_source,
+                corrected_zh,
+                proposed_terminology,
+            )
+            language_preserved = source_language_preserved(
+                segment,
+                original_source,
+                corrected_source,
+            )
+            valid = language_preserved and is_language_valid(
+                original_source or original_zh,
+                corrected_source,
+                corrected_zh,
+                require_corrected=bool(original_source),
+            ) and not conflicts
+            if not valid:
+                batch_reviewed.append(dict(segment))
+                rejected_items.append(
+                    {
+                        "id": segment.get("id"),
+                        "start": segment.get("start"),
+                        "reason": (
+                            "source_language_changed"
+                            if not language_preserved
+                            else "invalid_language_or_terminology"
+                        ),
+                    }
+                )
+                continue
+
+            output = {
+                **segment,
+                "en": corrected_source,
+                "zh": corrected_zh,
+                "final_qa_policy_version": FINAL_QA_POLICY_VERSION,
+                "final_qa_model": llm_model,
+            }
+            changed_fields = [
+                field
+                for field, before_value, after_value in (
+                    ("en", original_source, corrected_source),
+                    ("zh", original_zh, corrected_zh),
+                )
+                if normalize_space(str(before_value or ""))
+                != normalize_space(str(after_value or ""))
+            ]
+            if changed_fields:
+                output["final_qa_changed"] = True
+                changes.append(
+                    {
+                        "id": segment.get("id"),
+                        "start": segment.get("start"),
+                        "fields": changed_fields,
+                    }
+                )
+            register_terminology(glossary, proposed_terminology)
+            batch_reviewed.append(output)
+
+        validate_timing_preserved(batch, batch_reviewed, batch_start)
+        reviewed.extend(batch_reviewed)
+        write_json_atomic(
+            artifact_path,
+            {
+                "version": FINAL_QA_POLICY_VERSION,
+                "status": "running",
+                "llm_model": llm_model,
+                "input_fingerprint": input_fingerprint,
+                "reviewed_count": len(reviewed),
+                "manual_preserved_count": sum(
+                    bool(item.get("final_qa_manual_preserved"))
+                    for item in reviewed
+                ),
+                "changed_count": len(changes),
+                "rejected_count": len(rejected_items),
+                "changes": changes,
+                "rejected_items": rejected_items,
+                "segments": reviewed,
+            },
+        )
+
+    report = {
+        "version": FINAL_QA_POLICY_VERSION,
+        "status": "review" if rejected_items else "pass",
+        "llm_model": llm_model,
+        "input_fingerprint": input_fingerprint,
+        "output_fingerprint": final_qa_fingerprint(
+            reviewed,
+            llm_model,
+            style_guide,
+        ),
+        "reviewed_count": len(reviewed),
+        "manual_preserved_count": sum(
+            bool(item.get("final_qa_manual_preserved"))
+            for item in reviewed
+        ),
+        "changed_count": len(changes),
+        "rejected_count": len(rejected_items),
+        "changes": changes,
+        "rejected_items": rejected_items,
+        "segments": reviewed,
+    }
+    write_json_atomic(artifact_path, report)
+    return reviewed, report
+
+
 def checkpoint_matches_segments(
     cached: List[Segment],
     segments: List[Segment],
@@ -3446,6 +4212,9 @@ def checkpoint_matches_segments(
     expected_terminology_policy_version: Optional[int] = None,
 ) -> bool:
     for index, cached_segment in enumerate(cached):
+        if index >= len(segments):
+            print("Ignoring checkpoint because it contains more items than the source.")
+            return False
         current = segments[index]
         if "display" not in cached_segment:
             print("Ignoring checkpoint because it lacks duplicate-cleanup display metadata.")
@@ -3492,9 +4261,32 @@ def checkpoint_matches_segments(
                 f"the current source at item {index}."
             )
             return False
-        same_start = abs(float(cached_segment["start"]) - float(current["start"])) <= 0.02
-        same_end = abs(float(cached_segment["end"]) - float(current["end"])) <= 0.02
-        same_text = clean_subtitle_text(str(cached_segment.get("text", ""))) == clean_subtitle_text(str(current.get("text", "")))
+        manually_reviewed = bool(cached_segment.get("manual_reviewed_at"))
+        has_manual_anchors = (
+            cached_segment.get("manual_source_start") is not None
+            and cached_segment.get("manual_source_end") is not None
+        )
+        cached_start = cached_segment.get(
+            "manual_source_start",
+            cached_segment["start"],
+        )
+        cached_end = cached_segment.get(
+            "manual_source_end",
+            cached_segment["end"],
+        )
+        same_start = (
+            manually_reviewed and not has_manual_anchors
+        ) or abs(float(cached_start) - float(current["start"])) <= 0.02
+        same_end = (
+            manually_reviewed and not has_manual_anchors
+        ) or abs(float(cached_end) - float(current["end"])) <= 0.02
+        cached_text = cached_segment.get(
+            "manual_source_text",
+            cached_segment.get("text", ""),
+        )
+        same_text = clean_subtitle_text(str(cached_text)) == clean_subtitle_text(
+            str(current.get("text", ""))
+        )
         if not (same_start and same_end and same_text):
             print(
                 "Checkpoint mismatch at item "
@@ -3737,6 +4529,8 @@ def main() -> None:
     source_segments_path = out_dir / f"{movie_name}.segments.source.json"
     sync_report_path = out_dir / f"{movie_name}.subtitle-sync.report.json"
     terminology_path = out_dir / f"{movie_name}.terminology.json"
+    style_guide_path = out_dir / f"{movie_name}.style-guide.json"
+    final_qa_path = out_dir / f"{movie_name}.final-qa.json"
     run_state_file = Path(args.run_state_file) if args.run_state_file else None
 
     sidecar_path = Path(args.subtitle_file or args.srt) if (args.subtitle_file or args.srt) else None
@@ -3793,6 +4587,7 @@ def main() -> None:
         asr_language = resolve_asr_language(args.asr_language, args.source_language)
         subtitle_segments: Optional[List[Segment]] = None
         existing_tracks: Optional[ExistingSubtitleTracks] = None
+        sync_report: Optional[Dict[str, Any]] = None
         loaded_legacy_source_cache = False
         reused_source_cache = False
         if source_segments_path.exists():
@@ -3833,6 +4628,15 @@ def main() -> None:
                     actual_source = "cached source segments"
                     reused_source_cache = True
                     source_language = infer_source_language_from_segments(subtitle_segments, source_language)
+                    if sync_report_path.exists():
+                        try:
+                            cached_sync_report = json.loads(
+                                sync_report_path.read_text(encoding="utf-8")
+                            )
+                            if isinstance(cached_sync_report, dict):
+                                sync_report = cached_sync_report
+                        except (OSError, ValueError, json.JSONDecodeError) as exc:
+                            print(f"Ignoring unreadable subtitle sync report {sync_report_path}: {exc}")
                     print(f"Reusing cached source segments from {source_segments_path} ({len(subtitle_segments)} events).")
                 else:
                     print(
@@ -3988,6 +4792,37 @@ def main() -> None:
         print(f"Actual subtitle source: {actual_source}")
         print_timing_report(subtitle_segments)
 
+        if len(subtitle_segments) >= 12:
+            try:
+                style_guide = analyze_movie_style(
+                    subtitle_segments,
+                    args.llm_model,
+                    style_guide_path,
+                )
+                print(
+                    "Movie-wide style guide: "
+                    f"status={style_guide.get('status')}, path={style_guide_path}"
+                )
+            except Exception as exc:
+                style_guide = {
+                    "version": STYLE_GUIDE_POLICY_VERSION,
+                    "status": "unavailable",
+                    "llm_model": args.llm_model,
+                    "error": str(exc),
+                    "terminology": [],
+                }
+                write_json_atomic(style_guide_path, style_guide)
+                print(f"Movie-wide style analysis unavailable; using defaults: {exc}")
+        else:
+            style_guide = {
+                "version": STYLE_GUIDE_POLICY_VERSION,
+                "status": "skipped_short",
+                "llm_model": args.llm_model,
+                "reason": "Fewer than 12 subtitle events.",
+                "terminology": [],
+            }
+            write_json_atomic(style_guide_path, style_guide)
+
         if segments_have_chinese(subtitle_segments):
             processed_segments = proofread_existing_chinese_segments(
                 subtitle_segments,
@@ -3996,6 +4831,7 @@ def main() -> None:
                 context_lines=args.context_lines,
                 checkpoint_path=checkpoint_path,
                 terminology_path=terminology_path,
+                style_guide=style_guide,
             )
         else:
             processed_segments = translate_and_correct_segments(
@@ -4006,7 +4842,42 @@ def main() -> None:
                 source_language=source_language,
                 checkpoint_path=checkpoint_path,
                 terminology_path=terminology_path,
+                style_guide=style_guide,
             )
+
+        if len(processed_segments) >= 12:
+            try:
+                processed_segments, final_qa_report = run_final_subtitle_qa(
+                    processed_segments,
+                    args.llm_model,
+                    final_qa_path,
+                    style_guide=style_guide,
+                    batch_size=max(8, args.batch_size * 2),
+                )
+                write_json_atomic(checkpoint_path, processed_segments)
+                print(
+                    "Independent final QA: "
+                    f"status={final_qa_report.get('status')}, "
+                    f"changed={final_qa_report.get('changed_count', 0)}, "
+                    f"rejected={final_qa_report.get('rejected_count', 0)}"
+                )
+            except Exception as exc:
+                final_qa_report = {
+                    "version": FINAL_QA_POLICY_VERSION,
+                    "status": "failed",
+                    "llm_model": args.llm_model,
+                    "error": str(exc),
+                }
+                write_json_atomic(final_qa_path, final_qa_report)
+                print(f"Independent final QA failed; preserving first-pass subtitles: {exc}")
+        else:
+            final_qa_report = {
+                "version": FINAL_QA_POLICY_VERSION,
+                "status": "skipped_short",
+                "llm_model": args.llm_model,
+                "reason": "Fewer than 12 processed subtitle events.",
+            }
+            write_json_atomic(final_qa_path, final_qa_report)
 
         subtitle_font_file = (
             validate_font_path(Path(args.subtitle_font_file))
@@ -4036,17 +4907,27 @@ def main() -> None:
             font_scale=args.subtitle_font_scale,
             font_path=subtitle_font_file,
         )
+        scene_cut_cache_path = out_dir / f"{movie_name}.scene-cuts.json"
+        scene_cuts = detect_scene_cuts(
+            video_path,
+            scene_cut_cache_path,
+        )
+        if scene_cuts:
+            print(f"Scene-aware timing: loaded {len(scene_cuts)} cached or detected cuts.")
         output_segments = prepare_segments_for_output(
             processed_segments,
             max_words=args.max_words,
             max_chars=args.max_chars,
             max_duration=args.max_duration,
             layout_policy=layout_policy,
+            scene_cuts=scene_cuts,
         )
         en_ass = out_dir / f"{movie_name}.en.ass"
         zh_ass = out_dir / f"{movie_name}.zh.ass"
         bi_ass = out_dir / f"{movie_name}.bilingual.ass"
         quality_report_path = out_dir / f"{movie_name}.quality-report.json"
+        render_validation_path = out_dir / f"{movie_name}.render-validation.json"
+        render_preview_path = out_dir / f"{movie_name}.render-preview.png"
 
         print("Generating bilingual subtitles...", flush=True)
         ass_options = {
@@ -4058,12 +4939,44 @@ def main() -> None:
         generate_ass(output_segments, en_ass, "en", **ass_options)
         generate_ass(output_segments, zh_ass, "zh", **ass_options)
         generate_ass(output_segments, bi_ass, "bilingual", **ass_options)
+        srt_artifacts = write_delivery_srts(
+            output_segments,
+            out_dir,
+            movie_name,
+        )
+        render_validation = validate_ass_rendering(
+            bi_ass,
+            output_segments,
+            render_preview_path,
+            play_resolution=play_resolution,
+            font_directory=(
+                subtitle_font_file.parent
+                if subtitle_font_file is not None
+                else None
+            ),
+        )
+        write_json_atomic(render_validation_path, render_validation)
+        print(
+            "ASS render validation: "
+            f"status={render_validation.get('status')}, "
+            f"preview={render_validation.get('preview_path', '-')}"
+        )
         artifact_paths = {
             "english_ass": str(en_ass),
             "chinese_ass": str(zh_ass),
             "bilingual_ass": str(bi_ass),
             "quality_report": str(quality_report_path),
+            "style_guide": str(style_guide_path),
+            "final_qa": str(final_qa_path),
+            "render_validation": str(render_validation_path),
+            **srt_artifacts,
         }
+        if render_preview_path.exists():
+            artifact_paths["render_preview"] = str(render_preview_path)
+        if sync_report_path.exists():
+            artifact_paths["subtitle_sync_report"] = str(sync_report_path)
+        if scene_cut_cache_path.exists():
+            artifact_paths["scene_cut_cache"] = str(scene_cut_cache_path)
         if subtitle_font_file is not None:
             font_manifest = package_ass_with_font(
                 bi_ass,
@@ -4095,6 +5008,13 @@ def main() -> None:
             target_chinese_cps=TARGET_CHINESE_CPS,
             target_english_cps=TARGET_ENGLISH_CPS,
             artifacts=artifact_paths,
+            sync_report=sync_report,
+            source_kind=actual_source,
+            video_duration_seconds=probe_video_duration_seconds(video_path),
+            min_duration_seconds=MIN_SUBTITLE_DURATION,
+            style_guide=style_guide,
+            final_qa_report=final_qa_report,
+            render_validation=render_validation,
         )
         write_quality_report(quality_report_path, quality_report)
         print_timing_report(output_segments)

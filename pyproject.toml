@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bilingual-subtitle-pipeline"
-version = "0.3.0"
+version = "0.4.0"
 description = "Local and remote bilingual subtitle recognition, correction, and translation pipeline."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -39,7 +39,9 @@ py-modules = [
   "llm_policy",
   "output_paths",
   "pipeline_policy",
+  "scene_timing",
   "ssh_tunnel",
+  "subtitle_delivery",
   "subtitle_frontend",
   "subtitle_pipeline",
   "subtitle_quality",

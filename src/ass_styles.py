@@ -189,6 +189,40 @@ def probe_video_play_resolution(
         return 1920, play_res_y
 
 
+def probe_video_duration_seconds(
+    video_path: Path,
+    ffprobe_path: str | None = None,
+) -> float | None:
+    ffprobe = ffprobe_path or find_ffprobe()
+    if not ffprobe:
+        return None
+    command = [
+        ffprobe,
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "json",
+        str(video_path),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+        payload = json.loads(result.stdout)
+        duration = float((payload.get("format") or {}).get("duration"))
+        return duration if math.isfinite(duration) and duration > 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
 def sanitize_font_name(value: str | None) -> str:
     name = re.sub(r"[\r\n,]+", " ", str(value or "")).strip()
     name = re.sub(r"\s+", " ", name)

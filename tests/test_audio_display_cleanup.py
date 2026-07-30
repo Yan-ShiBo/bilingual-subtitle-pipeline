@@ -567,6 +567,189 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertEqual(output[1]["zh"], "\u7ea6\u7ff0\u5750\u4e0b\u4e86\u3002")
         self.assertEqual(terminology["entries"], [{"source": "John", "target": "\u7ea6\u7ff0"}])
 
+    def test_movie_style_prepass_is_cached_and_seeds_name_policy(self) -> None:
+        source = [
+            {"id": 0, "start": 1.0, "end": 2.0, "text": "John arrived."},
+            {"id": 1, "start": 2.0, "end": 3.0, "text": "John sat down."},
+        ]
+        response = json.dumps(
+            {
+                "register": "Natural conversational Chinese.",
+                "name_policy": "Always translate John as \u7ea6\u7ff0.",
+                "address_policy": "Use relationship-aware forms of address.",
+                "sdh_policy": "Translate English-only SDH cues when Chinese lacks them.",
+                "punctuation_policy": "Use concise Chinese subtitle punctuation.",
+                "terminology": [{"source": "John", "target": "\u7ea6\u7ff0"}],
+            },
+            ensure_ascii=False,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_path = Path(tmpdir) / "style.json"
+            with patch.object(audio_to_subtitle, "call_llm", return_value=response) as call:
+                first = audio_to_subtitle.analyze_movie_style(
+                    source,
+                    "qwen3:30b",
+                    artifact_path,
+                )
+                second = audio_to_subtitle.analyze_movie_style(
+                    source,
+                    "qwen3:30b",
+                    artifact_path,
+                )
+
+        self.assertEqual(call.call_count, 1)
+        self.assertEqual(first["terminology"], [{"source": "John", "target": "\u7ea6\u7ff0"}])
+        self.assertEqual(second["input_fingerprint"], first["input_fingerprint"])
+
+    def test_translation_prompt_uses_movie_wide_style_before_first_batch(self) -> None:
+        source = [{"id": 0, "start": 1.0, "end": 2.0, "text": "John arrived."}]
+        style_guide = {
+            "status": "ready",
+            "register": "Concise conversational Chinese.",
+            "name_policy": "Always use \u7ea6\u7ff0 for John.",
+            "address_policy": "Use stable forms of address.",
+            "sdh_policy": "Translate missing English-only cues.",
+            "punctuation_policy": "Use concise punctuation.",
+            "terminology": [{"source": "John", "target": "\u7ea6\u7ff0"}],
+        }
+        response = (
+            '[{"index":0,"corrected_text":"John arrived.",'
+            '"chinese_translation":"\u7ea6\u7ff0\u5230\u4e86\u3002","display":true,'
+            '"terminology":[{"source":"John","target":"\u7ea6\u7ff0"}]}]'
+        )
+
+        with patch.object(audio_to_subtitle, "call_llm", return_value=response) as call:
+            output = translate_and_correct_segments(
+                source,
+                llm_model="qwen3:30b",
+                batch_size=1,
+                context_lines=0,
+                source_language="en",
+                style_guide=style_guide,
+            )
+
+        prompt = call.call_args.args[0]
+        self.assertIn("MOVIE-WIDE STYLE GUIDE", prompt)
+        self.assertIn("Always use \u7ea6\u7ff0 for John", prompt)
+        self.assertIn("John => \u7ea6\u7ff0", prompt)
+        self.assertEqual(output[0]["zh"], "\u7ea6\u7ff0\u5230\u4e86\u3002")
+
+    def test_independent_final_qa_repairs_name_without_changing_timing(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 1.0,
+                "end": 3.0,
+                "text": "John arrived.",
+                "en": "John arrived.",
+                "zh": "\u5f3a\u5c3c\u5230\u4e86\u3002",
+                "display": True,
+            }
+        ]
+        style_guide = {
+            "status": "ready",
+            "input_fingerprint": "style",
+            "register": "Natural Chinese.",
+            "name_policy": "John is always \u7ea6\u7ff0.",
+            "address_policy": "Stable.",
+            "sdh_policy": "Translate missing cues.",
+            "punctuation_policy": "Concise.",
+            "terminology": [{"source": "John", "target": "\u7ea6\u7ff0"}],
+        }
+        response = (
+            '[{"index":0,"corrected_english":"John arrived.",'
+            '"corrected_chinese":"\u7ea6\u7ff0\u5230\u4e86\u3002","display":true,'
+            '"terminology":[{"source":"John","target":"\u7ea6\u7ff0"}]}]'
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_path = Path(tmpdir) / "final-qa.json"
+            with patch.object(audio_to_subtitle, "call_llm", return_value=response):
+                output, report = audio_to_subtitle.run_final_subtitle_qa(
+                    source,
+                    "qwen3:30b",
+                    artifact_path,
+                    style_guide=style_guide,
+                )
+
+        self.assertEqual((output[0]["start"], output[0]["end"]), (1.0, 3.0))
+        self.assertEqual(output[0]["zh"], "\u7ea6\u7ff0\u5230\u4e86\u3002")
+        self.assertTrue(output[0]["final_qa_changed"])
+        self.assertEqual(report["status"], "pass")
+
+    def test_independent_final_qa_rejects_translation_of_japanese_source(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 1.0,
+                "end": 3.0,
+                "text": "\u3053\u3093\u306b\u3061\u306f",
+                "en": "\u3053\u3093\u306b\u3061\u306f",
+                "zh": "\u4f60\u597d",
+                "source_language": "ja",
+                "display": True,
+            }
+        ]
+        response = (
+            '[{"index":0,"corrected_english":"Hello",'
+            '"corrected_chinese":"\u4f60\u597d","display":true,"terminology":[]}]'
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_path = Path(tmpdir) / "final-qa.json"
+            with patch.object(
+                audio_to_subtitle,
+                "call_llm",
+                return_value=response,
+            ) as call:
+                output, report = audio_to_subtitle.run_final_subtitle_qa(
+                    source,
+                    "qwen3:30b",
+                    artifact_path,
+                )
+
+        self.assertIn("SOURCE_LANGUAGE=ja", call.call_args.args[0])
+        self.assertEqual(output[0]["en"], "\u3053\u3093\u306b\u3061\u306f")
+        self.assertEqual(report["status"], "review")
+        self.assertEqual(
+            report["rejected_items"][0]["reason"],
+            "source_language_changed",
+        )
+
+    def test_independent_final_qa_preserves_manual_review(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 1.1,
+                "end": 3.2,
+                "text": "John arrived.",
+                "en": "John arrived.",
+                "zh": "\u7ea6\u7ff0\u5230\u4e86\u3002",
+                "display": True,
+                "manual_reviewed_at": "2026-07-30T10:00:00+00:00",
+            }
+        ]
+        response = (
+            '[{"index":0,"corrected_english":"Jack arrived.",'
+            '"corrected_chinese":"\u6770\u514b\u5230\u4e86\u3002","display":true,'
+            '"terminology":[]}]'
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_path = Path(tmpdir) / "final-qa.json"
+            with patch.object(audio_to_subtitle, "call_llm", return_value=response):
+                output, report = audio_to_subtitle.run_final_subtitle_qa(
+                    source,
+                    "qwen3:30b",
+                    artifact_path,
+                )
+
+        self.assertEqual(output[0]["en"], "John arrived.")
+        self.assertEqual(output[0]["zh"], "\u7ea6\u7ff0\u5230\u4e86\u3002")
+        self.assertTrue(output[0]["final_qa_manual_preserved"])
+        self.assertEqual(report["manual_preserved_count"], 1)
+
     def test_relevant_early_terminology_survives_prompt_limit(self) -> None:
         glossary = {"john": {"source": "John", "target": "\u7ea6\u7ff0"}}
         for index in range(300):
@@ -1208,6 +1391,57 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertEqual(output[0]["text"], "Recognized line")
         self.assertEqual(unloaded, [True])
 
+    def test_transcribe_audio_persists_whisper_confidence_metadata(self) -> None:
+        captured_kwargs = {}
+
+        class FakeWhisperModel:
+            model = None
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            @staticmethod
+            def transcribe(*_args, **kwargs):
+                captured_kwargs.update(kwargs)
+                segment = SimpleNamespace(
+                    start=1.0,
+                    end=3.0,
+                    text="Recognized line",
+                    avg_logprob=-0.42,
+                    compression_ratio=1.2,
+                    no_speech_prob=0.08,
+                    temperature=0.0,
+                    words=[
+                        SimpleNamespace(
+                            start=1.0,
+                            end=2.0,
+                            word="Recognized",
+                            probability=0.91,
+                        ),
+                        SimpleNamespace(
+                            start=2.0,
+                            end=3.0,
+                            word="line",
+                            probability=0.82,
+                        ),
+                    ],
+                )
+                info = SimpleNamespace(language="en", language_probability=0.97)
+                return iter([segment]), info
+
+        with patch.dict(
+            sys.modules,
+            {"faster_whisper": SimpleNamespace(WhisperModel=FakeWhisperModel)},
+        ):
+            output = audio_to_subtitle.transcribe_audio(Path("audio.wav"), language="auto")
+
+        self.assertTrue(captured_kwargs["multilingual"])
+        self.assertEqual(captured_kwargs["hallucination_silence_threshold"], 2.0)
+        self.assertEqual(output[0]["asr_avg_logprob"], -0.42)
+        self.assertEqual(output[0]["asr_language_probability"], 0.97)
+        self.assertEqual(output[0]["words"][0]["probability"], 0.91)
+        self.assertAlmostEqual(output[0]["asr_word_confidence"], 0.865)
+
     def test_frontend_rejects_duplicate_run_for_same_output(self) -> None:
         class FakeProcess:
             pid = 43210
@@ -1555,6 +1789,66 @@ class DisplayCleanupTests(unittest.TestCase):
             "".join(piece["zh"] for piece in pieces if piece.get("zh")),
             source[0]["zh"],
         )
+
+    def test_bilingual_split_uses_word_timestamps_instead_of_equal_time(self) -> None:
+        words = [
+            {"start": 10.0, "end": 10.4, "word": "One"},
+            {"start": 10.4, "end": 10.8, "word": "two"},
+            {"start": 10.8, "end": 11.2, "word": "three"},
+            {"start": 11.2, "end": 11.6, "word": "four"},
+            {"start": 15.0, "end": 15.4, "word": "five"},
+            {"start": 15.4, "end": 15.8, "word": "six"},
+            {"start": 15.8, "end": 16.2, "word": "seven"},
+            {"start": 16.2, "end": 16.6, "word": "eight"},
+        ]
+        source = [
+            {
+                "id": 0,
+                "start": 10.0,
+                "end": 18.0,
+                "text": "One two three four five six seven eight",
+                "en": "One two three four five six seven eight",
+                "zh": "\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b",
+                "timing_origin": "audio_asr",
+                "words": words,
+            }
+        ]
+
+        pieces = split_segments_for_subtitles(
+            source,
+            max_words=4,
+            max_chars=42,
+            max_duration=10.0,
+        )
+
+        self.assertEqual(len(pieces), 2)
+        self.assertAlmostEqual(pieces[0]["end"], 11.6)
+        self.assertAlmostEqual(pieces[1]["start"], 15.0)
+        self.assertEqual([word["word"] for word in pieces[1]["words"]], ["five", "six", "seven", "eight"])
+
+    def test_unanchored_existing_cue_is_not_delayed_by_synthetic_split(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 10.0,
+                "end": 18.0,
+                "text": "This cue has no word timestamps and must retain its source timing.",
+                "en": "This cue has no word timestamps and must retain its source timing.",
+                "zh": "\u8fd9\u6761\u5b57\u5e55\u6ca1\u6709\u8bcd\u7ea7\u65f6\u95f4\u952e\u5e76\u5fc5\u987b\u4fdd\u7559\u539f\u65f6\u95f4",
+                "timing_origin": "existing_subtitle",
+            }
+        ]
+
+        pieces = split_segments_for_subtitles(
+            source,
+            max_words=4,
+            max_chars=20,
+            max_duration=3.0,
+        )
+
+        self.assertEqual(len(pieces), 1)
+        self.assertEqual((pieces[0]["start"], pieces[0]["end"]), (10.0, 18.0))
+        self.assertTrue(pieces[0]["unanchored_split_avoided"])
 
     def test_bilingual_output_uses_independent_one_line_limits(self) -> None:
         source = [
@@ -2086,6 +2380,59 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertEqual([event.text for event in result], ["first", "second"])
         self.assertEqual(FakeOcrEngine.recognized, [second_image])
 
+    def test_ocr_observation_accepts_array_like_scores(self) -> None:
+        class AmbiguousScores(list):
+            def __bool__(self):
+                raise AssertionError("array-like scores must not be coerced to bool")
+
+        observation = subtitle_pipeline.extract_ocr_observation(
+            {
+                "rec_texts": ["recognized"],
+                "rec_scores": AmbiguousScores([0.64]),
+                "rec_polys": [
+                    [[0, 0], [100, 0], [100, 20], [0, 20]],
+                ],
+            },
+            "en",
+        )
+
+        self.assertEqual(observation.text, "recognized")
+        self.assertEqual(observation.confidence, 0.64)
+        self.assertEqual(observation.line_confidences, [0.64])
+
+    def test_ocr_observation_persists_confidence_in_cache(self) -> None:
+        class FakeOcrEngine:
+            def __init__(self, **_kwargs):
+                pass
+
+            @staticmethod
+            def assert_gpu() -> None:
+                pass
+
+            @staticmethod
+            def recognize(_image_path: Path):
+                return subtitle_pipeline.OcrObservation(
+                    text="recognized",
+                    confidence=0.64,
+                    line_confidences=[0.64],
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image = root / "subtitle.png"
+            image.write_bytes(b"image")
+            cache_path = root / "ocr.json"
+            image_events = [PgsImageEvent(1.0, 2.0, image, "hash")]
+
+            with patch.object(subtitle_pipeline, "PaddleOcrEngine", FakeOcrEngine):
+                result = ocr_pgs_events(image_events, "en", "gpu:0", cache_path, True)
+
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result[0].confidence, 0.64)
+        self.assertEqual(result[0].metadata["line_confidences"], [0.64])
+        self.assertEqual(cached["events"][0]["confidence"], 0.64)
+
     def test_ocr_cache_rejects_same_length_with_different_image_hash(self) -> None:
         class FakeOcrEngine:
             recognized: list[Path] = []
@@ -2198,6 +2545,58 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertEqual(output[0]["en"], "\u9332\u97f3\u306e\u6280\u8853")
         self.assertEqual(output[0]["processing_mode"], "translate")
 
+    def test_japanese_translation_retries_source_language_change(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 1.0,
+                "end": 2.0,
+                "text": "\u9332\u97f3\u306e\u6280\u8853",
+                "source_language": "ja",
+            }
+        ]
+        translated_source = """
+        [
+          {
+            "index": 0,
+            "corrected_text": "Recording technology",
+            "chinese_translation": "\u5f55\u97f3\u6280\u672f",
+            "display": true,
+            "terminology": []
+          }
+        ]
+        """
+        repaired = {
+            "corrected_text": "\u9332\u97f3\u306e\u6280\u8853",
+            "chinese_translation": "\u5f55\u97f3\u6280\u672f",
+            "display": True,
+            "terminology": [],
+        }
+
+        with (
+            patch.object(
+                audio_to_subtitle,
+                "call_llm",
+                return_value=translated_source,
+            ),
+            patch.object(
+                audio_to_subtitle,
+                "retry_single_segment_llm",
+                return_value=repaired,
+            ) as retry,
+        ):
+            output = translate_and_correct_segments(
+                source,
+                llm_model="qwen3:30b",
+                batch_size=1,
+                context_lines=0,
+                source_language="ja",
+            )
+
+        retry.assert_called_once()
+        self.assertEqual(output[0]["en"], "\u9332\u97f3\u306e\u6280\u8853")
+        self.assertEqual(output[0]["zh"], "\u5f55\u97f3\u6280\u672f")
+
     def test_frontend_defaults_audio_recognition_to_follow_source_language(self) -> None:
         frontend_source = (ROOT / "src" / "subtitle_frontend.py").read_text(encoding="utf-8")
 
@@ -2266,7 +2665,11 @@ class DisplayCleanupTests(unittest.TestCase):
             self.assertIn("Hello world", body)
             self.assertIn("\u7e41\u4f53\u5b57\u5e55", body)
             self.assertEqual(source_cache[0]["zh"], "\u7e41\u4f53\u5b57\u5e55")
-            self.assertEqual(quality_report["status"], "pass")
+            self.assertEqual(quality_report["status"], "review")
+            self.assertEqual(
+                quality_report["checks"]["subtitle_sync"]["result"],
+                "disabled",
+            )
             self.assertEqual(
                 quality_report["artifacts"]["bilingual_ass"],
                 str(out_dir / "Episode.bilingual.ass"),
@@ -2336,7 +2739,10 @@ class DisplayCleanupTests(unittest.TestCase):
         ]
 
         def call_llm(prompt, *_args, **_kwargs):
-            self.assertIn("Translate from English into corrected_chinese only when the original Chinese is empty", prompt)
+            self.assertIn(
+                "Translate source-track information into corrected_chinese only when the original Chinese is empty",
+                prompt,
+            )
             self.assertIn("SDH/non-speech cues", prompt)
             self.assertIn("Keep names and recurring terminology consistent", prompt)
             return """
@@ -2397,6 +2803,60 @@ class DisplayCleanupTests(unittest.TestCase):
 
         self.assertEqual(output[0]["en"], "")
         self.assertEqual(output[0]["zh"], "\u4fc4\u4ea5\u4fc4\u5dde \u54e5\u4f26\u5e03\u5e02 2045\u5e74")
+
+    def test_existing_chinese_proofreading_preserves_japanese_source(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 6.0,
+                "end": 8.0,
+                "text": "\u3053\u3093\u306b\u3061\u306f",
+                "en": "\u3053\u3093\u306b\u3061\u306f",
+                "zh": "\u4f60\u597d",
+                "source_language": "ja",
+            }
+        ]
+        translated_source = """
+        [
+          {
+            "index": 0,
+            "corrected_english": "Hello",
+            "corrected_chinese": "\u4f60\u597d",
+            "display": true,
+            "terminology": []
+          }
+        ]
+        """
+        repaired = {
+            "corrected_english": "\u3053\u3093\u306b\u3061\u306f",
+            "corrected_chinese": "\u4f60\u597d",
+            "display": True,
+            "terminology": [],
+        }
+
+        with (
+            patch.object(
+                audio_to_subtitle,
+                "call_llm",
+                return_value=translated_source,
+            ) as call,
+            patch.object(
+                audio_to_subtitle,
+                "retry_single_segment_llm",
+                return_value=repaired,
+            ) as retry,
+        ):
+            output = proofread_existing_chinese_segments(
+                source,
+                llm_model="qwen3:30b",
+                batch_size=1,
+                context_lines=0,
+            )
+
+        self.assertIn("SOURCE_LANGUAGE=ja", call.call_args.args[0])
+        retry.assert_called_once()
+        self.assertEqual(output[0]["en"], "\u3053\u3093\u306b\u3061\u306f")
+        self.assertEqual(output[0]["zh"], "\u4f60\u597d")
 
     def test_generate_ass_does_not_write_chinese_in_english_layer(self) -> None:
         segments = [

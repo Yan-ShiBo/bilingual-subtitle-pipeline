@@ -135,3 +135,26 @@ def movie_name_schema() -> dict[str, Any]:
         "required": ["series_name", "movie_name"],
         "additionalProperties": False,
     }
+
+
+def movie_style_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "register": {"type": "string"},
+            "name_policy": {"type": "string"},
+            "address_policy": {"type": "string"},
+            "sdh_policy": {"type": "string"},
+            "punctuation_policy": {"type": "string"},
+            "terminology": _terminology_schema(),
+        },
+        "required": [
+            "register",
+            "name_policy",
+            "address_policy",
+            "sdh_policy",
+            "punctuation_policy",
+            "terminology",
+        ],
+        "additionalProperties": False,
+    }
