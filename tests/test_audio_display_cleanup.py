@@ -1,5 +1,6 @@
-import sys
+import io
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -467,7 +468,11 @@ class DisplayCleanupTests(unittest.TestCase):
             prompts.append(prompt)
             return responses.pop(0)
 
-        with patch.object(audio_to_subtitle, "call_llm", side_effect=call_llm):
+        cp1252_stdout = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+        with (
+            patch.object(audio_to_subtitle, "call_llm", side_effect=call_llm),
+            patch.object(sys, "stdout", cp1252_stdout),
+        ):
             output = translate_and_correct_segments(
                 source,
                 llm_model="qwen3:30b",

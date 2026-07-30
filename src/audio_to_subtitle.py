@@ -2568,7 +2568,10 @@ def retry_single_segment_llm(
     terminology_text: str = "(none yet)",
     require_display: bool = False,
 ) -> Dict[str, Any]:
-    print(f"检测到语言异常，正在重试单句: {segment.get('text', '')}")
+    print(
+        "Detected an invalid visible subtitle; retrying one item: "
+        f"{ascii(str(segment.get('text') or ''))}"
+    )
     display_requirement = (
         "- This line is not covered by another visible subtitle. "
         'You MUST set "display": true and return complete visible text.'
@@ -2711,7 +2714,10 @@ Rules:
                 item = lookup[0]
                 if not parse_display_flag(item.get("display", True)):
                     if require_display:
-                        print(f"重试单句第 {attempt + 1} 次仍请求隐藏唯一字幕，继续重试...")
+                        print(
+                            f"Single-item retry {attempt + 1} still requested "
+                            "hiding a unique subtitle; retrying."
+                        )
                         continue
                     return item
                 if is_proofread:
@@ -2730,11 +2736,17 @@ Rules:
                     translated = str(item.get("chinese_translation") or "")
                     if is_language_valid(segment.get("text", ""), corrected, translated):
                         return item
-            print(f"重试单句第 {attempt + 1} 次依然语言异常，继续重试...")
+            print(
+                f"Single-item retry {attempt + 1} still failed language "
+                "validation; retrying."
+            )
         except Exception as exc:
-            print(f"重试单句请求异常: {exc}")
+            print(f"Single-item retry request failed: {ascii(str(exc))}")
     
-    print("10次重试均失败，将中断当前批次并保留最近 checkpoint。")
+    print(
+        "All 10 single-item retries failed; stopping the current batch "
+        "and preserving the latest checkpoint."
+    )
     return {}
 
 
