@@ -1,7 +1,4 @@
-paddleocr
-opencc-python-reimplemented
-imageio-ffmpeg
-tqdm
-requests
-pgsrip
-paramiko
+-r requirements.txt
+
+paddleocr==3.7.0
+requests==2.32.5
