@@ -395,6 +395,100 @@ class SubtitleQualityTests(unittest.TestCase):
             ["offset reached the search boundary"],
         )
 
+    def test_word_timing_supersedes_rejected_existing_subtitle_sync(self) -> None:
+        layout = build_layout_policy(
+            (1920, 1080),
+            profile_name="adaptive",
+            font_name="Arial",
+            font_scale=100,
+        )
+        source = {
+            "id": 0,
+            "start": 1.0,
+            "end": 3.0,
+            "text": "Hello",
+            "en": "Hello",
+            "zh": "\u4f60\u597d",
+            "timing_origin": "existing_subtitle",
+            "display": True,
+        }
+        processed = {
+            **source,
+            "word_timing_source": "whisper-words.json",
+            "words": [{"word": "Hello", "start": 1.0, "end": 1.4}],
+        }
+
+        report = build_quality_report(
+            [source],
+            [processed],
+            [processed],
+            layout,
+            max_duration=5.5,
+            target_chinese_cps=9.0,
+            target_english_cps=20.0,
+            sync_report={
+                "mode": "auto",
+                "status": "rejected_low_quality",
+                "pipeline_quality_passed": False,
+            },
+            source_kind="embedded",
+            video_duration_seconds=120.0,
+        )
+
+        sync_check = report["checks"]["subtitle_sync"]
+        self.assertEqual(sync_check["status"], "pass")
+        self.assertEqual(sync_check["review_items"], 0)
+        self.assertEqual(sync_check["result"], "superseded_by_word_timing")
+        self.assertEqual(sync_check["superseded_result"], "rejected_low_quality")
+
+    def test_terminology_check_ignores_targets_absent_from_rendered_text(self) -> None:
+        layout = build_layout_policy(
+            (1920, 1080),
+            profile_name="adaptive",
+            font_name="Arial",
+            font_scale=100,
+        )
+        segments = [
+            {
+                "id": 0,
+                "start": 1.0,
+                "end": 3.0,
+                "text": "lotus position",
+                "en": "lotus position",
+                "zh": "\u83b2\u82b1\u5f0f",
+                "terminology": [
+                    {"source": "lotus position", "target": "\u83b2\u5ea7\u5f0f"}
+                ],
+            },
+            {
+                "id": 1,
+                "start": 3.1,
+                "end": 5.1,
+                "text": "lotus position",
+                "en": "lotus position",
+                "zh": "\u83b2\u82b1\u5f0f",
+                "terminology": [
+                    {"source": "lotus position", "target": "\u83b2\u82b1\u5f0f"}
+                ],
+            },
+        ]
+
+        report = build_quality_report(
+            segments,
+            segments,
+            segments,
+            layout,
+            max_duration=5.5,
+            target_chinese_cps=9.0,
+            target_english_cps=20.0,
+        )
+
+        self.assertEqual(report["checks"]["terminology"]["status"], "pass")
+        self.assertEqual(
+            report["checks"]["terminology"]["inconsistency_count"],
+            0,
+        )
+
     def test_quality_report_flags_short_events_after_final_timing(self) -> None:
         layout = build_layout_policy(
             (1920, 1080),

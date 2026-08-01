@@ -39,6 +39,25 @@ class SshTunnelTests(unittest.TestCase):
         self.assertGreater(manager.local_port, 0)
         self.assertTrue(manager._tunnel_ready.is_set())
 
+    def test_tunnel_publishes_operating_system_assigned_port(self) -> None:
+        class FakeTransport:
+            @staticmethod
+            def is_active() -> bool:
+                return False
+
+        class FakeClient:
+            @staticmethod
+            def get_transport():
+                return FakeTransport()
+
+        manager = SSHTunnelManager(local_port=0)
+        manager.ssh_client = FakeClient()
+
+        manager._forward_local_port()
+
+        self.assertGreater(manager.local_port, 0)
+        self.assertTrue(manager._tunnel_ready.is_set())
+
     def test_resolve_ssh_connection_uses_openssh_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

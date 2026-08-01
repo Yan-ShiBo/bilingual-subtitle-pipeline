@@ -244,12 +244,20 @@ def _terminology_inconsistencies(
     targets_by_source: dict[str, set[str]] = {}
     display_by_source: dict[str, str] = {}
     for segment in segments:
+        rendered_text = "\n".join(
+            _normalized_text(segment.get(track))
+            for track in ("en", "zh")
+            if _normalized_text(segment.get(track))
+        )
+        rendered_compact = re.sub(r"\s+", "", rendered_text).casefold()
         for entry in segment.get("terminology") or []:
             if not isinstance(entry, dict):
                 continue
             source = _normalized_text(entry.get("source"))
             target = _normalized_text(entry.get("target"))
             if not source or not target:
+                continue
+            if re.sub(r"\s+", "", target).casefold() not in rendered_compact:
                 continue
             key = source.casefold()
             targets_by_source.setdefault(key, set()).add(target)
@@ -320,6 +328,7 @@ def _sync_quality_check(
     sync_report: dict[str, Any] | None,
     *,
     existing_timing_source: bool,
+    timing_reanchored: bool = False,
 ) -> dict[str, Any]:
     if not existing_timing_source:
         return {
@@ -327,6 +336,25 @@ def _sync_quality_check(
             "review_items": 0,
             "mode": None,
             "result": None,
+            "applied": False,
+            "reasons": [],
+        }
+    if timing_reanchored:
+        original_result = (
+            str(sync_report.get("status") or "unknown").casefold()
+            if isinstance(sync_report, dict)
+            else "missing_report"
+        )
+        return {
+            "status": "pass",
+            "review_items": 0,
+            "mode": (
+                str(sync_report.get("mode") or "").casefold() or None
+                if isinstance(sync_report, dict)
+                else None
+            ),
+            "result": "superseded_by_word_timing",
+            "superseded_result": original_result,
             "applied": False,
             "reasons": [],
         }
@@ -803,9 +831,27 @@ def build_quality_report(
     ]
     terminology_count, terminology_samples = _terminology_inconsistencies(processed_segments)
     existing_timing_source = _uses_existing_subtitle_timing(source_segments, source_kind)
+    visible_processed = [
+        segment
+        for segment in processed_segments
+        if segment.get("display", True) is not False
+    ]
+    timed_processed = [
+        segment
+        for segment in visible_processed
+        if (
+            segment.get("words")
+            or segment.get("word_timing_source")
+            or segment.get("split_timing_basis") == "word_timestamps"
+        )
+    ]
+    timing_reanchored = bool(visible_processed) and (
+        len(timed_processed) / len(visible_processed) >= 0.8
+    )
     subtitle_sync = _sync_quality_check(
         sync_report,
         existing_timing_source=existing_timing_source,
+        timing_reanchored=timing_reanchored,
     )
     source_completeness = _source_completeness_check(
         source_segments,

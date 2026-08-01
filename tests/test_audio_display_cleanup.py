@@ -44,6 +44,44 @@ from audio_to_subtitle import (  # noqa: E402
 
 
 class DisplayCleanupTests(unittest.TestCase):
+    def test_release_name_strips_compound_language_track_tags(self) -> None:
+        name = (
+            "头号玩家.Ready.Player.One.2018.Eng.Fre.Ger.Ita.Por.Spa.Cze.Hun."
+            "Pol.Rus.Tha.Tur.Jpn.2160p.BluRay.Remux.mkv"
+        )
+
+        self.assertEqual(
+            subtitle_frontend.clean_name(name),
+            "头号玩家 Ready Player One 2018",
+        )
+
+    def test_frontend_status_does_not_reuse_logs_from_another_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            output_root = root / "output"
+            payload = {
+                "pid": 0,
+                "output_root": str(output_root),
+                "series_name": "Series",
+                "movie_name": "Movie",
+            }
+            with patch.object(subtitle_frontend, "LOG_DIR", root / "logs"):
+                legacy_stdout, _ = subtitle_frontend.frontend_log_paths("Series", "Movie")
+                legacy_stdout.write_text("Success! Subtitles saved\n", encoding="utf-8")
+
+                unrelated_status = subtitle_frontend.run_status(payload)
+
+                scoped_stdout, _ = subtitle_frontend.frontend_log_paths(
+                    "Series",
+                    "Movie",
+                    subtitle_frontend.output_dir(output_root, "Series", "Movie"),
+                )
+                scoped_stdout.write_text("Success! Subtitles saved\n", encoding="utf-8")
+                matching_status = subtitle_frontend.run_status(payload)
+
+        self.assertEqual(unrelated_status["outcome"], "idle")
+        self.assertEqual(matching_status["outcome"], "success")
+
     def test_atomic_json_write_retries_transient_windows_lock(self) -> None:
         original_replace = Path.replace
         replace_calls = 0
@@ -180,12 +218,14 @@ class DisplayCleanupTests(unittest.TestCase):
                     {
                         "path": str(video),
                         "output_root": str(subtitle_frontend.LEGACY_DEFAULT_OUTPUT_ROOT),
+                        "analysis_config_fingerprint": "source-config-v1",
                     }
                 )
 
         self.assertEqual(info["output_root"], str(video.parent))
         self.assertEqual(info["output_root_source"], "existing")
         self.assertTrue(info["source_segments_exists"])
+        self.assertEqual(info["analysis_config_fingerprint"], "source-config-v1")
 
     def test_frontend_page_migrates_project_relative_output_default(self) -> None:
         page = subtitle_frontend.html_page()
@@ -427,6 +467,61 @@ class DisplayCleanupTests(unittest.TestCase):
             "unique_source_not_covered",
         )
 
+    def test_model_hide_guard_preserves_manual_hidden_review(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 1.0,
+                "end": 2.0,
+                "text": "A different important sentence.",
+            },
+        ]
+        processed = [
+            {
+                **source[0],
+                "en": "A different important sentence.",
+                "zh": "",
+                "display": False,
+                "manual_reviewed_at": "2026-07-31T10:00:00+00:00",
+            },
+        ]
+
+        guarded = guard_model_hidden_segments(source, processed)
+
+        self.assertFalse(guarded[0]["display"])
+        self.assertEqual(guarded[0]["display_guard"], "accepted_hidden")
+        self.assertEqual(
+            guarded[0]["display_guard_reason"],
+            "manual_review",
+        )
+
+    def test_model_hide_guard_preserves_subtitle_credit_suppression(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 1.0,
+                "end": 6.0,
+                "text": "== Subtitle by Littant ==",
+                "chinese_text_authority": "authored",
+            },
+        ]
+        processed = [
+            {
+                **source[0],
+                "en": "",
+                "zh": "== Subtitle by Littant ==",
+                "display": False,
+                "suppression_reason": "subtitle_credit",
+                "non_content_credit": True,
+            },
+        ]
+
+        guarded = guard_model_hidden_segments(source, processed)
+
+        self.assertFalse(guarded[0]["display"])
+        self.assertEqual(guarded[0]["display_guard"], "accepted_hidden")
+        self.assertEqual(guarded[0]["display_guard_reason"], "subtitle_credit")
+
     def test_model_hide_guard_accepts_fragment_covered_by_earlier_line(self) -> None:
         source = [
             {"id": 0, "start": 10.0, "end": 11.0, "text": "A sentence starts here"},
@@ -455,6 +550,137 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertEqual(
             guarded[1]["display_guard_reason"],
             "covered_by_adjacent_visible_line",
+        )
+
+    def test_model_hide_guard_accepts_symbol_prefixed_ocr_fragment(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 28.9,
+                "end": 33.01,
+                "text": "%uh home",
+                "en": "%uh home",
+                "zh": "",
+                "source_text_authority": "ocr",
+            },
+        ]
+        processed = [
+            {
+                **source[0],
+                "en": "",
+                "zh": "",
+                "display": False,
+                "model_display_requested": False,
+            },
+        ]
+
+        guarded = guard_model_hidden_segments(source, processed)
+
+        self.assertFalse(guarded[0]["display"])
+        self.assertEqual(guarded[0]["display_guard"], "accepted_hidden")
+        self.assertEqual(
+            guarded[0]["display_guard_reason"],
+            "ocr_symbol_fragment",
+        )
+
+    def test_model_hide_guard_accepts_ocr_bridge_between_chinese_cues(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 230.39,
+                "end": 233.459,
+                "text": "I also like it when everything is stimulated",
+                "en": "I also like it when everything is stimulated",
+                "zh": "\u6211\u4e5f\u559c\u6b22\u540c\u65f6\u53d7\u5230\u523a\u6fc0",
+                "source_text_authority": "ocr",
+            },
+            {
+                "id": 1,
+                "start": 233.459,
+                "end": 236.91,
+                "text": "a mess stimulated because that list is like",
+                "en": "a mess stimulated because that list is like",
+                "zh": "",
+                "source_text_authority": "ocr",
+            },
+            {
+                "id": 2,
+                "start": 236.91,
+                "end": 240.5,
+                "text": "three in one, it is amazing",
+                "en": "three in one, it is amazing",
+                "zh": "\u56e0\u4e3a\u611f\u89c9\u5c31\u50cf\u4e09\u4f4d\u4e00\u4f53",
+                "source_text_authority": "ocr",
+            },
+        ]
+        processed = [
+            {
+                **source[0],
+                "display": True,
+            },
+            {
+                **source[1],
+                "en": "",
+                "zh": "",
+                "display": False,
+                "model_display_requested": False,
+            },
+            {
+                **source[2],
+                "display": True,
+            },
+        ]
+
+        guarded = guard_model_hidden_segments(source, processed)
+
+        self.assertFalse(guarded[1]["display"])
+        self.assertEqual(
+            guarded[1]["display_guard_reason"],
+            "ocr_fragment_covered_by_adjacent_chinese",
+        )
+
+    def test_model_hide_guard_accepts_tiny_ocr_prefix_covered_by_next_cue(
+        self,
+    ) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 10.0,
+                "end": 10.39,
+                "text": "people",
+                "en": "people",
+                "zh": "",
+                "source_text_authority": "ocr",
+            },
+            {
+                "id": 1,
+                "start": 10.38,
+                "end": 15.0,
+                "text": "often start with something like this",
+                "en": "often start with something like this",
+                "zh": "人们通常会从这样的东西开始",
+                "source_text_authority": "ocr",
+                "chinese_text_authority": "authored",
+            },
+        ]
+        processed = [
+            {
+                **source[0],
+                "display": False,
+                "model_display_requested": False,
+            },
+            {
+                **source[1],
+                "display": True,
+            },
+        ]
+
+        guarded = guard_model_hidden_segments(source, processed)
+
+        self.assertFalse(guarded[0]["display"])
+        self.assertEqual(
+            guarded[0]["display_guard_reason"],
+            "ocr_tiny_fragment_covered_by_following_chinese",
         )
 
     def test_delivery_suppresses_subtitle_track_label_artifact(self) -> None:
@@ -795,6 +1021,261 @@ class DisplayCleanupTests(unittest.TestCase):
             output["corrected_chinese"],
         )
 
+    def test_single_item_retry_lists_required_authored_chinese_cue(self) -> None:
+        source = {
+            "id": 7,
+            "start": 45.745,
+            "end": 53.682,
+            "text": "I'm Dr. Catherine Hood.",
+            "en": "I'm Dr. Catherine Hood.",
+            "zh": (
+                "\u6211\u662f\u51ef\u745f\u7433\u00b7\u80e1\u5fb7\u533b\u751f"
+                "[\u6027\u7231\u5065\u5eb7\u4e0e\u6027\u5173\u7cfb\u4e13\u5bb6]"
+                "\u3002\u6211\u5c06\u63a2\u8ba8\u6027\u7231\u7684\u5404\u4e2a\u65b9\u9762\u3002"
+            ),
+            "source_language": "en",
+            "source_text_authority": "ocr",
+            "chinese_text_authority": "authored",
+        }
+        responses = [
+            json.dumps(
+                [
+                    {
+                        "index": 0,
+                        "corrected_english": source["en"],
+                        "corrected_chinese": (
+                            "\u6211\u662f\u51ef\u745f\u7433\u00b7\u80e1\u5fb7\u533b\u751f\u3002"
+                            "\u6211\u5c06\u63a2\u8ba8\u6027\u7231\u7684\u5404\u4e2a\u65b9\u9762\u3002"
+                        ),
+                        "display": True,
+                        "terminology": [],
+                    }
+                ],
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                [
+                    {
+                        "index": 0,
+                        "corrected_english": source["en"],
+                        "corrected_chinese": (
+                            "\u6211\u662f\u51ef\u745f\u7433\u00b7\u80e1\u5fb7\u533b\u751f"
+                            "\uff08\u6027\u7231\u5065\u5eb7\u4e0e\u6027\u5173\u7cfb\u4e13\u5bb6\uff09\u3002"
+                            "\u6211\u5c06\u63a2\u8ba8\u6027\u7231\u7684\u5404\u4e2a\u65b9\u9762\u3002"
+                        ),
+                        "display": True,
+                        "terminology": [],
+                    }
+                ],
+                ensure_ascii=False,
+            ),
+        ]
+        prompts = []
+
+        def call_llm(prompt, *_args, **_kwargs):
+            prompts.append(prompt)
+            return responses[len(prompts) - 1]
+
+        with patch.object(audio_to_subtitle, "call_llm", side_effect=call_llm):
+            output = audio_to_subtitle.retry_single_segment_llm(
+                source,
+                "",
+                "",
+                None,
+                source["start"],
+                source["end"],
+                "system",
+                "qwen3.5:122b",
+                "English",
+                is_proofread=True,
+            )
+
+        self.assertEqual(len(prompts), 2)
+        self.assertIn(
+            "[\u6027\u7231\u5065\u5eb7\u4e0e\u6027\u5173\u7cfb\u4e13\u5bb6]",
+            prompts[0],
+        )
+        self.assertIn("AUTOMATIC VALIDATION FEEDBACK", prompts[1])
+        self.assertIn("\u6027\u7231\u5065\u5eb7\u4e0e\u6027\u5173\u7cfb\u4e13\u5bb6", output["corrected_chinese"])
+
+    def test_single_item_retry_falls_back_to_authored_chinese(self) -> None:
+        source = {
+            "id": 7,
+            "start": 45.745,
+            "end": 53.682,
+            "text": "I'm Dr. Catherine Hood.",
+            "en": "I'm Dr. Catherine Hood.",
+            "zh": (
+                "\u6211\u662f\u51ef\u745f\u7433\u00b7\u80e1\u5fb7\u533b\u751f"
+                "[\u6027\u7231\u5065\u5eb7\u4e0e\u6027\u5173\u7cfb\u4e13\u5bb6]"
+                "\u3002\u6211\u5c06\u63a2\u8ba8\u6027\u7231\u7684\u5404\u4e2a\u65b9\u9762\u3002"
+            ),
+            "source_language": "en",
+            "source_text_authority": "ocr",
+            "chinese_text_authority": "authored",
+        }
+        response = json.dumps(
+            [
+                {
+                    "index": 0,
+                    "corrected_english": source["en"],
+                    "corrected_chinese": (
+                        "\u6211\u662f\u51ef\u745f\u7433\u00b7\u80e1\u5fb7\u533b\u751f\u3002"
+                        "\u6211\u5c06\u63a2\u8ba8\u6027\u7231\u7684\u5404\u4e2a\u65b9\u9762\u3002"
+                    ),
+                    "display": True,
+                    "terminology": [],
+                }
+            ],
+            ensure_ascii=False,
+        )
+
+        with patch.object(
+            audio_to_subtitle,
+            "call_llm",
+            return_value=response,
+        ) as call:
+            output = audio_to_subtitle.retry_single_segment_llm(
+                source,
+                "",
+                "",
+                None,
+                source["start"],
+                source["end"],
+                "system",
+                "qwen3.5:122b",
+                "English",
+                is_proofread=True,
+            )
+
+        self.assertEqual(call.call_count, 10)
+        self.assertEqual(output["corrected_chinese"], source["zh"])
+
+    def test_retry_canonicalizes_spacing_inside_approved_terminology(self) -> None:
+        source = {
+            "id": 22,
+            "start": 93.08,
+            "end": 102.75,
+            "text": "on everything from stimulating your g-spot exercises",
+            "en": "on everything from stimulating your g-spot exercises",
+            "zh": "\u4ece\u6559\u4f60\u5982\u4f55\u523a\u6fc0G\u70b9\u5230\u953b\u70bc",
+            "source_language": "en",
+            "source_text_authority": "ocr",
+            "chinese_text_authority": "authored",
+        }
+        response = json.dumps(
+            [
+                {
+                    "index": 0,
+                    "corrected_english": source["en"],
+                    "corrected_chinese": "\u4ece\u6559\u4f60\u5982\u4f55\u523a\u6fc0 G \u70b9\u5230\u953b\u70bc",
+                    "display": True,
+                    "terminology": [],
+                }
+            ],
+            ensure_ascii=False,
+        )
+        glossary = {"g-spot": {"source": "G-spot", "target": "G\u70b9"}}
+
+        with patch.object(
+            audio_to_subtitle,
+            "call_llm",
+            return_value=response,
+        ) as call:
+            output = audio_to_subtitle.retry_single_segment_llm(
+                source,
+                "",
+                "",
+                None,
+                93.08,
+                102.75,
+                "system",
+                "qwen3.5:122b",
+                "English",
+                is_proofread=True,
+                terminology_glossary=glossary,
+            )
+
+        self.assertEqual(call.call_count, 1)
+        self.assertIn("G\u70b9", output["corrected_chinese"])
+        self.assertNotIn("G \u70b9", output["corrected_chinese"])
+
+    def test_authored_chinese_term_survives_model_omission(self) -> None:
+        glossary = {"g-spot": {"source": "G-spot", "target": "G\u70b9"}}
+        preserved = audio_to_subtitle.preserve_authored_chinese_terminology(
+            {"chinese_text_authority": "authored"},
+            "\u4ece\u6559\u4f60\u5982\u4f55\u523a\u6fc0G\u70b9\u5230\u953b\u70bc",
+            "\u4ece\u6559\u4f60\u5982\u4f55\u523a\u6fc0\u654f\u611f\u70b9\u5230\u953b\u70bc",
+            "Stimulating your G-spot",
+            glossary,
+        )
+
+        self.assertEqual(
+            preserved,
+            "\u4ece\u6559\u4f60\u5982\u4f55\u523a\u6fc0G\u70b9\u5230\u953b\u70bc",
+        )
+
+    def test_authored_chinese_allows_natural_technical_term_inflection(self) -> None:
+        segment = {"chinese_text_authority": "authored"}
+        entry = {
+            "source": "female ejaculation",
+            "target": "\u5973\u6027\u5c04\u7cbe",
+        }
+        original = "\u6240\u4ee5\u5973\u6027\u7684\u786e\u4e5f\u80fd\u591f\u201c\u5c04\u7cbe\u201d"
+
+        self.assertTrue(
+            audio_to_subtitle.authored_chinese_satisfies_technical_term(
+                segment,
+                original,
+                entry,
+            )
+        )
+        self.assertEqual(
+            audio_to_subtitle.filter_authored_chinese_terminology_conflicts(
+                segment,
+                original,
+                [entry],
+            ),
+            [],
+        )
+
+    def test_authored_chinese_does_not_relax_proper_name_mapping(self) -> None:
+        self.assertFalse(
+            audio_to_subtitle.authored_chinese_satisfies_technical_term(
+                {"chinese_text_authority": "authored"},
+                "\u51ef\u4f26\u672c\u4eba\u5b89\u5fb7\u4f0d",
+                {
+                    "source": "Karen Underwood",
+                    "target": "\u51ef\u4f26\u00b7\u5b89\u5fb7\u4f0d\u5fb7",
+                },
+            )
+        )
+
+    def test_context_dependent_sex_term_is_not_registered_as_exact_mapping(self) -> None:
+        glossary = {}
+        accepted = audio_to_subtitle.register_terminology(
+            glossary,
+            [
+                {"source": "sex", "target": "\u6027\u7231"},
+                {"source": "gonorrhea", "target": "\u6dcb\u75c5"},
+            ],
+        )
+
+        self.assertNotIn("sex", glossary)
+        self.assertIn("gonorrhea", glossary)
+        self.assertEqual(
+            accepted,
+            [{"source": "gonorrhea", "target": "\u6dcb\u75c5"}],
+        )
+        self.assertEqual(
+            audio_to_subtitle.terminology_conflicts(
+                {"sex": {"source": "sex", "target": "\u6027\u7231"}},
+                "sex life",
+                "\u6027\u751f\u6d3b",
+            ),
+            [],
+        )
+
     def test_language_validation_preserves_existing_short_latin_token(self) -> None:
         self.assertTrue(
             audio_to_subtitle.is_language_valid(
@@ -817,6 +1298,15 @@ class DisplayCleanupTests(unittest.TestCase):
                 "Go!",
                 "Go",
                 original_translation="\u8d70\uff01",
+            )
+        )
+
+    def test_language_validation_rejects_cleaned_empty_placeholder(self) -> None:
+        self.assertFalse(
+            audio_to_subtitle.is_language_valid(
+                "ok",
+                "ok",
+                "-",
             )
         )
 
@@ -890,6 +1380,80 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertEqual(call.call_count, 1)
         self.assertEqual(first["terminology"], [{"source": "John", "target": "\u7ea6\u7ff0"}])
         self.assertEqual(second["input_fingerprint"], first["input_fingerprint"])
+
+    def test_movie_style_prepass_retries_malformed_structured_response(self) -> None:
+        source = [
+            {"id": 0, "start": 1.0, "end": 2.0, "text": "John arrived."},
+        ]
+        valid_response = json.dumps(
+            {
+                "register": "Natural conversational Chinese.",
+                "name_policy": "Translate John consistently.",
+                "address_policy": "Use relationship-aware address.",
+                "sdh_policy": "Translate missing SDH cues.",
+                "punctuation_policy": "Use concise punctuation.",
+                "terminology": [{"source": "John", "target": "\u7ea6\u7ff0"}],
+            },
+            ensure_ascii=False,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_path = Path(tmpdir) / "style.json"
+            with (
+                patch.object(
+                    audio_to_subtitle,
+                    "call_llm",
+                    side_effect=["{\"register\": \"broken\"", valid_response],
+                ) as call,
+                patch.object(audio_to_subtitle.time, "sleep"),
+            ):
+                style = audio_to_subtitle.analyze_movie_style(
+                    source,
+                    "qwen3.5:122b",
+                    artifact_path,
+                )
+
+        self.assertEqual(call.call_count, 2)
+        self.assertEqual(style["status"], "ready")
+        self.assertEqual(
+            style["terminology"],
+            [{"source": "John", "target": "\u7ea6\u7ff0"}],
+        )
+
+    def test_movie_style_prepass_reuses_matching_unavailable_result(self) -> None:
+        source = [
+            {"id": 0, "start": 1.0, "end": 2.0, "text": "John arrived."},
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_path = Path(tmpdir) / "style.json"
+            cached = {
+                "version": audio_to_subtitle.STYLE_GUIDE_POLICY_VERSION,
+                "status": "unavailable",
+                "llm_model": "qwen3.5:122b",
+                "input_fingerprint": audio_to_subtitle.style_guide_fingerprint(
+                    source,
+                    "qwen3.5:122b",
+                ),
+                "error": "previous remote timeout",
+                "terminology": [],
+            }
+            artifact_path.write_text(
+                json.dumps(cached, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            with patch.object(
+                audio_to_subtitle,
+                "call_llm",
+                side_effect=AssertionError("matching failure cache must be reused"),
+            ):
+                style = audio_to_subtitle.analyze_movie_style(
+                    source,
+                    "qwen3.5:122b",
+                    artifact_path,
+                )
+
+        self.assertEqual(style, cached)
 
     def test_movie_terminology_review_only_applies_high_confidence_fixes(self) -> None:
         source = [
@@ -1368,6 +1932,38 @@ class DisplayCleanupTests(unittest.TestCase):
             "source_language_changed",
         )
 
+    def test_independent_final_qa_ignores_rejection_for_hidden_artifact(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 1.0,
+                "end": 3.0,
+                "text": "%uh",
+                "en": "%uh",
+                "zh": "",
+                "source_language": "en",
+                "display": False,
+                "suppression_reason": "ocr_artifact",
+            }
+        ]
+        response = (
+            '[{"index":0,"corrected_english":"Hello",'
+            '"corrected_chinese":"","display":false,"terminology":[]}]'
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_path = Path(tmpdir) / "final-qa.json"
+            with patch.object(audio_to_subtitle, "call_llm", return_value=response):
+                output, report = audio_to_subtitle.run_final_subtitle_qa(
+                    source,
+                    "qwen3:30b",
+                    artifact_path,
+                )
+
+        self.assertEqual(output, source)
+        self.assertEqual(report["status"], "pass")
+        self.assertEqual(report["rejected_count"], 0)
+
     def test_independent_final_qa_preserves_manual_review(self) -> None:
         source = [
             {
@@ -1416,6 +2012,48 @@ class DisplayCleanupTests(unittest.TestCase):
 
         self.assertIn("John => \u7ea6\u7ff0", prompt_glossary)
         self.assertIn("Term 299 => \u672f\u8bed299", prompt_glossary)
+
+    def test_longer_name_mapping_supersedes_overlapping_short_name(self) -> None:
+        entries = [
+            {"source": "Lou", "target": "露"},
+            {"source": "Lou Paget", "target": "卢·佩吉"},
+        ]
+
+        applicable = audio_to_subtitle.applicable_terminology_entries(
+            entries,
+            "Here is Lou Paget with advice.",
+        )
+        glossary = {
+            entry["source"].casefold(): entry
+            for entry in entries
+        }
+        prompt_glossary = audio_to_subtitle.format_terminology_glossary(
+            glossary,
+            "Here is Lou Paget with advice.",
+        )
+        conflicts = audio_to_subtitle.terminology_conflicts(
+            glossary,
+            "Here is Lou Paget with advice.",
+            "下面由卢·佩吉提供建议。",
+        )
+
+        self.assertEqual(applicable, [entries[1]])
+        self.assertIn("Lou Paget => 卢·佩吉", prompt_glossary)
+        self.assertNotIn("- Lou => 露", prompt_glossary)
+        self.assertEqual(conflicts, [])
+
+    def test_short_name_mapping_applies_at_independent_occurrence(self) -> None:
+        entries = [
+            {"source": "Lou", "target": "露"},
+            {"source": "Lou Paget", "target": "卢·佩吉"},
+        ]
+
+        applicable = audio_to_subtitle.applicable_terminology_entries(
+            entries,
+            "Lou met Lou Paget.",
+        )
+
+        self.assertEqual(applicable, entries)
 
     def test_translation_retries_when_known_name_mapping_is_inconsistent(self) -> None:
         source = [
@@ -1523,6 +2161,176 @@ class DisplayCleanupTests(unittest.TestCase):
             self.assertTrue(source_manifest["assets"])
             self.assertTrue(processing_plan["execution"]["source_cache_reused"])
             self.assertEqual(processing_plan["execution"]["local_gpu"], [])
+
+    def test_main_persists_autonomous_review_output_before_delivery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video = root / "video.mp4"
+            video.write_bytes(b"placeholder")
+            output_root = root / "out"
+            out_dir = output_root / "Series" / "Episode"
+            out_dir.mkdir(parents=True)
+            source_segments = [
+                {
+                    "id": index,
+                    "start": float(index * 2 + 1),
+                    "end": float(index * 2 + 2),
+                    "text": f"Source line {index}.",
+                    "source_language": "en",
+                }
+                for index in range(12)
+            ]
+            (out_dir / "Episode.segments.source.json").write_text(
+                json.dumps(source_segments, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            processed = [
+                {
+                    **segment,
+                    "en": segment["text"],
+                    "zh": f"\u8bd1\u6587 {segment['id']}",
+                    "display": True,
+                }
+                for segment in source_segments
+            ]
+
+            def autonomous_review(segments, model, artifact_path, **kwargs):
+                reviewed = [dict(segment) for segment in segments]
+                reviewed[0]["zh"] = "\u591c\u95f4\u590d\u6838\u5df2\u4fee\u6b63"
+                report = {
+                    "version": 1,
+                    "status": "pass",
+                    "llm_model": model,
+                    "rounds_requested": kwargs["rounds"],
+                    "rounds_completed": kwargs["rounds"],
+                    "reviewed_count": len(reviewed),
+                    "changed_count": 1,
+                    "rejected_count": 0,
+                    "rejected_items": [],
+                    "segments": reviewed,
+                }
+                audio_to_subtitle.write_json_atomic(artifact_path, report)
+                return reviewed, report
+
+            argv = [
+                "audio_to_subtitle.py",
+                "--video",
+                str(video),
+                "--source",
+                "audio",
+                "--output-root",
+                str(output_root),
+                "--series-name",
+                "Series",
+                "--movie-name",
+                "Episode",
+                "--llm-model",
+                "qwen3.5:122b",
+                "--autonomous-review-rounds",
+                "2",
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(
+                    audio_to_subtitle,
+                    "extract_audio",
+                    side_effect=AssertionError("extract_audio called"),
+                ),
+                patch.object(
+                    audio_to_subtitle,
+                    "transcribe_audio",
+                    side_effect=AssertionError("transcribe_audio called"),
+                ),
+                patch.object(
+                    audio_to_subtitle,
+                    "translate_and_correct_segments",
+                    return_value=processed,
+                ),
+                patch.object(
+                    audio_to_subtitle,
+                    "analyze_movie_style",
+                    return_value={
+                        "version": 1,
+                        "status": "pass",
+                        "input_fingerprint": "style",
+                        "terminology": [],
+                    },
+                ),
+                patch.object(
+                    audio_to_subtitle,
+                    "review_movie_terminology",
+                    return_value=(
+                        [],
+                        {
+                            "status": "pass",
+                            "input_fingerprint": "terms",
+                            "reviewed_count": 0,
+                            "correction_count": 0,
+                            "unapplied_count": 0,
+                        },
+                    ),
+                ),
+                patch.object(
+                    audio_to_subtitle,
+                    "run_final_subtitle_qa",
+                    return_value=(
+                        processed,
+                        {
+                            "version": audio_to_subtitle.FINAL_QA_POLICY_VERSION,
+                            "status": "pass",
+                            "llm_model": "qwen3.5:122b",
+                            "reviewed_count": len(processed),
+                            "changed_count": 0,
+                            "rejected_count": 0,
+                            "rejected_items": [],
+                            "segments": processed,
+                        },
+                    ),
+                ),
+                patch.object(
+                    audio_to_subtitle,
+                    "run_autonomous_subtitle_review",
+                    side_effect=autonomous_review,
+                ) as run_autonomous,
+                patch.object(
+                    audio_to_subtitle,
+                    "probe_video_play_resolution",
+                    return_value=(1920, 1080),
+                ),
+                patch.object(audio_to_subtitle, "detect_scene_cuts", return_value=[]),
+                patch.object(
+                    audio_to_subtitle,
+                    "validate_ass_rendering",
+                    return_value={"status": "pass", "preview_path": ""},
+                ),
+                patch.object(
+                    audio_to_subtitle,
+                    "probe_video_duration_seconds",
+                    return_value=26.0,
+                ),
+            ):
+                audio_to_subtitle.main()
+
+            checkpoint = json.loads(
+                (out_dir / "Episode.segments.checkpoint.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            quality = json.loads(
+                (out_dir / "Episode.quality-report.json").read_text(encoding="utf-8")
+            )
+
+        run_autonomous.assert_called_once()
+        self.assertEqual(checkpoint[0]["zh"], "\u591c\u95f4\u590d\u6838\u5df2\u4fee\u6b63")
+        self.assertEqual(
+            quality["artifacts"]["autonomous_review"],
+            str(out_dir / "Episode.autonomous-review.json"),
+        )
+        self.assertEqual(
+            quality["checks"]["independent_final_qa"]["result"],
+            "pass",
+        )
 
     def test_main_reuses_audio_cache_from_previous_sync_policy(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1640,6 +2448,74 @@ class DisplayCleanupTests(unittest.TestCase):
 
             self.assertNotEqual(first_fingerprint, second_fingerprint)
             self.assertFalse(source_cache_matches_request(cached, second_fingerprint))
+
+    def test_source_cache_fingerprint_changes_with_sidecar_text_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video = root / "movie.mkv"
+            english = root / "movie.en.srt"
+            video.write_bytes(b"video")
+            english.write_text("subtitle", encoding="utf-8")
+            authored_args = SimpleNamespace(
+                source="sidecar",
+                merge_existing_subtitles="yes",
+                english_subtitle_text_authority="authored",
+            )
+            ocr_args = SimpleNamespace(
+                source="sidecar",
+                merge_existing_subtitles="yes",
+                english_subtitle_text_authority="ocr",
+            )
+
+            authored = build_source_request_fingerprint(
+                video,
+                video,
+                authored_args,
+                english_sidecar_path=english,
+            )
+            ocr = build_source_request_fingerprint(
+                video,
+                video,
+                ocr_args,
+                english_sidecar_path=english,
+            )
+
+        self.assertNotEqual(authored, ocr)
+
+    def test_source_cache_language_ignores_hidden_credit_lane(self) -> None:
+        cached = [
+            {
+                "id": 0,
+                "start": 0.1,
+                "end": 6.0,
+                "text": "== \u5b57\u5e55\u5236\u4f5c ==",
+                "source_language": "zh",
+                "display": False,
+                "non_content_credit": True,
+            },
+            {
+                "id": 1,
+                "start": 0.75,
+                "end": 3.83,
+                "text": "Tonight on the programme",
+                "source_language": "en",
+            },
+            {
+                "id": 2,
+                "start": 3.83,
+                "end": 7.0,
+                "text": "The next spoken line",
+                "source_language": "en",
+            },
+        ]
+
+        self.assertTrue(
+            audio_to_subtitle.source_cache_matches_requested_language(
+                cached,
+                "en",
+                "source",
+            )
+        )
 
     def test_source_request_accepts_equivalent_auto_and_explicit_sync_audio(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1925,7 +2801,7 @@ class DisplayCleanupTests(unittest.TestCase):
         full_cleanup.assert_not_called()
         self.assertEqual(result["run_mode"], "reprocess")
 
-    def test_frontend_remote_run_uses_its_own_tunnel_port(self) -> None:
+    def test_frontend_remote_run_uses_persistent_bridge_port(self) -> None:
         class FakeProcess:
             pid = 54322
 
@@ -1933,14 +2809,11 @@ class DisplayCleanupTests(unittest.TestCase):
             def poll():
                 return None
 
-        class FakeTunnel:
-            @staticmethod
-            def status():
-                return {"connected": True, "local_port": 32123}
-
         captured_env = {}
+        captured_args = []
 
-        def popen(_args, **kwargs):
+        def popen(args, **kwargs):
+            captured_args.extend(args)
             captured_env.update(kwargs["env"])
             return FakeProcess()
 
@@ -1957,11 +2830,18 @@ class DisplayCleanupTests(unittest.TestCase):
                 "movie_name": "Episode",
                 "source": "audio",
                 "llm_model": "remote:AI Server:qwen3:30b",
+                "chinese_subtitle_text_authority": "authored",
+                "english_subtitle_text_authority": "ocr",
+                "autonomous_review_rounds": 2,
             }
             subtitle_frontend.RUNS.clear()
             try:
                 with (
-                    patch.object(subtitle_frontend, "tunnel_manager", FakeTunnel()),
+                    patch.object(
+                        subtitle_frontend,
+                        "remote_ollama_base_url",
+                        return_value="http://127.0.0.1:32123",
+                    ),
                     patch.object(subtitle_frontend, "frontend_log_paths", return_value=(log_path, err_path)),
                     patch.object(subtitle_frontend.subprocess, "Popen", side_effect=popen),
                 ):
@@ -1970,13 +2850,24 @@ class DisplayCleanupTests(unittest.TestCase):
                 subtitle_frontend.RUNS.clear()
 
         self.assertEqual(captured_env["SUBTITLE_REMOTE_OLLAMA_URL"], "http://127.0.0.1:32123")
+        self.assertEqual(
+            captured_args[
+                captured_args.index("--chinese-subtitle-text-authority") + 1
+            ],
+            "authored",
+        )
+        self.assertEqual(
+            captured_args[
+                captured_args.index("--english-subtitle-text-authority") + 1
+            ],
+            "ocr",
+        )
+        self.assertEqual(
+            captured_args[captured_args.index("--autonomous-review-rounds") + 1],
+            "2",
+        )
 
-    def test_frontend_rejects_remote_run_without_its_own_tunnel(self) -> None:
-        class DisconnectedTunnel:
-            @staticmethod
-            def status():
-                return {"connected": False, "local_port": None}
-
+    def test_frontend_rejects_remote_run_without_ready_bridge(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             video = root / "movie.mp4"
@@ -1990,13 +2881,17 @@ class DisplayCleanupTests(unittest.TestCase):
                 "llm_model": "remote:AI Server:qwen3:30b",
             }
             with (
-                patch.object(subtitle_frontend, "tunnel_manager", DisconnectedTunnel()),
+                patch.object(
+                    subtitle_frontend,
+                    "remote_ollama_base_url",
+                    side_effect=RuntimeError("远程 Ollama 桥接尚未就绪"),
+                ),
                 patch.object(
                     subtitle_frontend.subprocess,
                     "Popen",
-                    side_effect=AssertionError("remote process was launched without a tunnel"),
+                    side_effect=AssertionError("remote process was launched without a bridge"),
                 ),
-                self.assertRaisesRegex(RuntimeError, "尚未连接远程服务器"),
+                self.assertRaisesRegex(RuntimeError, "桥接尚未就绪"),
             ):
                 subtitle_frontend.start_processing(payload)
 
@@ -2024,6 +2919,34 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertEqual(result, "ok")
         self.assertEqual(captured["base_url"], "http://127.0.0.1:32123")
         self.assertEqual(captured["payload"]["model"], "qwen3:30b")
+
+    def test_remote_llm_can_match_an_existing_runner_context(self) -> None:
+        captured = {}
+
+        def post_chat(base_url, payload):
+            captured["base_url"] = base_url
+            captured["payload"] = payload
+            return {"message": {"content": "ok"}}
+
+        with (
+            patch.dict(
+                audio_to_subtitle.os.environ,
+                {
+                    "SUBTITLE_REMOTE_OLLAMA_URL": "http://127.0.0.1:32123",
+                    "SUBTITLE_REMOTE_OLLAMA_NUM_CTX": "262144",
+                },
+                clear=False,
+            ),
+            patch.object(audio_to_subtitle, "post_ollama_chat", side_effect=post_chat),
+        ):
+            result = audio_to_subtitle.call_llm(
+                "prompt",
+                model="remote:AI Server:qwen3.5:122b",
+                role="proofread",
+            )
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(captured["payload"]["options"]["num_ctx"], 262144)
 
     def test_llm_role_applies_explicit_generation_profile_and_json_schema(self) -> None:
         captured = {}
@@ -2193,6 +3116,193 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertEqual(report["manual_override_count"], 1)
         self.assertEqual(report["output_fingerprint"], report["input_fingerprint"])
 
+    def test_autonomous_review_runs_distinct_passes_and_reuses_summary(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 1.0,
+                "end": 2.5,
+                "text": "John is here.",
+                "en": "John is here.",
+                "zh": "\u7ea6\u7ff0\u6765\u4e86\u3002",
+                "display": True,
+                "source_language": "en",
+                "source_text_authority": "authored",
+            }
+        ]
+        responses = [
+            json.dumps(
+                [
+                    {
+                        "index": 0,
+                        "corrected_english": "John is here.",
+                        "corrected_chinese": "\u7ea6\u7ff0\u5df2\u7ecf\u5230\u4e86\u3002",
+                        "display": True,
+                        "terminology": [],
+                    }
+                ],
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                [
+                    {
+                        "index": 0,
+                        "corrected_english": "John is here.",
+                        "corrected_chinese": "\u7ea6\u7ff0\u5df2\u7ecf\u5230\u4e86\u3002",
+                        "display": True,
+                        "terminology": [],
+                    }
+                ],
+                ensure_ascii=False,
+            ),
+        ]
+        prompts = []
+        seeds = []
+
+        def call_llm(prompt, *_args, **kwargs):
+            prompts.append(prompt)
+            seeds.append(kwargs.get("seed_offset"))
+            return responses[len(prompts) - 1]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_path = Path(tmpdir) / "episode.autonomous-review.json"
+            with patch.object(audio_to_subtitle, "call_llm", side_effect=call_llm):
+                output, report = audio_to_subtitle.run_autonomous_subtitle_review(
+                    source,
+                    "qwen3.5:122b",
+                    artifact_path,
+                    rounds=2,
+                    batch_size=8,
+                )
+
+            self.assertTrue(
+                audio_to_subtitle.autonomous_review_round_artifact_path(
+                    artifact_path,
+                    1,
+                ).exists()
+            )
+            self.assertTrue(
+                audio_to_subtitle.autonomous_review_round_artifact_path(
+                    artifact_path,
+                    2,
+                ).exists()
+            )
+            with patch.object(
+                audio_to_subtitle,
+                "call_llm",
+                side_effect=AssertionError("completed autonomous review reran"),
+            ):
+                cached_output, cached_report = (
+                    audio_to_subtitle.run_autonomous_subtitle_review(
+                        output,
+                        "qwen3.5:122b",
+                        artifact_path,
+                        rounds=2,
+                        batch_size=8,
+                    )
+                )
+
+        self.assertIn("PROFILE: semantic_integrity", prompts[0])
+        self.assertIn("PROFILE: professional_readability", prompts[1])
+        self.assertEqual(seeds, [1000, 2000])
+        self.assertEqual(output[0]["zh"], "\u7ea6\u7ff0\u5df2\u7ecf\u5230\u4e86\u3002")
+        self.assertEqual(report["status"], "pass")
+        self.assertEqual(report["rounds_completed"], 2)
+        self.assertEqual(len(report["round_reports"]), 2)
+        self.assertEqual(cached_output[0]["zh"], output[0]["zh"])
+        self.assertEqual(cached_report["output_fingerprint"], report["output_fingerprint"])
+
+    def test_autonomous_review_failure_preserves_last_valid_round(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 1.0,
+                "end": 2.0,
+                "text": "Hello.",
+                "en": "Hello.",
+                "zh": "\u4f60\u597d\u3002",
+                "display": True,
+            }
+        ]
+        first_round = [{**source[0], "zh": "\u4f60\u597d\uff01"}]
+        first_report = {
+            "status": "pass",
+            "reviewed_count": 1,
+            "changed_count": 1,
+            "rejected_count": 0,
+            "changes": [{"id": 0, "start": 1.0, "fields": ["zh"]}],
+            "rejected_items": [],
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_path = Path(tmpdir) / "episode.autonomous-review.json"
+            with patch.object(
+                audio_to_subtitle,
+                "run_final_subtitle_qa",
+                side_effect=[
+                    (first_round, first_report),
+                    RuntimeError("remote model unavailable"),
+                ],
+            ):
+                output, report = audio_to_subtitle.run_autonomous_subtitle_review(
+                    source,
+                    "qwen3.5:122b",
+                    artifact_path,
+                    rounds=2,
+                )
+            persisted = json.loads(artifact_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(output[0]["zh"], "\u4f60\u597d\uff01")
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["rounds_completed"], 1)
+        self.assertEqual(report["failed_round"], 2)
+        self.assertEqual(persisted["segments"][0]["zh"], "\u4f60\u597d\uff01")
+        self.assertIn("remote model unavailable", persisted["error"])
+
+    def test_autonomous_review_never_overwrites_manual_subtitle(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 1.0,
+                "end": 2.0,
+                "text": "Hello.",
+                "en": "Hello!",
+                "zh": "\u4f60\u597d\uff01",
+                "display": True,
+                "source_language": "en",
+                "manual_reviewed_at": "2026-08-01T20:00:00+00:00",
+            }
+        ]
+        response = json.dumps(
+            [
+                {
+                    "index": 0,
+                    "corrected_english": "Goodbye.",
+                    "corrected_chinese": "\u518d\u89c1\u3002",
+                    "display": True,
+                    "terminology": [],
+                }
+            ],
+            ensure_ascii=False,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(
+                audio_to_subtitle,
+                "call_llm",
+                return_value=response,
+            ):
+                output, report = audio_to_subtitle.run_autonomous_subtitle_review(
+                    source,
+                    "qwen3.5:122b",
+                    Path(tmpdir) / "episode.autonomous-review.json",
+                    rounds=2,
+                )
+
+        self.assertEqual(output[0]["en"], "Hello!")
+        self.assertEqual(output[0]["zh"], "\u4f60\u597d\uff01")
+        self.assertEqual(report["manual_preserved_count"], 1)
+
     def test_structured_json_repairs_only_unquoted_schema_strings(self) -> None:
         response_schema = audio_to_subtitle.indexed_subtitle_schema(2, "proofread")
         malformed = """[
@@ -2227,6 +3337,46 @@ class DisplayCleanupTests(unittest.TestCase):
         with self.assertRaises(json.JSONDecodeError):
             audio_to_subtitle.parse_json_response(malformed)
 
+    def test_structured_json_repairs_unescaped_quotes_in_schema_strings(self) -> None:
+        response_schema = audio_to_subtitle.indexed_subtitle_schema(1, "proofread")
+        malformed = """[
+  {
+    "index": 0,
+    "corrected_english": "He called it "the signal".",
+    "corrected_chinese": "他说这是"信号"。",
+    "display": true,
+    "terminology": []
+  }
+]"""
+
+        parsed = audio_to_subtitle.parse_json_response(
+            malformed,
+            response_schema=response_schema,
+        )
+
+        self.assertEqual(parsed[0]["corrected_english"], 'He called it "the signal".')
+        self.assertEqual(parsed[0]["corrected_chinese"], '他说这是"信号"。')
+
+    def test_structured_json_repairs_empty_schema_string_value(self) -> None:
+        response_schema = audio_to_subtitle.indexed_subtitle_schema(1, "proofread")
+        malformed = """[
+  {
+    "index": 0,
+    "corrected_english": "Music",
+    "corrected_chinese": ,
+    "display": false,
+    "terminology": []
+  }
+]"""
+
+        parsed = audio_to_subtitle.parse_json_response(
+            malformed,
+            response_schema=response_schema,
+        )
+
+        self.assertEqual(parsed[0]["corrected_chinese"], "")
+        self.assertFalse(parsed[0]["display"])
+
     def test_structured_json_repairs_concatenated_objects_as_array(self) -> None:
         response_schema = audio_to_subtitle.indexed_terminology_schema(2)
         malformed = """{
@@ -2253,6 +3403,19 @@ class DisplayCleanupTests(unittest.TestCase):
 
         self.assertEqual(validated[0]["target"], "\u827e\u5947")
         self.assertEqual(validated[1]["target"], "\u827e\u6d1b\u514b")
+
+    def test_terminology_review_accepts_single_unwrapped_object(self) -> None:
+        validated = audio_to_subtitle.validate_terminology_review_response(
+            {
+                "index": 0,
+                "target": "\u9634\u8482",
+                "confidence": 1.0,
+                "decision": "keep",
+            },
+            1,
+        )
+
+        self.assertEqual(validated[0]["target"], "\u9634\u8482")
 
     def test_structured_json_does_not_repair_non_string_schema_values(self) -> None:
         response_schema = audio_to_subtitle.indexed_subtitle_schema(1, "proofread")
@@ -2763,6 +3926,180 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertEqual((pieces[0]["start"], pieces[0]["end"]), (10.0, 18.0))
         self.assertTrue(pieces[0]["unanchored_split_avoided"])
 
+    def test_unanchored_ocr_cue_splits_only_during_final_layout(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 10.0,
+                "end": 18.0,
+                "text": "This OCR cue has no word timestamps but still needs readable splits.",
+                "en": "This OCR cue has no word timestamps but still needs readable splits.",
+                "zh": "\u8fd9\u6761OCR\u5b57\u5e55\u6ca1\u6709\u8bcd\u7ea7\u65f6\u95f4\u952e\u4f46\u4ecd\u9700\u62c6\u5206",
+                "timing_origin": "existing_subtitle",
+                "source_text_authority": "ocr",
+            }
+        ]
+
+        source_stage = split_segments_for_subtitles(
+            source,
+            max_words=4,
+            max_chars=20,
+            max_duration=3.0,
+        )
+        pieces = split_segments_for_subtitles(
+            source,
+            max_words=4,
+            max_chars=20,
+            max_duration=3.0,
+            layout_policy=audio_to_subtitle.build_layout_policy(
+                (1920, 1080),
+                profile_name="adaptive",
+                font_name="",
+                font_scale=100,
+            ),
+        )
+
+        self.assertEqual(len(source_stage), 1)
+        self.assertTrue(source_stage[0]["unanchored_split_avoided"])
+        self.assertGreater(len(pieces), 1)
+        self.assertEqual(pieces[0]["start"], 10.0)
+        self.assertEqual(pieces[-1]["end"], 18.0)
+        self.assertTrue(
+            all(piece["split_timing_basis"] == "proportional" for piece in pieces)
+        )
+        self.assertTrue(
+            all(
+                float(piece["end"]) - float(piece["start"]) <= 3.0
+                for piece in pieces
+            )
+        )
+
+    def test_final_layout_splits_longer_language_independently(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 10.0,
+                "end": 14.0,
+                "text": "intercourse.",
+                "en": "intercourse.",
+                "zh": "[\u8a79\u59ae\u5f17\u00b7\u4f2f\u66fc\u533b\u751f] \u6570\u636e\u663e\u793a\u53ea\u670930%\u7684\u5973\u6027\u53ef\u4ee5\u901a\u8fc7\u4f20\u7edf\u6027\u4ea4\u83b7\u5f97\u9ad8\u6f6e",
+                "timing_origin": "existing_subtitle",
+                "source_text_authority": "ocr",
+            }
+        ]
+        layout = audio_to_subtitle.build_layout_policy(
+            (1920, 1080),
+            profile_name="adaptive",
+            font_name="",
+            font_scale=100,
+        )
+
+        pieces = split_segments_for_subtitles(
+            source,
+            max_words=12,
+            max_chars=42,
+            max_duration=5.5,
+            layout_policy=layout,
+        )
+
+        self.assertGreater(len(pieces), 1)
+        self.assertEqual(
+            " ".join(piece["en"] for piece in pieces if piece.get("en")),
+            "intercourse.",
+        )
+        self.assertEqual(
+            "".join(piece["zh"] for piece in pieces if piece.get("zh")).replace(" ", ""),
+            source[0]["zh"].replace(" ", ""),
+        )
+        self.assertTrue(
+            all(
+                not piece.get("zh")
+                or layout.fits(
+                    piece["zh"],
+                    "zh",
+                    bilingual=bool(piece.get("en") and piece.get("zh")),
+                )
+                for piece in pieces
+            )
+        )
+
+    def test_final_layout_never_creates_proportional_flashes_below_minimum_duration(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 166.14,
+                "end": 169.83,
+                "text": "tentative sex alone the data suggest that",
+                "en": (
+                    "The data suggest that only 30 percent of women can achieve "
+                    "orgasm with traditional penile-vaginal intercourse."
+                ),
+                "zh": "\u6570\u636e\u663e\u793a\uff0c\u4ec530%\u7684\u5973\u6027\u80fd\u901a\u8fc7\u4f20\u7edf\u6027\u4ea4\u8fbe\u5230\u9ad8\u6f6e\u3002",
+                "timing_origin": "existing_subtitle",
+                "source_text_authority": "ocr",
+            }
+        ]
+        layout = audio_to_subtitle.build_layout_policy(
+            (1964, 1080),
+            profile_name="adaptive",
+            font_name="Microsoft YaHei",
+            font_scale=100,
+        )
+
+        pieces = split_segments_for_subtitles(
+            source,
+            max_words=12,
+            max_chars=42,
+            max_duration=5.5,
+            layout_policy=layout,
+        )
+
+        self.assertLessEqual(len(pieces), 4)
+        self.assertTrue(
+            all(
+                float(piece["end"]) - float(piece["start"])
+                >= audio_to_subtitle.MIN_SUBTITLE_DURATION - 0.001
+                for piece in pieces
+            )
+        )
+        self.assertTrue(all(len(piece["en"]) <= 42 for piece in pieces))
+
+    def test_compact_layout_never_splits_latin_acronym_inside_chinese(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 10.0,
+                "end": 15.5,
+                "text": "prostatic specific antigen",
+                "en": "prostatic specific antigen",
+                "zh": "\u53ca\u524d\u5217\u817a\u7279\u5f02\u6297\u539f\uff08PSA\uff09",
+                "timing_origin": "existing_subtitle",
+                "source_text_authority": "ocr",
+            }
+        ]
+        layout = audio_to_subtitle.build_layout_policy(
+            (1920, 1080),
+            profile_name="adaptive",
+            font_name="",
+            font_scale=100,
+        )
+
+        pieces = split_segments_for_subtitles(
+            source,
+            max_words=12,
+            max_chars=8,
+            max_duration=5.5,
+            layout_policy=layout,
+        )
+
+        self.assertTrue(any("\uff08PSA\uff09" in piece.get("zh", "") for piece in pieces))
+        self.assertFalse(
+            any(
+                piece.get("zh", "") in {"P", "PS", "PSA", "SA", "A", "SA\uff09", "A\uff09"}
+                for piece in pieces
+            )
+        )
+
     def test_bilingual_output_uses_independent_one_line_limits(self) -> None:
         source = [
             {
@@ -2810,6 +4147,308 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertGreaterEqual(len(pieces), 2)
         self.assertTrue(pieces[0]["en"].endswith(","))
         self.assertTrue(pieces[0]["zh"].endswith("，"))
+
+    def test_balanced_chinese_split_never_breaks_inside_book_title(self) -> None:
+        chunks = audio_to_subtitle.split_text_balanced(
+            "今晚，《21世纪性爱指南》",
+            2,
+            "",
+            max_chars=16,
+        )
+
+        self.assertEqual(chunks, ["今晚，", "《21世纪性爱指南》"])
+
+    def test_balanced_chinese_split_preserves_words_and_names(self) -> None:
+        names = audio_to_subtitle.split_text_balanced(
+            (
+                "每周，本节目性学专家艾娃·凯德尔医生和来自洛杉矶的"
+                "卢·佩吉都会带来私人指导，从锻炼阴道肌肉的负重器具，"
+                "到增强高潮感受的乳霜，无所不包。"
+            ),
+            6,
+            "",
+            max_chars=16,
+        )
+        teaser = audio_to_subtitle.split_text_balanced(
+            (
+                "今晚我们将探讨：为什么衰老并不意味着性生活的终结，"
+                "以及为何有些男人迷恋公共场所性爱的刺激与危险。"
+            ),
+            4,
+            "",
+            max_chars=16,
+        )
+
+        self.assertFalse(any(chunk.endswith("艾娃") for chunk in names))
+        self.assertFalse(any(chunk.startswith("·凯德尔") for chunk in names))
+        self.assertFalse(any(chunk.startswith("的") for chunk in names[1:]))
+        self.assertFalse(any(chunk.endswith("衰") for chunk in teaser))
+        self.assertFalse(any(chunk.startswith("老") for chunk in teaser))
+        self.assertFalse(any(chunk.endswith("公") for chunk in teaser))
+        self.assertFalse(any(chunk.startswith("共") for chunk in teaser))
+        self.assertTrue(all(len(chunk) <= 16 for chunk in [*names, *teaser]))
+
+    def test_balanced_split_prefers_boundary_after_long_lower_third(self) -> None:
+        chinese = (
+            "[凯瑟琳·胡德医生，性健康与两性关系专家]"
+            "本系列将探讨性爱的各个方面，为你提供技巧和建议。"
+        )
+        english = (
+            "[Dr. Catherine Hood, Sex Health and Relationship Expert] "
+            "In this series, we examine every aspect of lovemaking."
+        )
+
+        chinese_chunks = audio_to_subtitle.split_text_balanced(
+            chinese,
+            4,
+            "",
+            max_chars=16,
+        )
+        english_chunks = audio_to_subtitle.split_text_balanced(
+            english,
+            4,
+            " ",
+            max_chars=42,
+            max_words=12,
+        )
+
+        self.assertEqual("".join(chinese_chunks), chinese)
+        self.assertEqual(" ".join(english_chunks), english)
+        self.assertFalse(any("]本" in chunk for chunk in chinese_chunks))
+        self.assertFalse(any("] In" in chunk for chunk in english_chunks))
+        self.assertTrue(any(chunk.endswith("]") for chunk in chinese_chunks))
+        self.assertTrue(any(chunk.endswith("]") for chunk in english_chunks))
+
+    def test_bilingual_split_keeps_long_lower_third_intact_with_dialogue(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 24.0,
+                "end": 44.0,
+                "text": (
+                    "[Dr. Catherine Hood, Sex Health and Relationship Expert] "
+                    "In this series, we examine every aspect of lovemaking, "
+                    "bringing you tips, advice and new techniques to give you "
+                    "greater confidence and invigorate your sex life. Every "
+                    "week, we explore the world's most popular sexual positions "
+                    "in detail."
+                ),
+                "en": (
+                    "[Dr. Catherine Hood, Sex Health and Relationship Expert] "
+                    "In this series, we examine every aspect of lovemaking, "
+                    "bringing you tips, advice and new techniques to give you "
+                    "greater confidence and invigorate your sex life. Every "
+                    "week, we explore the world's most popular sexual positions "
+                    "in detail."
+                ),
+                "zh": (
+                    "[凯瑟琳·胡德医生，性健康与两性关系专家]"
+                    "本系列将探讨性爱的各个方面，为你提供技巧、建议和新方法，"
+                    "帮助你增强信心，为性生活注入活力。"
+                    "每周我们都会详细解析世界上最常见的性爱体位。"
+                ),
+            }
+        ]
+
+        pieces = split_segments_for_subtitles(
+            source,
+            max_words=12,
+            max_chars=42,
+            max_duration=5.5,
+        )
+
+        self.assertTrue(any("] In" in piece["en"] for piece in pieces))
+        self.assertTrue(any("]本" in piece["zh"] for piece in pieces))
+        self.assertFalse(
+            any(
+                piece["en"]
+                == "[Dr. Catherine Hood, Sex Health and Relationship Expert]"
+                for piece in pieces
+            )
+        )
+        self.assertFalse(
+            any(
+                piece["zh"] == "[凯瑟琳·胡德医生，性健康与两性关系专家]"
+                for piece in pieces
+            )
+        )
+        self.assertEqual(
+            sum(
+                "[Dr. Catherine Hood, Sex Health and Relationship Expert]"
+                in piece["en"]
+                for piece in pieces
+            ),
+            1,
+        )
+        self.assertEqual(
+            sum(
+                "[凯瑟琳·胡德医生，性健康与两性关系专家]" in piece["zh"]
+                for piece in pieces
+            ),
+            1,
+        )
+
+    def test_bilingual_split_attaches_short_lower_third_to_dialogue(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 24.0,
+                "end": 32.0,
+                "text": "[Dr. Hood] Hello everyone. We begin now.",
+                "en": "[Dr. Hood] Hello everyone. We begin now.",
+                "zh": "[胡德医生]大家好。现在开始。",
+            }
+        ]
+
+        pieces = split_segments_for_subtitles(
+            source,
+            max_words=12,
+            max_chars=42,
+            max_duration=5.5,
+        )
+
+        self.assertTrue(pieces[0]["en"].startswith("[Dr. Hood] Hello"))
+        self.assertTrue(pieces[0]["zh"].startswith("[胡德医生]大家好"))
+        self.assertFalse(any(piece["en"] == "[Dr. Hood]" for piece in pieces))
+        self.assertFalse(any(piece["zh"] == "[胡德医生]" for piece in pieces))
+
+    def test_bilingual_split_aligns_multiple_speaker_labels(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 24.0,
+                "end": 39.0,
+                "text": (
+                    "[Alice] This English sentence is deliberately longer "
+                    "than its translation. [Bob] Short reply."
+                ),
+                "en": (
+                    "[Alice] This English sentence is deliberately longer "
+                    "than its translation. [Bob] Short reply."
+                ),
+                "zh": (
+                    "[爱丽丝]这句中文很短。"
+                    "[鲍勃]这句中文回答故意比英文更长一些。"
+                ),
+            }
+        ]
+
+        pieces = split_segments_for_subtitles(
+            source,
+            max_words=12,
+            max_chars=42,
+            max_duration=5.5,
+        )
+
+        for piece in pieces:
+            english_has_label = "[" in piece["en"]
+            chinese_has_label = "[" in piece["zh"]
+            self.assertEqual(english_has_label, chinese_has_label)
+        self.assertTrue(
+            any("[Alice]" in piece["en"] and "This" in piece["en"] for piece in pieces)
+        )
+        self.assertTrue(
+            any("[Bob]" in piece["en"] and piece["en"] != "[Bob]" for piece in pieces)
+        )
+
+    def test_bilingual_split_keeps_corresponding_sentences_together(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 0.0,
+                "end": 10.0,
+                "text": (
+                    "Alpha explains the longer first point. "
+                    "Beta ends."
+                ),
+                "en": (
+                    "Alpha explains the longer first point. "
+                    "Beta ends."
+                ),
+                "zh": "甲项很短。乙项给出较长中文解释。",
+            }
+        ]
+
+        pieces = split_segments_for_subtitles(
+            source,
+            max_words=12,
+            max_chars=42,
+            max_duration=5.5,
+        )
+
+        self.assertEqual(len(pieces), 2)
+        self.assertIn("Alpha", pieces[0]["en"])
+        self.assertIn("甲", pieces[0]["zh"])
+        self.assertIn("Beta", pieces[1]["en"])
+        self.assertIn("乙", pieces[1]["zh"])
+
+    def test_word_allocation_prefers_a_clear_speech_pause(self) -> None:
+        words = [
+            {"word": "one", "start": 0.0, "end": 0.4},
+            {"word": "two", "start": 0.5, "end": 0.9},
+            {"word": "three.", "start": 1.0, "end": 1.4},
+            {"word": "four", "start": 4.0, "end": 4.4},
+            {"word": "five", "start": 4.5, "end": 4.9},
+            {"word": "six", "start": 5.0, "end": 5.4},
+        ]
+
+        groups = audio_to_subtitle.allocate_words_to_chunks(
+            words,
+            ["Brief.", "A deliberately much longer second subtitle chunk."],
+            compact_text=False,
+            max_duration=5.5,
+        )
+
+        self.assertEqual(
+            [word["word"] for word in groups[0]],
+            ["one", "two", "three."],
+        )
+        self.assertEqual(
+            [word["word"] for word in groups[1]],
+            ["four", "five", "six"],
+        )
+
+    def test_corrected_english_can_anchor_splits_to_asr_word_timestamps(self) -> None:
+        source = {
+            "id": 0,
+            "start": 0.0,
+            "end": 10.0,
+            "text": "one two three four five six seven eight nine ten",
+            "en": (
+                "Brief start. This is the much longer corrected ending."
+            ),
+            "zh": "简短开场。随后是一句明显更长的校正文稿。",
+            "word_timing_track": "en",
+            "words": [
+                {
+                    "word": word,
+                    "start": float(index),
+                    "end": float(index + 1),
+                }
+                for index, word in enumerate(
+                    "brief start this is the much longer corrected ending".split()
+                )
+            ],
+        }
+
+        pieces = audio_to_subtitle.split_bilingual_segment(
+            source,
+            max_words=12,
+            max_chars=42,
+            max_duration=5.5,
+        )
+
+        self.assertEqual(len(pieces), 2)
+        self.assertEqual(pieces[0]["en"], "Brief start.")
+        self.assertEqual(pieces[0]["end"], 2.0)
+        self.assertEqual(pieces[1]["start"], 2.0)
+        self.assertEqual(pieces[0]["split_timing_basis"], "word_timestamps")
+
+    def test_simplified_chinese_normalizes_cjk_spacing(self) -> None:
+        self.assertEqual(
+            audio_to_subtitle.to_simplified_text("刺激 G 点，21 世纪，34 岁"),
+            "刺激G点，21世纪，34岁",
+        )
 
     def test_reading_budget_caps_each_bilingual_language_to_one_line(self) -> None:
         chinese_budget, english_budget = audio_to_subtitle.reading_budgets(
@@ -2993,6 +4632,342 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertIn("ZH_MAX=13", text)
         self.assertIn("SOURCE_MAX=30", text)
 
+    def test_ocr_boundary_guard_detects_words_copied_from_next_cue(self) -> None:
+        segments = [
+            {
+                "id": 0,
+                "start": 10.0,
+                "end": 13.0,
+                "text": "I can its come myself from",
+                "source_text_authority": "ocr",
+            },
+            {
+                "id": 1,
+                "start": 13.0,
+                "end": 16.0,
+                "text": "traditional sex alone the data suggest that",
+                "source_text_authority": "ocr",
+            },
+        ]
+
+        borrowed = audio_to_subtitle.adjacent_context_borrowed_phrase(
+            segments,
+            0,
+            "I can't come myself from traditional sex alone.",
+        )
+
+        self.assertEqual(borrowed, "traditional sex alone")
+
+    def test_ocr_boundary_guard_allows_short_term_recovered_from_authored_chinese(self) -> None:
+        segments = [
+            {
+                "id": 0,
+                "start": 10.0,
+                "end": 13.0,
+                "text": "my clip to spur and",
+                "zh": "\u6211\u7684\u9634\u8482\u3001G\u70b9\u548c\u809b\u95e8",
+                "source_text_authority": "ocr",
+                "chinese_text_authority": "authored",
+            },
+            {
+                "id": 1,
+                "start": 13.0,
+                "end": 16.0,
+                "text": "g-spot and clitoris at the same time",
+                "source_text_authority": "ocr",
+            },
+        ]
+
+        borrowed = audio_to_subtitle.adjacent_context_borrowed_phrase(
+            segments,
+            0,
+            "My clitoris, G-spot and anus are stimulated.",
+        )
+
+        self.assertEqual(borrowed, "")
+
+    def test_adjacent_context_guard_allows_ocr_repair_with_long_anchor(self) -> None:
+        segments = [
+            {
+                "id": 49,
+                "text": (
+                    "still to come on accounts Guide to 21st century sex "
+                    "premature ejaculation affects one in three men"
+                ),
+                "source_text_authority": "ocr",
+            },
+            {
+                "id": 50,
+                "text": "Welcome back to A Girl's Guide to 21st century sex",
+                "source_text_authority": "ocr",
+            },
+        ]
+
+        borrowed = audio_to_subtitle.adjacent_context_borrowed_phrase(
+            segments,
+            0,
+            (
+                "Still to come on A Girl's Guide to 21st Century Sex: "
+                "premature ejaculation affects one in three men."
+            ),
+        )
+
+        self.assertEqual(borrowed, "")
+
+    def test_adjacent_context_guard_allows_fuzzy_ocr_word_anchor(self) -> None:
+        segments = [
+            {
+                "id": 152,
+                "text": "we can kiss and caress and I show safety",
+                "source_text_authority": "ocr",
+            },
+            {
+                "id": 153,
+                "text": "I feel very safe and close to him",
+                "source_text_authority": "ocr",
+            },
+        ]
+
+        borrowed = audio_to_subtitle.adjacent_context_borrowed_phrase(
+            segments,
+            0,
+            "We can kiss and caress, and I feel very safe.",
+        )
+
+        self.assertEqual(borrowed, "")
+
+    def test_adjacent_context_guard_allows_unordered_ocr_word_anchors(self) -> None:
+        segments = [
+            {
+                "id": 154,
+                "text": (
+                    "have inception pregnancy and especially enjoyed it "
+                    "having sex until it feels uncomfortable"
+                ),
+                "source_text_authority": "ocr",
+            },
+            {
+                "id": 155,
+                "text": "nothing to fear from having passionate sex during pregnancy",
+                "source_text_authority": "ocr",
+            },
+        ]
+
+        borrowed = audio_to_subtitle.adjacent_context_borrowed_phrase(
+            segments,
+            0,
+            "I especially enjoy sex during pregnancy until it feels uncomfortable.",
+        )
+
+        self.assertEqual(borrowed, "")
+
+    def test_authored_chinese_title_card_allows_short_ocr_reconstruction(self) -> None:
+        segment = {
+            "text": "home",
+            "zh": "\u7247\u540d\uff1a\u300a21\u4e16\u7eaa\u6027\u7231\u6307\u5357\u300b\uff0c\u7b2c\u4e94\u96c6",
+            "source_text_authority": "ocr",
+            "chinese_text_authority": "authored",
+        }
+
+        allowed = (
+            audio_to_subtitle.authored_chinese_title_card_allows_ocr_reconstruction(
+                segment,
+                segment["zh"],
+                "A Girl's Guide to 21st Century Sex, Episode Five.",
+                "guide to 21st century sex",
+            )
+        )
+
+        self.assertTrue(allowed)
+
+    def test_authored_chinese_title_card_does_not_exempt_regular_dialogue(self) -> None:
+        segment = {
+            "text": "home",
+            "zh": "\u6211\u73b0\u5728\u56de\u5bb6\u3002",
+            "source_text_authority": "ocr",
+            "chinese_text_authority": "authored",
+        }
+
+        allowed = (
+            audio_to_subtitle.authored_chinese_title_card_allows_ocr_reconstruction(
+                segment,
+                segment["zh"],
+                "A Girl's Guide to 21st Century Sex, Episode Five.",
+                "guide to 21st century sex",
+            )
+        )
+
+        self.assertFalse(allowed)
+
+    def test_authored_chinese_retention_rejects_over_summarized_long_target(self) -> None:
+        segment = {
+            "chinese_text_authority": "authored",
+        }
+        original = (
+            "\u4eba\u751f\u6765\u5c31\u6709\u4ece\u751f\u7406\u548c\u60c5\u611f\u4e0a\u559c\u6b22\u540c\u6027\u7684\u80fd\u529b\uff0c"
+            "\u4f46\u6211\u4eec\u7684\u73af\u5883\u548c\u7ecf\u5386\u4f1a\u5f71\u54cd\u6211\u4eec\u6700\u7ec8\u6210\u4e3a\u600e\u6837\u7684\u4eba\u3002"
+        )
+
+        retained = audio_to_subtitle.authored_chinese_content_retained(
+            segment,
+            original,
+            "\u73af\u5883\u51b3\u5b9a\u6211\u4eec\u6210\u4e3a\u8c01\u3002",
+        )
+
+        self.assertFalse(retained)
+
+    def test_authored_chinese_retention_preserves_each_speaker_label(self) -> None:
+        segment = {
+            "chinese_text_authority": "authored",
+        }
+        original = (
+            "[\u827e\u5a03\u533b\u751f]\u4eba\u751f\u6765\u5c31\u6709\u7231\u540c\u6027\u7684\u80fd\u529b\u3002"
+            "[\u51ef\u4f26\u548c\u7ef4\u59ec]\u6709\u6bb5\u65f6\u95f4\u6211\u53ea\u60f3\u548c\u5973\u4eba\u5728\u4e00\u8d77\u3002"
+        )
+
+        retained = audio_to_subtitle.authored_chinese_content_retained(
+            segment,
+            original,
+            "[\u827e\u5a03\u533b\u751f]\u4eba\u751f\u6765\u5c31\u6709\u7231\u540c\u6027\u7684\u80fd\u529b\uff0c"
+            "\u6709\u6bb5\u65f6\u95f4\u6211\u53ea\u60f3\u548c\u5973\u4eba\u5728\u4e00\u8d77\u3002",
+        )
+
+        self.assertFalse(retained)
+
+    def test_previous_output_guard_detects_shifted_batch_result(self) -> None:
+        segments = [
+            {
+                "id": 0,
+                "text": (
+                    "everybody is born with the ability to love the same sex "
+                    "but our environment and experiences determine who we become"
+                ),
+                "zh": (
+                    "\u4eba\u751f\u6765\u5c31\u6709\u7231\u540c\u6027\u7684\u80fd\u529b\uff0c"
+                    "\u4f46\u73af\u5883\u548c\u7ecf\u5386\u51b3\u5b9a\u6211\u4eec\u6210\u4e3a\u8c01"
+                ),
+            },
+            {
+                "id": 1,
+                "text": "but I'm not interested in having a relationship with them",
+                "zh": "\u6211\u4f1a\u5bf9\u7537\u4eba\u6709\u5e7b\u60f3\uff0c\u4f46\u4e0d\u60f3\u548c\u4ed6\u4eec\u4ea4\u5f80",
+            },
+        ]
+        approved = [
+            {
+                "id": 0,
+                "en": (
+                    "Everyone can love the same sex, but our environment and "
+                    "experiences determine who we become."
+                ),
+                "zh": (
+                    "\u4eba\u751f\u6765\u5c31\u6709\u7231\u540c\u6027\u7684\u80fd\u529b\uff0c"
+                    "\u4f46\u73af\u5883\u548c\u7ecf\u5386\u51b3\u5b9a\u6211\u4eec\u6210\u4e3a\u8c01\u3002"
+                ),
+                "display": True,
+            }
+        ]
+
+        borrowed = audio_to_subtitle.previous_output_borrowed_phrase(
+            segments,
+            1,
+            approved,
+            "But our environment and experiences determine who we become.",
+            "\u4f46\u73af\u5883\u548c\u7ecf\u5386\u51b3\u5b9a\u6211\u4eec\u4f1a\u6210\u4e3a\u4ec0\u4e48\u6837\u7684\u4eba\u3002",
+        )
+
+        self.assertTrue(borrowed)
+
+    def test_previous_output_guard_allows_genuine_repeated_source(self) -> None:
+        repeated = "Please don't stop."
+        repeated_chinese = "\u8bf7\u4e0d\u8981\u505c\u3002"
+        segments = [
+            {"id": 0, "text": repeated, "zh": repeated_chinese},
+            {"id": 1, "text": repeated, "zh": repeated_chinese},
+        ]
+        approved = [
+            {
+                "id": 0,
+                "en": repeated,
+                "zh": repeated_chinese,
+                "display": True,
+            }
+        ]
+
+        borrowed = audio_to_subtitle.previous_output_borrowed_phrase(
+            segments,
+            1,
+            approved,
+            repeated,
+            repeated_chinese,
+        )
+
+        self.assertEqual(borrowed, "")
+
+    def test_final_qa_rejects_adjacent_context_borrowing(self) -> None:
+        source = [
+            {
+                "id": 0,
+                "start": 10.0,
+                "end": 13.0,
+                "text": "I can its come myself from",
+                "en": "I can't come myself from.",
+                "zh": "\u6211\u65e0\u6cd5\u8fbe\u5230\u9ad8\u6f6e\u3002",
+                "source_language": "en",
+                "source_text_authority": "ocr",
+                "display": True,
+            },
+            {
+                "id": 1,
+                "start": 13.0,
+                "end": 16.0,
+                "text": "traditional sex alone the data suggest that",
+                "en": "Traditional sex alone. The data suggest that...",
+                "zh": "\u4ec5\u9760\u4f20\u7edf\u6027\u4ea4\u3002\u6570\u636e\u663e\u793a\u2026\u2026",
+                "source_language": "en",
+                "source_text_authority": "ocr",
+                "display": True,
+            },
+        ]
+        response = json.dumps(
+            [
+                {
+                    "index": 0,
+                    "corrected_english": (
+                        "I can't come myself from traditional sex alone."
+                    ),
+                    "corrected_chinese": "\u4ec5\u9760\u4f20\u7edf\u6027\u4ea4\u6211\u65e0\u6cd5\u8fbe\u5230\u9ad8\u6f6e\u3002",
+                    "display": True,
+                    "terminology": [],
+                },
+                {
+                    "index": 1,
+                    "corrected_english": source[1]["en"],
+                    "corrected_chinese": source[1]["zh"],
+                    "display": True,
+                    "terminology": [],
+                },
+            ],
+            ensure_ascii=False,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_path = Path(tmpdir) / "final-qa.json"
+            with patch.object(audio_to_subtitle, "call_llm", return_value=response):
+                output, report = audio_to_subtitle.run_final_subtitle_qa(
+                    source,
+                    "qwen3.5:122b",
+                    artifact_path,
+                    batch_size=8,
+                )
+
+        self.assertEqual(output[0]["en"], source[0]["en"])
+        self.assertEqual(report["status"], "review")
+        self.assertEqual(
+            report["rejected_items"][0]["reason"],
+            "adjacent_context_borrowed",
+        )
+
     def test_prompt_budget_is_capped_before_overlapping_next_subtitle(self) -> None:
         segment = {"id": 0, "start": 0.0, "end": 2.0, "text": "An overlapping line"}
 
@@ -3034,6 +5009,36 @@ class DisplayCleanupTests(unittest.TestCase):
 
         self.assertEqual(len(output), 4)
 
+    def test_output_never_emits_non_content_credit(self) -> None:
+        output = prepare_segments_for_output(
+            [
+                {
+                    "id": 0,
+                    "start": 0.1,
+                    "end": 6.0,
+                    "text": "== \u5b57\u5e55\u5236\u4f5c\uff1aLittant ==",
+                    "zh": "\u5b57\u5e55\u5236\u4f5c\uff1aLittant",
+                    "display": True,
+                    "non_content_credit": True,
+                },
+                {
+                    "id": 1,
+                    "start": 0.75,
+                    "end": 3.83,
+                    "text": "Tonight on the programme",
+                    "en": "Tonight on the programme",
+                    "zh": "\u4eca\u665a\u7684\u8282\u76ee\u5185\u5bb9",
+                    "display": True,
+                },
+            ],
+            max_words=12,
+            max_chars=42,
+            max_duration=5.5,
+        )
+
+        self.assertEqual(len(output), 1)
+        self.assertEqual(output[0]["en"], "Tonight on the programme")
+
     def test_merge_existing_subtitles_uses_spoken_track_timing(self) -> None:
         en_segments = [
             {"id": 0, "start": 30.0, "end": 32.0, "text": "The spoken line ends here."}
@@ -3051,6 +5056,220 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertEqual(len(merged), 1)
         self.assertEqual(merged[0]["start"], 30.0)
         self.assertEqual(merged[0]["end"], 32.0)
+
+    def test_merge_existing_subtitles_replaces_abnormal_ocr_span_with_authored_anchor(self) -> None:
+        en_segments = [
+            {
+                "id": 0,
+                "start": 909.15,
+                "end": 935.91,
+                "text": "man's penis and inside the vagina",
+                "source_text_authority": "ocr",
+            }
+        ]
+        zh_segments = [
+            {
+                "id": 0,
+                "start": 908.207,
+                "end": 911.506,
+                "text": "\u5973\u4eba\u7684\u4e73\u5934\u4e0a\uff0c\u7537\u4eba\u7684\u9634\u830e\u4e0a\u4ee5\u53ca\u9634\u9053\u5185\u90e8",
+                "chinese_text_authority": "authored",
+            }
+        ]
+        en_asset = SimpleNamespace(
+            text_authority="ocr",
+            timing_authority="authored",
+            origin="sidecar",
+            representation="authored_text",
+            asset_id="en",
+            language="en",
+            role="dialogue",
+            to_dict=lambda: {"asset_id": "en"},
+        )
+        zh_asset = SimpleNamespace(
+            text_authority="authored",
+            timing_authority="authored",
+            origin="sidecar",
+            representation="authored_text",
+            asset_id="zh",
+            language="zh",
+            role="dialogue",
+            to_dict=lambda: {"asset_id": "zh"},
+        )
+
+        merged = merge_existing_subtitle_segments(
+            en_segments,
+            zh_segments,
+            "sidecar",
+            english_asset=en_asset,
+            chinese_asset=zh_asset,
+        )
+
+        self.assertEqual((merged[0]["start"], merged[0]["end"]), (908.207, 911.506))
+        self.assertEqual(
+            merged[0]["timing_correction"],
+            "authored_anchor_replaced_abnormal_ocr_span",
+        )
+
+    def test_merge_ocr_uses_normal_authored_chinese_timing_anchor(self) -> None:
+        en_asset = SimpleNamespace(
+            text_authority="ocr",
+            timing_authority="authored_unverified",
+            origin="sidecar",
+            representation="authored_text",
+            asset_id="en",
+            language="en",
+            role="dialogue",
+            to_dict=lambda: {"asset_id": "en"},
+        )
+        zh_asset = SimpleNamespace(
+            text_authority="authored",
+            timing_authority="authored_unverified",
+            origin="sidecar",
+            representation="authored_text",
+            asset_id="zh",
+            language="zh",
+            role="dialogue",
+            to_dict=lambda: {"asset_id": "zh"},
+        )
+
+        merged = merge_existing_subtitle_segments(
+            [{"id": 0, "start": 30.0, "end": 32.0, "text": "Spoken line"}],
+            [{"id": 0, "start": 30.3, "end": 32.1, "text": "对白"}],
+            "sidecar",
+            english_asset=en_asset,
+            chinese_asset=zh_asset,
+        )
+
+        self.assertEqual((merged[0]["start"], merged[0]["end"]), (30.3, 32.1))
+        self.assertEqual(
+            merged[0]["timing_correction"],
+            "authored_anchor_preferred_over_ocr",
+        )
+
+    def test_merge_collapses_rolling_authored_chinese_before_ocr_pairing(self) -> None:
+        en_asset = SimpleNamespace(
+            text_authority="ocr",
+            timing_authority="authored_unverified",
+            origin="sidecar",
+            representation="authored_text",
+            asset_id="en",
+            language="en",
+            role="dialogue",
+            to_dict=lambda: {"asset_id": "en"},
+        )
+        zh_asset = SimpleNamespace(
+            text_authority="authored",
+            timing_authority="authored_unverified",
+            origin="sidecar",
+            representation="authored_text",
+            asset_id="zh",
+            language="zh",
+            role="dialogue",
+            to_dict=lambda: {"asset_id": "zh"},
+        )
+        label = "[泰勒·摩根]"
+        first_line = "我的性高潮很令人兴奋，很剧烈"
+        second_line = "就好像上天堂的感觉"
+
+        merged = merge_existing_subtitle_segments(
+            [
+                {
+                    "id": 0,
+                    "start": 144.58,
+                    "end": 148.45,
+                    "text": "my orgasms are amazing",
+                    "source_text_authority": "ocr",
+                },
+                {
+                    "id": 1,
+                    "start": 148.45,
+                    "end": 152.36,
+                    "text": "really intense and",
+                    "source_text_authority": "ocr",
+                },
+                {
+                    "id": 2,
+                    "start": 152.36,
+                    "end": 156.27,
+                    "text": "it feels like heaven",
+                    "source_text_authority": "ocr",
+                },
+            ],
+            [
+                {
+                    "id": 0,
+                    "start": 146.012,
+                    "end": 148.148,
+                    "text": first_line,
+                    "chinese_text_authority": "authored",
+                },
+                {
+                    "id": 1,
+                    "start": 148.148,
+                    "end": 150.517,
+                    "text": f"{label}\n{first_line}",
+                    "chinese_text_authority": "authored",
+                },
+                {
+                    "id": 2,
+                    "start": 150.517,
+                    "end": 151.518,
+                    "text": label,
+                    "chinese_text_authority": "authored",
+                },
+                {
+                    "id": 3,
+                    "start": 151.518,
+                    "end": 152.285,
+                    "text": f"{label}\n{second_line}",
+                    "chinese_text_authority": "authored",
+                },
+                {
+                    "id": 4,
+                    "start": 152.285,
+                    "end": 154.81,
+                    "text": second_line,
+                    "chinese_text_authority": "authored",
+                },
+            ],
+            "sidecar",
+            english_asset=en_asset,
+            chinese_asset=zh_asset,
+        )
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(
+            merged[0]["en"],
+            "my orgasms are amazing really intense and it feels like heaven",
+        )
+        self.assertEqual(merged[0]["zh"], f"{label}{first_line}{second_line}")
+        self.assertEqual((merged[0]["start"], merged[0]["end"]), (146.012, 154.81))
+        self.assertEqual(merged[0]["zh"].count(label), 1)
+
+    def test_merge_existing_subtitles_hides_non_dialogue_credit(self) -> None:
+        merged = merge_existing_subtitle_segments(
+            [{"id": 0, "start": 0.75, "end": 3.83, "text": "Tonight on the programme"}],
+            [
+                {"id": 0, "start": 0.1, "end": 6.0, "text": "== \u5b57\u5e55\u5236\u4f5c\uff1aLittant =="},
+                {"id": 1, "start": 0.1, "end": 3.7, "text": "\u4eca\u665a\u7684\u8282\u76ee\u5185\u5bb9"},
+            ],
+            "existing Chinese sidecar subtitle",
+        )
+
+        hidden = next(item for item in merged if item.get("non_content_credit"))
+        dialogue = next(item for item in merged if item.get("en"))
+        self.assertFalse(hidden["display"])
+        self.assertEqual(hidden["suppression_reason"], "subtitle_credit")
+        self.assertEqual(dialogue["zh"], "\u4eca\u665a\u7684\u8282\u76ee\u5185\u5bb9")
+        self.assertFalse(
+            apply_display_timing(
+                hidden,
+                {"display": True},
+                context_start=0.0,
+                context_end=10.0,
+            )["display"]
+        )
 
     def test_existing_subtitle_tracks_are_synchronized_independently_before_merge(self) -> None:
         tracks = ExistingSubtitleTracks(
@@ -3186,6 +5405,126 @@ class DisplayCleanupTests(unittest.TestCase):
                     SubtitleEvent(20.0, 22.0, "\u4e00\u4e2a\u5b8c\u6574\u53e5\u5b50\u3002"),
                 )
             ],
+        )
+
+    def test_pair_events_keeps_subtitle_credit_out_of_dialogue_pair(self) -> None:
+        pairs = pair_events(
+            [SubtitleEvent(0.75, 3.83, "Tonight on the programme")],
+            [
+                SubtitleEvent(0.1, 6.0, "== \u5b57\u5e55\u5236\u4f5c\uff1aLittant =="),
+                SubtitleEvent(0.1, 3.7, "\u4eca\u665a\u7684\u8282\u76ee\u5185\u5bb9"),
+            ],
+        )
+
+        self.assertIn(
+            (
+                SubtitleEvent(0.75, 3.83, "Tonight on the programme"),
+                SubtitleEvent(0.1, 3.7, "\u4eca\u665a\u7684\u8282\u76ee\u5185\u5bb9"),
+            ),
+            pairs,
+        )
+        self.assertIn(
+            (None, SubtitleEvent(0.1, 6.0, "== \u5b57\u5e55\u5236\u4f5c\uff1aLittant ==")),
+            pairs,
+        )
+
+    def test_subtitle_clean_text_preserves_angle_bracketed_title(self) -> None:
+        self.assertEqual(
+            subtitle_pipeline.clean_text(
+                "<i>\u4eca\u665a\uff0c\u300a<21\u4e16\u7eaa\u6027\u7231\u6307\u5357>\u300b</i>"
+            ),
+            "\u4eca\u665a\uff0c\u300a<21\u4e16\u7eaa\u6027\u7231\u6307\u5357>\u300b",
+        )
+
+    def test_pair_events_groups_ocr_fragments_around_authored_chinese_anchors(self) -> None:
+        ocr_metadata = {"source_text_authority": "ocr"}
+        authored_metadata = {"chinese_text_authority": "authored"}
+        pairs = pair_events(
+            [
+                SubtitleEvent(
+                    162.84,
+                    166.14,
+                    "I can its come myself from",
+                    metadata=ocr_metadata,
+                ),
+                SubtitleEvent(
+                    166.14,
+                    169.83,
+                    "tentative sex alone the data suggest that",
+                    metadata=ocr_metadata,
+                ),
+                SubtitleEvent(
+                    169.83,
+                    175.43,
+                    "only 30 percent women can achieve orgasm with traditional penile vaginal",
+                    metadata=ocr_metadata,
+                ),
+                SubtitleEvent(
+                    175.43,
+                    178.04,
+                    "intercourse",
+                    metadata=ocr_metadata,
+                ),
+            ],
+            [
+                SubtitleEvent(
+                    163.496,
+                    167.899,
+                    "\u4ec5\u4ec5\u662f\u901a\u8fc7\u4f20\u7edf\u7684\u6027\u4ea4\u6211\u65e0\u6cd5\u8fbe\u5230\u6027\u9ad8\u6f6e",
+                    metadata=authored_metadata,
+                ),
+                SubtitleEvent(
+                    168.501,
+                    172.872,
+                    "\u6570\u636e\u663e\u793a\u53ea\u670930%\u7684\u5973\u6027\u53ef\u4ee5\u901a\u8fc7\u4f20\u7edf\u6027\u4ea4\u83b7\u5f97\u9ad8\u6f6e",
+                    metadata=authored_metadata,
+                ),
+                SubtitleEvent(
+                    172.872,
+                    178.211,
+                    (
+                        "[\u8a79\u59ae\u5f17\u00b7\u4f2f\u66fc\u533b\u751f] "
+                        "\u6570\u636e\u663e\u793a\u53ea\u670930%\u7684\u5973\u6027\u53ef\u4ee5\u901a\u8fc7\u4f20\u7edf\u6027\u4ea4\u83b7\u5f97\u9ad8\u6f6e"
+                    ),
+                    metadata=authored_metadata,
+                ),
+            ],
+        )
+
+        self.assertEqual(len(pairs), 1)
+        self.assertEqual(
+            pairs[0][0].text,
+            (
+                "I can its come myself from tentative sex alone the data suggest that "
+                "only 30 percent women can achieve orgasm with traditional penile "
+                "vaginal intercourse"
+            ),
+        )
+        self.assertIn("[\u8a79\u59ae\u5f17\u00b7\u4f2f\u66fc\u533b\u751f]", pairs[0][1].text)
+        self.assertEqual(pairs[0][1].text.count("\u6570\u636e\u663e\u793a\u53ea\u670930%"), 1)
+
+    def test_pair_events_rebalances_micro_fragment_with_adjacent_cues(self) -> None:
+        pairs = pair_events(
+            [
+                SubtitleEvent(62.0, 65.74, "with special cameras we see your"),
+                SubtitleEvent(65.74, 66.07, "body"),
+                SubtitleEvent(66.07, 69.92, "during intercourse we explore mysteries"),
+            ],
+            [
+                SubtitleEvent(62.295, 63.785, "\u7528\u7279\u5236\u6444\u50cf\u5934"),
+                SubtitleEvent(64.297, 67.198, "\u770b\u5230\u6027\u4ea4\u65f6\u4f53\u5185\u7684\u53d8\u5316"),
+                SubtitleEvent(68.501, 69.991, "\u6211\u4eec\u5c06\u63a2\u7a76\u6027\u7231\u4e4b\u8c1c"),
+            ],
+        )
+
+        self.assertEqual(len(pairs), 1)
+        self.assertEqual(
+            pairs[0][0].text,
+            "with special cameras we see your body during intercourse we explore mysteries",
+        )
+        self.assertEqual(
+            pairs[0][1].text,
+            "\u7528\u7279\u5236\u6444\u50cf\u5934\u770b\u5230\u6027\u4ea4\u65f6\u4f53\u5185\u7684\u53d8\u5316\u6211\u4eec\u5c06\u63a2\u7a76\u6027\u7231\u4e4b\u8c1c",
         )
 
     def test_pair_events_does_not_chain_normal_adjacent_shifted_subtitles(self) -> None:
@@ -3754,7 +6093,7 @@ class DisplayCleanupTests(unittest.TestCase):
         """
 
         def call_llm(prompt, *_args, **_kwargs):
-            self.assertIn("EN: - | ZH: \u4fc4\u4ea5\u4fc4\u5dde \u54e5\u4f26\u5e03\u5e02 2045\u5e74", prompt)
+            self.assertIn("EN: - | ZH: \u4fc4\u4ea5\u4fc4\u5dde\u54e5\u4f26\u5e03\u5e022045\u5e74", prompt)
             return llm_response
 
         with patch.object(audio_to_subtitle, "call_llm", side_effect=call_llm):
@@ -3766,7 +6105,7 @@ class DisplayCleanupTests(unittest.TestCase):
             )
 
         self.assertEqual(output[0]["en"], "")
-        self.assertEqual(output[0]["zh"], "\u4fc4\u4ea5\u4fc4\u5dde \u54e5\u4f26\u5e03\u5e02 2045\u5e74")
+        self.assertEqual(output[0]["zh"], "\u4fc4\u4ea5\u4fc4\u5dde\u54e5\u4f26\u5e03\u5e022045\u5e74")
 
     def test_existing_chinese_proofreading_preserves_japanese_source(self) -> None:
         source = [
@@ -3924,6 +6263,11 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertIn('id="existingSubtitleOptions"', page)
         self.assertIn('id="audioRecognitionOptions"', page)
         self.assertIn('id="advancedSettings"', page)
+        self.assertIn('id="autonomousReview"', page)
+        self.assertIn(
+            "autonomous_review_rounds: document.getElementById('autonomousReview').checked ? 2 : 0",
+            page,
+        )
         self.assertIn("function updateWorkflowVisibility()", page)
         self.assertIn("source.addEventListener('change', () => {", page)
         self.assertIn(
@@ -3945,6 +6289,14 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertIn("usesExisting && subtitleSync !== 'off'", page)
         self.assertIn("audio_stream: usesSelectedAudioTrack ?", page)
         self.assertIn("用于字幕同步的音轨", page)
+        self.assertIn('id="runPreflight"', page)
+        self.assertIn('id="runBtn" onclick="startRun()" disabled', page)
+        self.assertIn("function runBlockReason()", page)
+        self.assertIn("本任务不会自动改用本地模型", page)
+        self.assertIn("function restoreModelSelection(select, value)", page)
+        self.assertIn("option?.disabled", page)
+        self.assertIn("function analysisConfigurationFingerprint()", page)
+        self.assertIn("analysis.analysis_config_fingerprint", page)
 
     def test_frontend_reports_failed_run_with_last_active_stage(self) -> None:
         stage, stage_index, outcome = subtitle_frontend.infer_stage_info(
@@ -4002,7 +6354,7 @@ class DisplayCleanupTests(unittest.TestCase):
         self.assertIn("def frontend_source_fingerprint()", frontend_source)
         self.assertIn('APP_DIR.glob("*.py")', frontend_source)
         self.assertIn('Invoke-RestMethod -Uri "$url/api/health"', launcher)
-        self.assertIn("foreach ($port in 8765..8775)", launcher)
+        self.assertIn("foreach ($port in 8765..8799)", launcher)
         self.assertIn("function Get-FrontendSourceSha256", launcher)
         self.assertIn('-Filter "*.py"', launcher)
         self.assertIn("$expectedSourceSha256", launcher)

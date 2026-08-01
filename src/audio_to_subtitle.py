@@ -1,6 +1,8 @@
 import argparse
 import hashlib
+import importlib
 import json
+import logging
 import math
 import os
 import re
@@ -8,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import time
+import warnings
 from dataclasses import asdict, dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -31,6 +34,7 @@ from llm_policy import (
 )
 from output_paths import OUTPUT_DIRECTORY_NAME, resolve_output_root, suggested_output_root
 from pipeline_policy import (
+    AUTONOMOUS_REVIEW_POLICY_VERSION,
     FINAL_QA_POLICY_VERSION,
     PROCESSING_POLICY_VERSION,
     STYLE_GUIDE_POLICY_VERSION,
@@ -64,8 +68,18 @@ from subtitle_sources import (
     source_manifest,
 )
 
+warnings.filterwarnings(
+    "ignore",
+    message=r"pkg_resources is deprecated as an API.*",
+    category=UserWarning,
+    module=r"jieba\._compat",
+)
+jieba = importlib.import_module("jieba")
+
 
 Segment = Dict[str, Any]
+
+jieba.setLogLevel(logging.WARNING)
 
 
 @dataclass(frozen=True)
@@ -81,7 +95,7 @@ class ExistingSubtitleTracks:
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m2ts", ".ts", ".mov", ".wmv"}
 SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt"}
 UNKNOWN_SOURCE_LANGUAGE_TAGS = {"", "auto", "source", "cached source", "subtitle", "embedded subtitle"}
-SOURCE_CACHE_VERSION = 6
+SOURCE_CACHE_VERSION = 11
 COMPATIBLE_SYNC_POLICY_VERSIONS = (5,)
 TARGET_CHINESE_CPS = 9.0
 TARGET_ENGLISH_CPS = 20.0
@@ -161,6 +175,9 @@ def load_cached_source_segments(path: Path) -> List[Segment]:
 def infer_source_language_from_segments(segments: List[Segment], fallback: str) -> str:
     if fallback and fallback != "auto":
         return fallback
+    dominant = dominant_source_language(segments)
+    if dominant:
+        return dominant
     for segment in segments:
         language = segment.get("source_language")
         if language:
@@ -244,6 +261,18 @@ def build_source_request_fingerprint(
         "crop_pad": int(getattr(args, "crop_pad", 8) or 8),
         "fast_ocr": bool(getattr(args, "fast_ocr", False)),
     }
+    english_text_authority = str(
+        getattr(args, "english_subtitle_text_authority", "authored")
+        or "authored"
+    )
+    chinese_text_authority = str(
+        getattr(args, "chinese_subtitle_text_authority", "authored")
+        or "authored"
+    )
+    if english_text_authority != "authored":
+        descriptor["english_subtitle_text_authority"] = english_text_authority
+    if chinese_text_authority != "authored":
+        descriptor["chinese_subtitle_text_authority"] = chinese_text_authority
     if processing_plan_fingerprint:
         descriptor["processing_plan_fingerprint"] = processing_plan_fingerprint
     serialized = json.dumps(descriptor, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -525,7 +554,8 @@ def call_llm(
     seed_offset: int = 0,
 ) -> str:
     base_url = "http://localhost:11434"
-    if model.startswith("remote:"):
+    remote_model = model.startswith("remote:")
+    if remote_model:
         parts = model.split(":", 2)
         if len(parts) != 3:
             raise ValueError("Invalid remote model identifier; reconnect the remote server.")
@@ -541,6 +571,23 @@ def call_llm(
     messages.append({"role": "user", "content": prompt})
 
     profile = generation_profile(role)
+    num_ctx = profile.num_ctx
+    if remote_model:
+        remote_num_ctx = os.environ.get(
+            "SUBTITLE_REMOTE_OLLAMA_NUM_CTX",
+            "",
+        ).strip()
+        if remote_num_ctx:
+            try:
+                num_ctx = int(remote_num_ctx)
+            except ValueError as exc:
+                raise ValueError(
+                    "SUBTITLE_REMOTE_OLLAMA_NUM_CTX must be an integer."
+                ) from exc
+            if not 4096 <= num_ctx <= 1_048_576:
+                raise ValueError(
+                    "SUBTITLE_REMOTE_OLLAMA_NUM_CTX must be between 4096 and 1048576."
+                )
     payload: Dict[str, Any] = {
         "model": model,
         "messages": messages,
@@ -552,7 +599,7 @@ def call_llm(
             "top_p": profile.top_p,
             "top_k": profile.top_k,
             "seed": profile.seed + max(0, int(seed_offset)),
-            "num_ctx": profile.num_ctx,
+            "num_ctx": num_ctx,
             "num_predict": profile.max_tokens,
         },
     }
@@ -623,6 +670,21 @@ def _schema_string_property_names(response_schema: Dict[str, Any]) -> set[str]:
     return names
 
 
+def escape_unescaped_json_quotes(value: str) -> str:
+    escaped: List[str] = []
+    backslash_run = 0
+    for character in value:
+        if character == '"' and backslash_run % 2 == 0:
+            escaped.append('\\"')
+        else:
+            escaped.append(character)
+        if character == "\\":
+            backslash_run += 1
+        else:
+            backslash_run = 0
+    return "".join(escaped)
+
+
 def repair_unquoted_schema_strings(text: str, response_schema: Dict[str, Any]) -> str:
     string_properties = _schema_string_property_names(response_schema)
     if not string_properties:
@@ -655,10 +717,44 @@ def repair_unquoted_schema_strings(text: str, response_schema: Dict[str, Any]) -
             value = value[:-1].rstrip()
         raw_value = value.strip()
 
+        if not raw_value:
+            repaired_lines.append(
+                match.group("prefix")
+                + '""'
+                + ("," if has_comma else "")
+                + trailing_spacing
+                + newline
+            )
+            changed = True
+            continue
+
+        if raw_value.startswith('"'):
+            try:
+                json.loads(raw_value)
+            except json.JSONDecodeError:
+                if len(raw_value) < 2 or not raw_value.endswith('"'):
+                    repaired_lines.append(line)
+                    continue
+                escaped_inner = escape_unescaped_json_quotes(raw_value[1:-1])
+                try:
+                    decoded_value = json.loads(f'"{escaped_inner}"')
+                except json.JSONDecodeError:
+                    repaired_lines.append(line)
+                    continue
+                repaired_lines.append(
+                    match.group("prefix")
+                    + json.dumps(decoded_value, ensure_ascii=False)
+                    + ("," if has_comma else "")
+                    + trailing_spacing
+                    + newline
+                )
+                changed = True
+                continue
+            repaired_lines.append(line)
+            continue
+
         if (
-            not raw_value
-            or raw_value.startswith('"')
-            or raw_value in {"null", "true", "false"}
+            raw_value in {"null", "true", "false"}
             or raw_value.startswith(("{", "["))
         ):
             repaired_lines.append(line)
@@ -933,6 +1029,16 @@ def clean_subtitle_text(text: str) -> str:
 
 
 CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+AUTHORED_CHINESE_CUE_RE = re.compile(
+    r"\[[^\[\]\n]{1,120}\]|\([^()\n]{1,120}\)|"
+    r"\u3010[^\u3010\u3011\n]{1,120}\u3011|"
+    r"\uff08[^\uff08\uff09\n]{1,120}\uff09"
+)
+AUTHORED_CHINESE_TITLE_CARD_RE = re.compile(
+    r"(?:\u7247\u540d|\u5267\u540d|\u6807\u9898)\s*[:\uff1a]|"
+    r"\u7b2c\s*(?:\d{1,3}|[\u96f6\u3007\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u4e24]{1,6})"
+    r"\s*(?:\u96c6|\u5b63|\u7ae0|\u56de|\u90e8)"
+)
 EAST_ASIAN_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]")
 JAPANESE_SCRIPT_RE = re.compile(r"[\u3040-\u30ff]")
 KOREAN_SCRIPT_RE = re.compile(r"[\uac00-\ud7af]")
@@ -993,6 +1099,13 @@ def clean_english_track_text(text: str) -> str:
     return "" if contains_east_asian(text) else text
 
 
+def clean_ocr_english_track_text(text: str) -> str:
+    text = clean_english_track_text(text)
+    if text == "0":
+        return ""
+    return re.sub(r"\s+0$", "", text).rstrip()
+
+
 def should_clean_english_track(segment: Segment) -> bool:
     language = normalize_language_tag(str(segment.get("source_language") or ""))
     if language == "zh":
@@ -1005,6 +1118,319 @@ def should_clean_english_track(segment: Segment) -> bool:
 def source_track_text(segment: Segment) -> str:
     text = clean_subtitle_text(str(segment.get("en") or ""))
     return clean_english_track_text(text) if should_clean_english_track(segment) else text
+
+
+SOURCE_TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:['\u2019][A-Za-z0-9]+)?|%")
+SOURCE_BOUNDARY_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "been",
+    "but",
+    "by",
+    "for",
+    "from",
+    "had",
+    "has",
+    "have",
+    "he",
+    "her",
+    "him",
+    "his",
+    "i",
+    "in",
+    "is",
+    "it",
+    "its",
+    "of",
+    "on",
+    "or",
+    "our",
+    "she",
+    "that",
+    "the",
+    "their",
+    "them",
+    "they",
+    "this",
+    "to",
+    "was",
+    "we",
+    "were",
+    "with",
+    "you",
+    "your",
+}
+
+
+def source_boundary_tokens(text: str) -> List[str]:
+    tokens = [
+        token.replace("\u2019", "'").casefold()
+        for token in SOURCE_TOKEN_RE.findall(clean_subtitle_text(text))
+    ]
+    return ["%" if token == "percent" else token for token in tokens]
+
+
+def token_sequence_contains(haystack: List[str], needle: List[str]) -> bool:
+    if not needle or len(needle) > len(haystack):
+        return False
+    return any(
+        haystack[index : index + len(needle)] == needle
+        for index in range(len(haystack) - len(needle) + 1)
+    )
+
+
+def substantial_contiguous_token_overlap(
+    haystack: List[str],
+    needle: List[str],
+    *,
+    minimum_tokens: int = 3,
+    minimum_ratio: float = 0.6,
+) -> bool:
+    required = max(minimum_tokens, math.ceil(len(needle) * minimum_ratio))
+    if len(needle) < required:
+        return False
+    return any(
+        token_sequence_contains(haystack, needle[start : start + required])
+        for start in range(len(needle) - required + 1)
+    )
+
+
+def has_fuzzy_ocr_token_anchor(
+    haystack: List[str],
+    needle: List[str],
+    *,
+    minimum_similarity: float = 0.78,
+) -> bool:
+    return any(
+        original != proposed
+        and len(original) >= 4
+        and len(proposed) >= 4
+        and SequenceMatcher(None, original, proposed).ratio() >= minimum_similarity
+        for original in haystack
+        for proposed in needle
+    )
+
+
+def has_substantial_unordered_token_overlap(
+    haystack: List[str],
+    needle: List[str],
+    *,
+    minimum_ratio: float = 0.6,
+) -> bool:
+    if not needle:
+        return False
+    required = max(2, math.ceil(len(needle) * minimum_ratio))
+    matched = len(set(needle) & set(haystack))
+    return matched >= required
+
+
+def adjacent_context_borrowed_phrase(
+    segments: List[Segment],
+    index: int,
+    proposed_source: str,
+    *,
+    minimum_tokens: int = 3,
+) -> str:
+    if index < 0 or index >= len(segments):
+        return ""
+    segment = segments[index]
+    authority = str(
+        segment.get("source_text_authority")
+        or segment.get("text_authority")
+        or ""
+    )
+    original = clean_subtitle_text(str(segment.get("text") or ""))
+    if authority != "ocr" or contains_east_asian(original):
+        return ""
+    original_tokens = source_boundary_tokens(original)
+    proposed_tokens = source_boundary_tokens(proposed_source)
+    if len(proposed_tokens) < minimum_tokens:
+        return ""
+
+    neighbor_tokens = [
+        source_boundary_tokens(str(segments[neighbor_index].get("text") or ""))
+        for neighbor_index in (index - 1, index + 1)
+        if 0 <= neighbor_index < len(segments)
+    ]
+    for size in range(len(proposed_tokens), minimum_tokens - 1, -1):
+        for start in range(len(proposed_tokens) - size + 1):
+            phrase = proposed_tokens[start : start + size]
+            if token_sequence_contains(original_tokens, phrase):
+                continue
+            if substantial_contiguous_token_overlap(
+                original_tokens,
+                phrase,
+                minimum_tokens=minimum_tokens,
+            ):
+                continue
+            content_tokens = [
+                token
+                for token in phrase
+                if token not in SOURCE_BOUNDARY_STOPWORDS
+            ]
+            if len(content_tokens) < 3:
+                continue
+            if has_substantial_unordered_token_overlap(
+                original_tokens,
+                content_tokens,
+            ):
+                continue
+            if has_fuzzy_ocr_token_anchor(original_tokens, content_tokens):
+                continue
+            if any(token_sequence_contains(neighbor, phrase) for neighbor in neighbor_tokens):
+                return " ".join(phrase)
+    return ""
+
+
+def authored_chinese_content_retained(
+    segment: Segment,
+    original_chinese: str,
+    proposed_chinese: str,
+    *,
+    minimum_original_characters: int = 32,
+    minimum_ratio: float = 0.45,
+) -> bool:
+    authority = str(segment.get("chinese_text_authority") or "")
+    if authority != "authored":
+        return True
+    if len(AUTHORED_CHINESE_CUE_RE.findall(proposed_chinese)) < len(
+        AUTHORED_CHINESE_CUE_RE.findall(original_chinese)
+    ):
+        return False
+    original_count = len(CJK_RE.findall(clean_subtitle_text(original_chinese)))
+    if original_count < minimum_original_characters:
+        return True
+    proposed_count = len(CJK_RE.findall(clean_subtitle_text(proposed_chinese)))
+    return proposed_count >= math.ceil(original_count * minimum_ratio)
+
+
+def authored_chinese_title_card_allows_ocr_reconstruction(
+    segment: Segment,
+    original_chinese: str,
+    proposed_source: str,
+    borrowed_phrase: str,
+    *,
+    maximum_source_tokens: int = 20,
+) -> bool:
+    if not borrowed_phrase:
+        return False
+    source_authority = str(
+        segment.get("source_text_authority")
+        or segment.get("text_authority")
+        or ""
+    )
+    if (
+        source_authority != "ocr"
+        or str(segment.get("chinese_text_authority") or "") != "authored"
+        or not AUTHORED_CHINESE_TITLE_CARD_RE.search(original_chinese or "")
+    ):
+        return False
+    proposed_tokens = source_boundary_tokens(proposed_source)
+    return 2 <= len(proposed_tokens) <= maximum_source_tokens
+
+
+def semantic_track_similarity(left: str, right: str) -> float:
+    left_text = clean_subtitle_text(left)
+    right_text = clean_subtitle_text(right)
+    if not left_text or not right_text:
+        return 0.0
+    if contains_cjk(left_text) and contains_cjk(right_text):
+        left_compact = "".join(CJK_RE.findall(left_text))
+        right_compact = "".join(CJK_RE.findall(right_text))
+        width = 2 if min(len(left_compact), len(right_compact)) >= 2 else 1
+        left_units = {
+            left_compact[index : index + width]
+            for index in range(len(left_compact) - width + 1)
+        }
+        right_units = {
+            right_compact[index : index + width]
+            for index in range(len(right_compact) - width + 1)
+        }
+    else:
+        left_units = {
+            token
+            for token in source_boundary_tokens(left_text)
+            if token not in SOURCE_BOUNDARY_STOPWORDS
+        }
+        right_units = {
+            token
+            for token in source_boundary_tokens(right_text)
+            if token not in SOURCE_BOUNDARY_STOPWORDS
+        }
+    if not left_units or not right_units:
+        return 0.0
+    return len(left_units & right_units) / len(left_units | right_units)
+
+
+def previous_output_borrowed_phrase(
+    source_segments: List[Segment],
+    source_index: int,
+    approved_segments: List[Segment],
+    proposed_source: str,
+    proposed_chinese: str,
+) -> str:
+    if source_index <= 0 or source_index >= len(source_segments):
+        return ""
+    previous_source = source_segments[source_index - 1]
+    previous_id = previous_source.get("id")
+    previous_output = next(
+        (
+            item
+            for item in reversed(approved_segments)
+            if item.get("id") == previous_id
+        ),
+        None,
+    )
+    if previous_output is None or previous_output.get("display", True) is False:
+        return ""
+
+    current_source = source_segments[source_index]
+    current_original_source = str(current_source.get("text") or "")
+    current_original_chinese = str(current_source.get("zh") or "")
+    previous_original_source = str(previous_source.get("text") or "")
+    previous_original_chinese = str(previous_source.get("zh") or "")
+    source_repeat_score = max(
+        semantic_track_similarity(
+            current_original_source,
+            previous_original_source,
+        ),
+        semantic_track_similarity(
+            current_original_chinese,
+            previous_original_chinese,
+        ),
+    )
+    if source_repeat_score >= 0.55:
+        return ""
+
+    proposed_prior_score = max(
+        semantic_track_similarity(
+            proposed_source,
+            str(previous_output.get("en") or previous_output.get("text") or ""),
+        ),
+        semantic_track_similarity(
+            proposed_chinese,
+            str(previous_output.get("zh") or ""),
+        ),
+    )
+    proposed_own_score = max(
+        semantic_track_similarity(proposed_source, current_original_source),
+        semantic_track_similarity(
+            proposed_chinese,
+            current_original_chinese,
+        ),
+    )
+    if (
+        proposed_prior_score >= 0.28
+        and proposed_own_score < 0.22
+        and proposed_prior_score - proposed_own_score >= 0.15
+    ):
+        return normalize_space(proposed_source or proposed_chinese)[:120]
+    return ""
 
 
 def source_editing_policy(segments: List[Segment]) -> str:
@@ -1025,7 +1451,9 @@ def source_editing_policy(segments: List[Segment]) -> str:
     if "ocr" in authorities:
         return (
             "The source includes OCR text. Repair only evident recognition errors, prioritizing "
-            "low-confidence or impossible text and preserving credible authored wording."
+            "low-confidence or impossible text and preserving credible authored wording. Keep "
+            "each correction inside its original timestamp boundary; neighboring cues are context "
+            "only and must never be copied into or completed inside the target cue."
         )
     if "asr" in authorities:
         return (
@@ -1100,10 +1528,23 @@ def to_simplified_text(text: str) -> str:
     try:
         from opencc import OpenCC
     except Exception:
-        return text
-    if not hasattr(to_simplified_text, "_converter"):
-        setattr(to_simplified_text, "_converter", OpenCC("t2s"))
-    return getattr(to_simplified_text, "_converter").convert(text)
+        converted = text
+    else:
+        if not hasattr(to_simplified_text, "_converter"):
+            setattr(to_simplified_text, "_converter", OpenCC("t2s"))
+        converted = getattr(to_simplified_text, "_converter").convert(text)
+    cjk = r"\u3400-\u4dbf\u4e00-\u9fff"
+    converted = re.sub(
+        rf"(?<=[{cjk}，。！？；：、）》】」』])\s+(?=[{cjk}A-Za-z0-9%《【「『（])",
+        "",
+        converted,
+    )
+    converted = re.sub(
+        rf"(?<=[A-Za-z0-9%》】」』）\]])\s+(?=[{cjk}，。！？；：、])",
+        "",
+        converted,
+    )
+    return converted
 
 
 def to_simplified_segments(segments: List[Segment]) -> List[Segment]:
@@ -1363,6 +1804,12 @@ def segments_to_events(segments: List[Segment], key: str = "text") -> List[Any]:
             "source_role",
             "source_text_authority",
             "source_timing_authority",
+            "chinese_asset_id",
+            "chinese_origin",
+            "chinese_representation",
+            "chinese_role",
+            "chinese_text_authority",
+            "chinese_timing_authority",
             "supplementary_source",
         ):
             if segment.get(field_name) is not None:
@@ -1395,7 +1842,7 @@ def merge_existing_subtitle_segments(
     chinese_asset: Optional[SubtitleAsset] = None,
     supplementary_assets: Tuple[SubtitleAsset, ...] = (),
 ) -> List[Segment]:
-    from subtitle_pipeline import pair_events
+    from subtitle_pipeline import is_subtitle_credit_text, pair_events
 
     zh_events = segments_to_events(to_simplified_segments(zh_segments))
     en_events = segments_to_events(en_segments or [])
@@ -1409,6 +1856,7 @@ def merge_existing_subtitle_segments(
             continue
         timing_event = en_event or zh_event
         timing_asset = english_asset if en_event else chinese_asset
+        timing_correction = ""
         if en_event and zh_event and english_asset and chinese_asset:
             english_timing_score = (
                 english_asset.timing_authority == "authored",
@@ -1423,9 +1871,34 @@ def merge_existing_subtitle_segments(
             if chinese_timing_score > english_timing_score:
                 timing_event = zh_event
                 timing_asset = chinese_asset
+            if (
+                english_asset.text_authority == "ocr"
+                and chinese_asset.text_authority == "authored"
+            ):
+                timing_event = zh_event
+                timing_asset = chinese_asset
+                timing_correction = "authored_anchor_preferred_over_ocr"
+            en_duration = max(0.01, en_event.end - en_event.start)
+            zh_duration = max(0.01, zh_event.end - zh_event.start)
+            if (
+                english_asset.text_authority == "ocr"
+                and chinese_asset.text_authority == "authored"
+                and en_duration > 12.0
+                and en_duration > zh_duration * 2.0
+                and zh_duration <= 10.0
+            ):
+                timing_event = zh_event
+                timing_asset = chinese_asset
+                timing_correction = "authored_anchor_replaced_abnormal_ocr_span"
         start = timing_event.start
         end = timing_event.end
         en_text = clean_english_track_text(en_event.text) if en_event else ""
+        if (
+            en_text
+            and english_asset is not None
+            and english_asset.text_authority == "ocr"
+        ):
+            en_text = clean_ocr_english_track_text(en_text)
         zh_text = to_simplified_text(clean_subtitle_text(zh_event.text)) if zh_event else ""
         text = en_text or zh_text
         if not text and not zh_text:
@@ -1446,6 +1919,10 @@ def merge_existing_subtitle_segments(
             "display": True,
             "preserve_distinct_overlap": True,
         }
+        if is_subtitle_credit_text(en_text) or is_subtitle_credit_text(zh_text):
+            item["display"] = False
+            item["suppression_reason"] = "subtitle_credit"
+            item["non_content_credit"] = True
         if en_event and isinstance(en_event.metadata, dict):
             for field_name in (
                 "source_asset_id",
@@ -1468,6 +1945,8 @@ def merge_existing_subtitle_segments(
         if timing_asset is not None:
             item["timing_asset_id"] = timing_asset.asset_id
             item["timing_authority"] = timing_asset.timing_authority
+        if timing_correction:
+            item["timing_correction"] = timing_correction
         lane_confidences = {
             lane: event.confidence
             for lane, event in (("en", en_event), ("zh", zh_event))
@@ -1530,6 +2009,8 @@ def find_existing_sidecar_subtitle_tracks(
     explicit_path: Optional[Path] = None,
     explicit_zh_path: Optional[Path] = None,
     explicit_en_path: Optional[Path] = None,
+    chinese_text_authority: str = "authored",
+    english_text_authority: str = "authored",
 ) -> Optional[ExistingSubtitleTracks]:
     candidates = sidecar_candidates(video_path, selected_path, explicit_path, explicit_zh_path, explicit_en_path)
     if not candidates:
@@ -1550,11 +2031,23 @@ def find_existing_sidecar_subtitle_tracks(
             en_path = explicit_path
     candidate_assets: List[Tuple[Path, SubtitleAsset]] = []
     for candidate in candidates:
+        candidate_text_authority = "authored"
+        if (
+            explicit_en_path is not None
+            and candidate.resolve() == explicit_en_path.resolve()
+        ):
+            candidate_text_authority = english_text_authority
+        elif (
+            explicit_zh_path is not None
+            and candidate.resolve() == explicit_zh_path.resolve()
+        ):
+            candidate_text_authority = chinese_text_authority
         candidate_asset = build_sidecar_asset(
             video_path,
             candidate,
             likely_match=sidecar_match_score(video_path, candidate) > 0,
             score=sidecar_match_score(video_path, candidate),
+            text_authority=candidate_text_authority,
         )
         if (
             candidate.resolve() not in explicit_candidates
@@ -1588,6 +2081,7 @@ def find_existing_sidecar_subtitle_tracks(
         language="zh",
         likely_match=sidecar_match_score(video_path, zh_path) > 0,
         score=sidecar_match_score(video_path, zh_path),
+        text_authority=chinese_text_authority,
     )
     for segment in zh_segments:
         segment["source_language"] = "zh"
@@ -1603,6 +2097,7 @@ def find_existing_sidecar_subtitle_tracks(
             language="en",
             likely_match=sidecar_match_score(video_path, en_path) > 0,
             score=sidecar_match_score(video_path, en_path),
+            text_authority=english_text_authority,
         )
         for segment in en_segments:
             segment["source_language"] = "en"
@@ -2439,8 +2934,80 @@ def split_plain_text(text: str, max_words: int, max_chars: int, min_chunks: int 
     return [chunk for chunk in chunks if chunk]
 
 
-def split_text_balanced(text: str, chunk_count: int, joiner: str) -> List[str]:
-    units = list(text) if joiner == "" else text.split()
+def compact_split_units(text: str) -> List[str]:
+    return re.findall(
+        r"[\(\uff08][A-Za-z0-9][A-Za-z0-9 .'%:/+\-]{0,30}[\)\uff09]"
+        r"|[A-Za-z0-9]+(?:[.'\u2019:/+\-][A-Za-z0-9]+)*%?[ \t]*"
+        r"|[ \t]+|.",
+        text,
+        flags=re.DOTALL,
+    )
+
+
+def chinese_split_units(text: str) -> List[str]:
+    tokens = [token for token in jieba.lcut(text, cut_all=False, HMM=True) if token]
+    if "".join(tokens) != text:
+        return compact_split_units(text)
+
+    merged: List[str] = []
+    index = 0
+    while index < len(tokens):
+        if tokens[index] in {"(", "（"}:
+            closing = ")" if tokens[index] == "(" else "）"
+            closing_index = next(
+                (
+                    candidate
+                    for candidate in range(index + 1, min(len(tokens), index + 8))
+                    if tokens[candidate] == closing
+                ),
+                -1,
+            )
+            if closing_index > index:
+                candidate = "".join(tokens[index : closing_index + 1])
+                if re.fullmatch(
+                    r"[\(（][A-Za-z0-9][A-Za-z0-9 .'%:/+\-]{0,30}[\)）]",
+                    candidate,
+                ):
+                    merged.append(candidate)
+                    index = closing_index + 1
+                    continue
+        if (
+            index + 2 < len(tokens)
+            and tokens[index + 1] in {"·", "・"}
+            and re.search(r"[\w\u3400-\u4dbf\u4e00-\u9fff]$", tokens[index])
+            and re.match(r"^[\w\u3400-\u4dbf\u4e00-\u9fff]", tokens[index + 2])
+        ):
+            merged.append(tokens[index] + tokens[index + 1] + tokens[index + 2])
+            index += 3
+            continue
+        merged.append(tokens[index])
+        index += 1
+    return merged
+
+
+def split_text_balanced(
+    text: str,
+    chunk_count: int,
+    joiner: str,
+    *,
+    max_chars: Optional[int] = None,
+    max_words: Optional[int] = None,
+) -> List[str]:
+    use_chinese_words = (
+        joiner == ""
+        and contains_cjk(text)
+        and not JAPANESE_SCRIPT_RE.search(text)
+        and not KOREAN_SCRIPT_RE.search(text)
+    )
+    units = (
+        chinese_split_units(text)
+        if use_chinese_words
+        else (
+            compact_split_units(text)
+            if joiner == ""
+            else re.findall(r"[\[【][^\]】]+[\]】]|\S+", text)
+        )
+    )
     if not units:
         return [""] * max(1, chunk_count)
 
@@ -2448,7 +3015,7 @@ def split_text_balanced(text: str, chunk_count: int, joiner: str) -> List[str]:
     if chunk_count == 1:
         return [joiner.join(units).strip()]
 
-    strong_punctuation = "。！？!?"
+    strong_punctuation = "。！？.!?"
     weak_punctuation = "，、；：,;:"
     no_break_after = {
         "a",
@@ -2480,36 +3047,132 @@ def split_text_balanced(text: str, chunk_count: int, joiner: str) -> List[str]:
         "could",
         "should",
     }
-    boundaries = [0]
-    for boundary_index in range(1, chunk_count):
-        previous = boundaries[-1]
-        remaining_chunks = chunk_count - boundary_index
-        minimum = previous + 1
-        maximum = len(units) - remaining_chunks
-        ideal = round(len(units) * boundary_index / chunk_count)
+    chinese_no_break_after = {
+        "与",
+        "为",
+        "从",
+        "但",
+        "到",
+        "及",
+        "和",
+        "在",
+        "将",
+        "并",
+        "或",
+        "把",
+        "由",
+        "给",
+        "而",
+        "被",
+        "让",
+    }
+    chinese_no_break_before = {
+        "了",
+        "吗",
+        "吧",
+        "呢",
+        "呀",
+        "啊",
+        "地",
+        "得",
+        "的",
+        "着",
+        "过",
+    }
+    full_text = joiner.join(units).strip()
+    target_length = max(1.0, len(full_text) / chunk_count)
+    states: Dict[Tuple[int, int], Tuple[float, Tuple[int, ...]]] = {
+        (0, 0): (0.0, (0,))
+    }
+    for part_index in range(1, chunk_count + 1):
+        minimum_end = part_index
+        maximum_end = len(units) - (chunk_count - part_index)
+        for end in range(minimum_end, maximum_end + 1):
+            best: Optional[Tuple[float, Tuple[int, ...]]] = None
+            for start in range(part_index - 1, end):
+                previous_state = states.get((part_index - 1, start))
+                if previous_state is None:
+                    continue
+                chunk = joiner.join(units[start:end]).strip()
+                if not chunk:
+                    continue
+                bracketed_label = bool(
+                    re.fullmatch(r"[\[【][^\]】]+[\]】]", chunk)
+                )
+                if (
+                    max_chars is not None
+                    and len(chunk) > max_chars
+                    and not bracketed_label
+                ):
+                    continue
+                if (
+                    max_words is not None
+                    and joiner
+                    and len(chunk.split()) > max_words
+                    and not bracketed_label
+                ):
+                    continue
 
-        def boundary_score(end: int) -> Tuple[int, int, int]:
-            previous_unit = units[end - 1]
-            next_unit = units[end] if end < len(units) else ""
-            score = abs(end - ideal) * 4
-            if previous_unit.endswith(tuple(strong_punctuation)):
-                score -= 12
-            elif previous_unit.endswith(tuple(weak_punctuation)):
-                score -= 6
-            if joiner:
-                normalized_previous = previous_unit.rstrip(".,;:!?").casefold()
-                if normalized_previous in no_break_after:
-                    score += 10
-            else:
-                if previous_unit in "（《「『【“‘":
-                    score += 12
-                if next_unit in "），。！？；：》」』】”’":
-                    score += 12
-            return score, abs(end - ideal), end
+                score = previous_state[0] + (len(chunk) - target_length) ** 2
+                if end < len(units):
+                    previous_unit = units[end - 1]
+                    next_unit = units[end]
+                    punctuation_weight = target_length * target_length
+                    if previous_unit.endswith(tuple(strong_punctuation)):
+                        score -= punctuation_weight * 0.8
+                    elif previous_unit.endswith(tuple(weak_punctuation)):
+                        score -= punctuation_weight * 0.35
+                    if (
+                        previous_unit.rstrip().endswith(("]", "】"))
+                        and start == 0
+                    ):
+                        score += punctuation_weight * 0.5
+                    if joiner:
+                        normalized_previous = previous_unit.rstrip(".,;:!?").casefold()
+                        if normalized_previous in no_break_after:
+                            score += punctuation_weight * 1.5
+                    else:
+                        if previous_unit.strip() in chinese_no_break_after:
+                            score += punctuation_weight * 1.5
+                        if next_unit.strip() in chinese_no_break_before:
+                            score += punctuation_weight * 1.5
+                        if previous_unit in "（《「『【“‘":
+                            score += punctuation_weight
+                        if next_unit in "），。！？；：》」』】”’":
+                            score += punctuation_weight
+                        prefix = "".join(units[:end])
+                        suffix = "".join(units[end:])
+                        for opening, closing in (
+                            ("《", "》"),
+                            ("「", "」"),
+                            ("『", "』"),
+                            ("【", "】"),
+                            ("（", "）"),
+                            ("(", ")"),
+                            ("[", "]"),
+                        ):
+                            if (
+                                prefix.count(opening) > prefix.count(closing)
+                                and closing in suffix
+                            ):
+                                score += punctuation_weight * 4.0
+                candidate = (
+                    score,
+                    (*previous_state[1], end),
+                )
+                if best is None or candidate < best:
+                    best = candidate
+            if best is not None:
+                states[(part_index, end)] = best
 
-        selected = min(range(minimum, maximum + 1), key=boundary_score)
-        boundaries.append(selected)
-    boundaries.append(len(units))
+    final_state = states.get((chunk_count, len(units)))
+    if final_state is None and (max_chars is not None or max_words is not None):
+        return split_text_balanced(text, chunk_count, joiner)
+    boundaries = list(
+        final_state[1]
+        if final_state is not None
+        else tuple(round(len(units) * index / chunk_count) for index in range(chunk_count + 1))
+    )
 
     chunks: List[str] = []
     for index in range(chunk_count):
@@ -2528,6 +3191,445 @@ def track_chunk_count(text: str, max_words: int, max_chars: int, is_cjk: bool) -
         math.ceil(len(text.split()) / max_words),
         math.ceil(len(text) / max_chars),
     )
+
+
+def is_bracketed_label(text: str) -> bool:
+    return bool(re.fullmatch(r"[\[【][^\]】]+[\]】]", text.strip()))
+
+
+SEMANTIC_SENTENCE_ENDINGS = ".!?;。！？；"
+SEMANTIC_CLOSING_MARKS = "\"'”’）)]】"
+ENGLISH_ABBREVIATIONS = {
+    "dr.",
+    "mr.",
+    "mrs.",
+    "ms.",
+    "prof.",
+    "st.",
+    "vs.",
+    "etc.",
+    "u.k.",
+    "u.s.",
+}
+
+
+def split_semantic_sentences(text: str) -> List[str]:
+    cleaned = clean_subtitle_text(text)
+    if not cleaned:
+        return []
+
+    chunks: List[str] = []
+    start = 0
+    index = 0
+    bracket_depth = 0
+    while index < len(cleaned):
+        character = cleaned[index]
+        if character in "[【":
+            bracket_depth += 1
+        elif character in "]】" and bracket_depth:
+            bracket_depth -= 1
+        if bracket_depth or character not in SEMANTIC_SENTENCE_ENDINGS:
+            index += 1
+            continue
+
+        boundary_end = index + 1
+        if character == ".":
+            while (
+                boundary_end < len(cleaned)
+                and cleaned[boundary_end] == "."
+            ):
+                boundary_end += 1
+            candidate = cleaned[start:boundary_end].strip()
+            previous_token = (
+                candidate.split()[-1].casefold()
+                if candidate.split()
+                else ""
+            )
+            decimal_point = (
+                index > 0
+                and index + 1 < len(cleaned)
+                and cleaned[index - 1].isdigit()
+                and cleaned[index + 1].isdigit()
+            )
+            if previous_token in ENGLISH_ABBREVIATIONS or decimal_point:
+                index += 1
+                continue
+
+        while (
+            boundary_end < len(cleaned)
+            and cleaned[boundary_end] in SEMANTIC_CLOSING_MARKS
+        ):
+            boundary_end += 1
+        candidate = cleaned[start:boundary_end].strip()
+        if not re.search(r"[A-Za-z0-9\u3400-\u9fff]", candidate):
+            index = boundary_end
+            continue
+        if cleaned[boundary_end:].strip():
+            chunks.append(candidate)
+            start = boundary_end
+        index = boundary_end
+
+    tail = cleaned[start:].strip()
+    if tail:
+        chunks.append(tail)
+    return chunks or [cleaned]
+
+
+def split_aligned_bilingual_sentences(
+    en_text: str,
+    zh_text: str,
+    target_chunk_count: int,
+    max_chunk_count: int,
+    *,
+    max_words: int,
+    en_max_chars: int,
+    zh_max_chars: int,
+    en_is_compact: bool,
+    layout_policy: Optional[SubtitleLayoutPolicy],
+) -> Optional[Tuple[List[str], List[str]]]:
+    en_sentences = split_semantic_sentences(en_text)
+    zh_sentences = split_semantic_sentences(zh_text)
+    if (
+        len(en_sentences) <= 1
+        or len(en_sentences) != len(zh_sentences)
+    ):
+        return None
+
+    bilingual = True
+    pair_chunk_counts: List[int] = []
+    for en_sentence, zh_sentence in zip(en_sentences, zh_sentences):
+        required = max(
+            track_chunk_count(
+                en_sentence,
+                max_words,
+                en_max_chars,
+                is_cjk=en_is_compact,
+            ),
+            track_chunk_count(
+                zh_sentence,
+                max_words,
+                zh_max_chars,
+                is_cjk=True,
+            ),
+        )
+        if layout_policy is not None:
+            required = max(
+                required,
+                layout_policy.required_chunks(
+                    en_sentence,
+                    "en",
+                    bilingual=bilingual,
+                ),
+                layout_policy.required_chunks(
+                    zh_sentence,
+                    "zh",
+                    bilingual=bilingual,
+                ),
+            )
+        pair_chunk_counts.append(required)
+
+    if sum(pair_chunk_counts) > max_chunk_count:
+        return None
+    while sum(pair_chunk_counts) < target_chunk_count:
+        candidates = [
+            (
+                max(
+                    len(en_sentences[index]) / pair_chunk_counts[index],
+                    len(zh_sentences[index]) / pair_chunk_counts[index],
+                ),
+                index,
+            )
+            for index in range(len(pair_chunk_counts))
+        ]
+        _, selected = max(candidates)
+        pair_chunk_counts[selected] += 1
+        if sum(pair_chunk_counts) >= max_chunk_count:
+            break
+
+    en_chunks: List[str] = []
+    zh_chunks: List[str] = []
+    for en_sentence, zh_sentence, chunk_count in zip(
+        en_sentences,
+        zh_sentences,
+        pair_chunk_counts,
+    ):
+        en_chunks.extend(
+            split_text_balanced(
+                en_sentence,
+                chunk_count,
+                joiner="" if en_is_compact else " ",
+                max_chars=en_max_chars,
+                max_words=None if en_is_compact else max_words,
+            )
+        )
+        zh_chunks.extend(
+            split_text_balanced(
+                zh_sentence,
+                chunk_count,
+                joiner="",
+                max_chars=zh_max_chars,
+            )
+        )
+    if len(en_chunks) != len(zh_chunks):
+        return None
+    return en_chunks, zh_chunks
+
+
+BRACKETED_SECTION_RE = re.compile(r"[\[【][^\]】]+[\]】]")
+
+
+def split_bracketed_sections(text: str) -> List[Tuple[str, str]]:
+    cleaned = clean_subtitle_text(text)
+    matches = list(BRACKETED_SECTION_RE.finditer(cleaned))
+    if not matches:
+        return [("", cleaned)] if cleaned else []
+
+    sections: List[Tuple[str, str]] = []
+    prefix = cleaned[: matches[0].start()].strip()
+    if prefix:
+        sections.append(("", prefix))
+    for index, match in enumerate(matches):
+        body_end = (
+            matches[index + 1].start()
+            if index + 1 < len(matches)
+            else len(cleaned)
+        )
+        sections.append(
+            (
+                match.group(0).strip(),
+                cleaned[match.end() : body_end].strip(),
+            )
+        )
+    return sections
+
+
+def labeled_chunk_text(label: str, body: str, joiner: str) -> str:
+    if not label:
+        return body
+    if not body:
+        return label
+    return f"{label}{joiner}{body}"
+
+
+def aligned_chunk_fits(
+    chunk: str,
+    *,
+    max_chars: int,
+    max_words: Optional[int],
+    layout_policy: Optional[SubtitleLayoutPolicy],
+    track: str,
+) -> bool:
+    if not chunk or is_bracketed_label(chunk):
+        return True
+    leading_label = re.match(
+        r"^[\[【][^\]】]+[\]】]\s*(?P<body>.+)$",
+        chunk,
+    )
+    measured_text = (
+        leading_label.group("body").strip()
+        if leading_label is not None
+        else chunk
+    )
+    if len(measured_text) > max_chars:
+        return False
+    if max_words is not None and len(measured_text.split()) > max_words:
+        return False
+    return layout_policy is None or layout_policy.fits(
+        chunk,
+        track,
+        bilingual=True,
+    )
+
+
+def split_aligned_bilingual_sections(
+    en_text: str,
+    zh_text: str,
+    target_chunk_count: int,
+    max_chunk_count: int,
+    *,
+    max_words: int,
+    en_max_chars: int,
+    zh_max_chars: int,
+    en_is_compact: bool,
+    layout_policy: Optional[SubtitleLayoutPolicy],
+) -> Optional[Tuple[List[str], List[str]]]:
+    en_sections = split_bracketed_sections(en_text)
+    zh_sections = split_bracketed_sections(zh_text)
+    if (
+        not any(label for label, _body in en_sections)
+        or len(en_sections) != len(zh_sections)
+        or any(
+            bool(en_label) != bool(zh_label)
+            for (en_label, _en_body), (zh_label, _zh_body) in zip(
+                en_sections,
+                zh_sections,
+            )
+        )
+    ):
+        return None
+
+    section_chunk_counts: List[int] = []
+    for (en_label, en_body), (zh_label, zh_body) in zip(
+        en_sections,
+        zh_sections,
+    ):
+        en_full = labeled_chunk_text(
+            en_label,
+            en_body,
+            "" if en_is_compact else " ",
+        )
+        zh_full = labeled_chunk_text(zh_label, zh_body, "")
+        required = max(
+            track_chunk_count(
+                en_full,
+                max_words,
+                en_max_chars,
+                is_cjk=en_is_compact,
+            ),
+            track_chunk_count(
+                zh_full,
+                max_words,
+                zh_max_chars,
+                is_cjk=True,
+            ),
+        )
+        if layout_policy is not None:
+            required = max(
+                required,
+                layout_policy.required_chunks(
+                    en_full,
+                    "en",
+                    bilingual=True,
+                ),
+                layout_policy.required_chunks(
+                    zh_full,
+                    "zh",
+                    bilingual=True,
+                ),
+            )
+        section_chunk_counts.append(required)
+
+    if sum(section_chunk_counts) > max_chunk_count:
+        return None
+    while sum(section_chunk_counts) < target_chunk_count:
+        candidates = [
+            (
+                max(
+                    len(en_body) / section_chunk_counts[index],
+                    len(zh_body) / section_chunk_counts[index],
+                ),
+                index,
+            )
+            for index, (
+                (_en_label, en_body),
+                (_zh_label, zh_body),
+            ) in enumerate(zip(en_sections, zh_sections))
+            if en_body or zh_body
+        ]
+        if not candidates:
+            break
+        _, selected = max(candidates)
+        section_chunk_counts[selected] += 1
+        if sum(section_chunk_counts) >= max_chunk_count:
+            break
+
+    en_chunks: List[str] = []
+    zh_chunks: List[str] = []
+    for (
+        (en_label, en_body),
+        (zh_label, zh_body),
+        chunk_count,
+    ) in zip(en_sections, zh_sections, section_chunk_counts):
+        body_chunks = split_aligned_bilingual_sentences(
+            en_body,
+            zh_body,
+            chunk_count,
+            chunk_count,
+            max_words=max_words,
+            en_max_chars=en_max_chars,
+            zh_max_chars=zh_max_chars,
+            en_is_compact=en_is_compact,
+            layout_policy=layout_policy,
+        )
+        if body_chunks is not None and len(body_chunks[0]) == chunk_count:
+            section_en, section_zh = body_chunks
+        else:
+            section_en = (
+                split_text_balanced(
+                    en_body,
+                    chunk_count,
+                    joiner="" if en_is_compact else " ",
+                    max_chars=en_max_chars,
+                    max_words=None if en_is_compact else max_words,
+                )
+                if en_body
+                else [""] * chunk_count
+            )
+            section_zh = (
+                split_text_balanced(
+                    zh_body,
+                    chunk_count,
+                    joiner="",
+                    max_chars=zh_max_chars,
+                )
+                if zh_body
+                else [""] * chunk_count
+            )
+        section_en += [""] * (chunk_count - len(section_en))
+        section_zh += [""] * (chunk_count - len(section_zh))
+        section_en[0] = labeled_chunk_text(
+            en_label,
+            section_en[0],
+            "" if en_is_compact else " ",
+        )
+        section_zh[0] = labeled_chunk_text(
+            zh_label,
+            section_zh[0],
+            "",
+        )
+
+        attached_fits = all(
+            aligned_chunk_fits(
+                chunk,
+                max_chars=en_max_chars,
+                max_words=None if en_is_compact else max_words,
+                layout_policy=layout_policy,
+                track="en",
+            )
+            for chunk in section_en
+        ) and all(
+            aligned_chunk_fits(
+                chunk,
+                max_chars=zh_max_chars,
+                max_words=None,
+                layout_policy=layout_policy,
+                track="zh",
+            )
+            for chunk in section_zh
+        )
+        if not attached_fits:
+            if not en_label or chunk_count < 2:
+                return None
+            remaining_count = chunk_count - 1
+            section_en = [en_label, *split_text_balanced(
+                en_body,
+                remaining_count,
+                joiner="" if en_is_compact else " ",
+                max_chars=en_max_chars,
+                max_words=None if en_is_compact else max_words,
+            )]
+            section_zh = [zh_label, *split_text_balanced(
+                zh_body,
+                remaining_count,
+                joiner="",
+                max_chars=zh_max_chars,
+            )]
+        en_chunks.extend(section_en)
+        zh_chunks.extend(section_zh)
+
+    if len(en_chunks) != len(zh_chunks):
+        return None
+    return en_chunks, zh_chunks
 
 
 def valid_word_timestamps(segment: Segment) -> List[Dict[str, Any]]:
@@ -2550,6 +3652,8 @@ def allocate_words_to_chunks(
     chunks: List[str],
     *,
     compact_text: bool,
+    min_duration: float = MIN_SUBTITLE_DURATION,
+    max_duration: Optional[float] = None,
 ) -> List[List[Dict[str, Any]]]:
     if len(chunks) <= 1:
         return [words]
@@ -2560,15 +3664,61 @@ def allocate_words_to_chunks(
         for chunk in chunks
     ]
     total_weight = sum(weights)
-    boundaries = [0]
-    cumulative_weight = 0
-    for index, weight in enumerate(weights[:-1], 1):
-        cumulative_weight += weight
-        ideal = round(len(words) * cumulative_weight / total_weight)
-        minimum = boundaries[-1] + 1
-        maximum = len(words) - (len(chunks) - index)
-        boundaries.append(max(minimum, min(maximum, ideal)))
-    boundaries.append(len(words))
+    cumulative_weights = [0]
+    for weight in weights:
+        cumulative_weights.append(cumulative_weights[-1] + weight)
+
+    states: Dict[Tuple[int, int], Tuple[float, Tuple[int, ...]]] = {
+        (0, 0): (0.0, (0,))
+    }
+    for chunk_index in range(1, len(chunks) + 1):
+        minimum_end = chunk_index
+        maximum_end = len(words) - (len(chunks) - chunk_index)
+        expected_words = len(words) * weights[chunk_index - 1] / total_weight
+        ideal_boundary = (
+            len(words)
+            * cumulative_weights[chunk_index]
+            / total_weight
+        )
+        for end in range(minimum_end, maximum_end + 1):
+            best: Optional[Tuple[float, Tuple[int, ...]]] = None
+            for start in range(chunk_index - 1, end):
+                previous = states.get((chunk_index - 1, start))
+                if previous is None:
+                    continue
+                duration = (
+                    float(words[end - 1]["end"])
+                    - float(words[start]["start"])
+                )
+                score = previous[0]
+                score += ((end - start) - expected_words) ** 2 * 2.0
+                score += (end - ideal_boundary) ** 2 * 0.25
+                if duration < min_duration:
+                    score += (min_duration - duration) ** 2 * 1000.0
+                if max_duration is not None and duration > max_duration:
+                    score += (duration - max_duration) ** 2 * 2.0
+                if end < len(words):
+                    pause = max(
+                        0.0,
+                        float(words[end]["start"])
+                        - float(words[end - 1]["end"]),
+                    )
+                    score -= min(pause, 3.0) ** 2 * 12.0
+                    if re.search(
+                        r"[.!?。！？;；]$",
+                        str(words[end - 1].get("word") or "").strip(),
+                    ):
+                        score -= 8.0
+                candidate = (score, (*previous[1], end))
+                if best is None or candidate < best:
+                    best = candidate
+            if best is not None:
+                states[(chunk_index, end)] = best
+
+    final_state = states.get((len(chunks), len(words)))
+    if final_state is None:
+        return []
+    boundaries = list(final_state[1])
     return [
         words[boundaries[index] : boundaries[index + 1]]
         for index in range(len(chunks))
@@ -2613,9 +3763,14 @@ def split_bilingual_segment(
         available_chunk_counts.append(
             max(1, len(source_text) if source_is_cjk else len(source_text.split()))
         )
-    max_available_chunks = min(available_chunk_counts) if available_chunk_counts else 1
+    max_available_chunks = max(available_chunk_counts) if available_chunk_counts else 1
     if word_timestamps:
         max_available_chunks = min(max_available_chunks, len(word_timestamps))
+    max_timed_chunks = max(
+        1,
+        math.floor((duration + 1e-9) / MIN_SUBTITLE_DURATION),
+    )
+    max_chunk_count = min(max_available_chunks, max_timed_chunks)
     chunk_count = max(
         1,
         math.ceil(duration / max_duration),
@@ -2644,19 +3799,63 @@ def split_bilingual_segment(
                     bilingual=False,
                 ),
             )
-    chunk_count = min(chunk_count, max_available_chunks)
+    chunk_count = min(chunk_count, max_chunk_count)
+    word_timing_track = str(
+        segment.get("word_timing_track") or ""
+    ).casefold()
+    word_groups: List[List[Dict[str, Any]]] = []
 
     while True:
-        en_chunks = (
-            split_text_balanced(
+        aligned_chunks = None
+        if en_text and zh_text:
+            aligned_chunks = split_aligned_bilingual_sections(
                 en_text,
+                zh_text,
                 chunk_count,
-                joiner="" if en_is_compact else " ",
+                max_chunk_count,
+                max_words=max_words,
+                en_max_chars=en_max_chars,
+                zh_max_chars=zh_max_chars,
+                en_is_compact=en_is_compact,
+                layout_policy=layout_policy,
             )
-            if en_text
-            else [""] * chunk_count
-        )
-        zh_chunks = split_text_balanced(zh_text, chunk_count, joiner="") if zh_text else [""] * chunk_count
+            if aligned_chunks is None:
+                aligned_chunks = split_aligned_bilingual_sentences(
+                    en_text,
+                    zh_text,
+                    chunk_count,
+                    max_chunk_count,
+                    max_words=max_words,
+                    en_max_chars=en_max_chars,
+                    zh_max_chars=zh_max_chars,
+                    en_is_compact=en_is_compact,
+                    layout_policy=layout_policy,
+                )
+        if aligned_chunks is not None:
+            en_chunks, zh_chunks = aligned_chunks
+            chunk_count = len(en_chunks)
+        else:
+            en_chunks = (
+                split_text_balanced(
+                    en_text,
+                    chunk_count,
+                    joiner="" if en_is_compact else " ",
+                    max_chars=en_max_chars,
+                    max_words=None if en_is_compact else max_words,
+                )
+                if en_text
+                else [""] * chunk_count
+            )
+            zh_chunks = (
+                split_text_balanced(
+                    zh_text,
+                    chunk_count,
+                    joiner="",
+                    max_chars=zh_max_chars,
+                )
+                if zh_text
+                else [""] * chunk_count
+            )
         en_chunks += [""] * (chunk_count - len(en_chunks))
         zh_chunks += [""] * (chunk_count - len(zh_chunks))
         if source_is_en:
@@ -2664,34 +3863,76 @@ def split_bilingual_segment(
         elif source_is_zh:
             text_chunks = zh_chunks
         else:
-            text_chunks = split_text_balanced(source_text, chunk_count, joiner=source_joiner)
+            text_chunks = split_text_balanced(
+                source_text,
+                chunk_count,
+                joiner=source_joiner,
+                max_chars=source_char_limit,
+                max_words=None if source_is_cjk else max_words,
+            )
             text_chunks += [""] * (chunk_count - len(text_chunks))
         limits_ok = all(
-            (
-                not chunk
-                or (
-                    len(chunk) <= en_max_chars
-                    and (en_is_compact or len(chunk.split()) <= max_words)
-                )
+            aligned_chunk_fits(
+                chunk,
+                max_chars=en_max_chars,
+                max_words=None if en_is_compact else max_words,
+                layout_policy=layout_policy,
+                track="en",
             )
             for chunk in en_chunks
-        ) and all(not chunk or len(chunk) <= zh_max_chars for chunk in zh_chunks) and all(
-            not chunk
-            or (
-                len(chunk) <= source_char_limit
-                and (source_is_cjk or len(chunk.split()) <= max_words)
+        ) and all(
+            aligned_chunk_fits(
+                chunk,
+                max_chars=zh_max_chars,
+                max_words=None,
+                layout_policy=layout_policy,
+                track="zh",
             )
-            for chunk in text_chunks
+            for chunk in zh_chunks
+        ) and (
+            source_is_en
+            or source_is_zh
+            or all(
+                not chunk
+                or (
+                    len(chunk) <= source_char_limit
+                    and (source_is_cjk or len(chunk.split()) <= max_words)
+                )
+                or is_bracketed_label(chunk)
+                for chunk in text_chunks
+            )
         )
-        if layout_policy is not None:
+        if layout_policy is not None and not (source_is_en or source_is_zh):
             limits_ok = limits_ok and all(
-                not chunk or layout_policy.fits(chunk, "en", bilingual=bilingual)
-                for chunk in en_chunks
-            ) and all(
-                not chunk or layout_policy.fits(chunk, "zh", bilingual=bilingual)
-                for chunk in zh_chunks
+                not chunk
+                or is_bracketed_label(chunk)
+                or layout_policy.fits(
+                    chunk,
+                    "zh" if source_is_cjk else "en",
+                    bilingual=bilingual,
+                )
+                for chunk in text_chunks
             )
-        if limits_ok or chunk_count >= max_available_chunks:
+        timing_chunks = (
+            en_chunks
+            if word_timestamps and word_timing_track == "en"
+            else (
+                zh_chunks
+                if word_timestamps and word_timing_track == "zh"
+                else (
+                    en_chunks
+                    if source_is_en
+                    else (zh_chunks if source_is_zh else text_chunks)
+                )
+            )
+        )
+        word_groups = allocate_words_to_chunks(
+            word_timestamps,
+            timing_chunks,
+            compact_text=source_is_cjk,
+            max_duration=max_duration,
+        )
+        if limits_ok or chunk_count >= max_chunk_count:
             break
         chunk_count += 1
 
@@ -2704,6 +3945,15 @@ def split_bilingual_segment(
         chunk_count > 1
         and segment.get("timing_origin")
         and not word_timestamps
+        and not (
+            layout_policy is not None
+            and str(
+                segment.get("source_text_authority")
+                or segment.get("text_authority")
+                or ""
+            )
+            == "ocr"
+        )
     ):
         return [
             {
@@ -2719,16 +3969,6 @@ def split_bilingual_segment(
             }
         ]
 
-    timing_chunks = (
-        en_chunks
-        if source_is_en
-        else (zh_chunks if source_is_zh else text_chunks)
-    )
-    word_groups = allocate_words_to_chunks(
-        word_timestamps,
-        timing_chunks,
-        compact_text=source_is_cjk,
-    )
     output: List[Segment] = []
     for index in range(chunk_count):
         word_group = word_groups[index] if word_groups else []
@@ -2944,6 +4184,95 @@ def model_guard_temporal_gap(first: Segment, second: Segment) -> float:
     return min(abs(second_start - first_end), abs(first_start - second_end))
 
 
+def ocr_fragment_covered_by_adjacent_chinese(
+    source_segments: List[Segment],
+    index: int,
+    *,
+    max_boundary_gap: float = 0.35,
+    max_duration: float = 4.5,
+) -> bool:
+    if index <= 0 or index + 1 >= len(source_segments):
+        return False
+    source = source_segments[index]
+    source_authority = str(
+        source.get("source_text_authority")
+        or source.get("text_authority")
+        or ""
+    )
+    source_text = source_track_text(source)
+    if (
+        source_authority != "ocr"
+        or not source_text
+        or clean_subtitle_text(str(source.get("zh") or ""))
+        or float(source["end"]) - float(source["start"]) > max_duration
+    ):
+        return False
+
+    from subtitle_pipeline import is_sdh_sound_cue
+
+    if is_sdh_sound_cue(source_text):
+        return False
+    if re.match(r"^[A-Z][A-Z0-9 .'-]{1,30}:", source_text):
+        return False
+
+    previous = source_segments[index - 1]
+    following = source_segments[index + 1]
+    if not clean_subtitle_text(str(previous.get("zh") or "")):
+        return False
+    if not clean_subtitle_text(str(following.get("zh") or "")):
+        return False
+    previous_gap = abs(float(source["start"]) - float(previous["end"]))
+    following_gap = abs(float(following["start"]) - float(source["end"]))
+    return (
+        previous_gap <= max_boundary_gap
+        and following_gap <= max_boundary_gap
+    )
+
+
+def ocr_tiny_fragment_covered_by_following_chinese(
+    source_segments: List[Segment],
+    index: int,
+    *,
+    max_boundary_gap: float = 0.12,
+    max_duration: float = 0.75,
+    max_words: int = 2,
+) -> bool:
+    if index < 0 or index + 1 >= len(source_segments):
+        return False
+    source = source_segments[index]
+    source_authority = str(
+        source.get("source_text_authority")
+        or source.get("text_authority")
+        or ""
+    )
+    source_text = source_track_text(source)
+    source_words = re.findall(r"\b[\w'-]+\b", source_text)
+    if (
+        source_authority != "ocr"
+        or not source_text
+        or clean_subtitle_text(str(source.get("zh") or ""))
+        or float(source["end"]) - float(source["start"]) > max_duration
+        or not source_words
+        or len(source_words) > max_words
+    ):
+        return False
+
+    following = source_segments[index + 1]
+    following_chinese = clean_subtitle_text(str(following.get("zh") or ""))
+    following_authority = str(
+        following.get("chinese_text_authority")
+        or following.get("text_authority")
+        or ""
+    )
+    boundary_gap = float(following["start"]) - float(source["end"])
+    return (
+        following_authority == "authored"
+        and bool(following_chinese)
+        and boundary_gap <= max_boundary_gap
+        and boundary_gap >= -max_boundary_gap
+    )
+
+
 def model_hide_support_reason(
     source_segments: List[Segment],
     processed_segments: List[Segment],
@@ -2952,6 +4281,22 @@ def model_hide_support_reason(
     max_gap: float = 4.0,
 ) -> Optional[str]:
     source = source_segments[index]
+    source_text = source_track_text(source)
+    source_authority = str(
+        source.get("source_text_authority")
+        or source.get("text_authority")
+        or ""
+    )
+    if (
+        source_authority == "ocr"
+        and source_text.startswith("%")
+        and not clean_subtitle_text(str(source.get("zh") or ""))
+    ):
+        return "ocr_symbol_fragment"
+    if ocr_fragment_covered_by_adjacent_chinese(source_segments, index):
+        return "ocr_fragment_covered_by_adjacent_chinese"
+    if ocr_tiny_fragment_covered_by_following_chinese(source_segments, index):
+        return "ocr_tiny_fragment_covered_by_following_chinese"
     source_keys = model_guard_text_keys(source)
     meaningful_keys = [key for key in source_keys if model_guard_key_is_meaningful(key)]
     if not meaningful_keys:
@@ -2991,6 +4336,23 @@ def guard_model_hidden_segment_at(
     index: int,
 ) -> None:
     segment = processed_segments[index]
+    if (
+        segment.get("non_content_credit")
+        or segment.get("suppression_reason") == "subtitle_credit"
+    ):
+        segment["display"] = False
+        segment["model_display_requested"] = False
+        segment["display_guard"] = "accepted_hidden"
+        segment["display_guard_reason"] = "subtitle_credit"
+        return
+    if (
+        segment.get("manual_reviewed_at")
+        and segment.get("display", True) is False
+    ):
+        segment["model_display_requested"] = False
+        segment["display_guard"] = "accepted_hidden"
+        segment["display_guard_reason"] = "manual_review"
+        return
     if segment.get("display_suppression"):
         segment["display"] = False
         return
@@ -3167,7 +4529,10 @@ def prepare_segments_for_output(
     visible: List[Segment] = []
     deduplicated = suppress_recent_exact_duplicates(segments, max_duration=max_duration)
     for segment in deduplicated:
-        if segment.get("display", True) is False:
+        if (
+            segment.get("display", True) is False
+            or segment.get("non_content_credit")
+        ):
             continue
         item = dict(segment)
         item.setdefault("checkpoint_segment_id", item.get("id"))
@@ -3692,6 +5057,19 @@ def validate_terminology_review_response(
     data: Any,
     expected_count: int,
 ) -> Dict[int, Dict[str, Any]]:
+    if isinstance(data, dict):
+        wrapped = next(
+            (
+                data.get(key)
+                for key in ("items", "results", "terminology")
+                if isinstance(data.get(key), list)
+            ),
+            None,
+        )
+        if wrapped is not None:
+            data = wrapped
+        elif expected_count == 1:
+            data = [data]
     if not isinstance(data, list) or len(data) != expected_count:
         raise ValueError(
             "Terminology review response must contain exactly "
@@ -4054,6 +5432,8 @@ def register_terminology(
         if not source or not target:
             continue
         key = source.casefold()
+        if key in CONTEXT_DEPENDENT_TERMINOLOGY_SOURCES:
+            continue
         existing = glossary.get(key)
         if existing is None:
             existing = {"source": source, "target": target}
@@ -4114,24 +5494,62 @@ def apply_terminology_overrides(
     return [dict(entry) for entry in glossary.values()]
 
 
-def source_contains_term(source_text: str, source_term: str) -> bool:
+def source_term_spans(source_text: str, source_term: str) -> List[Tuple[int, int]]:
     source = normalize_space(source_term)
     if not source:
-        return False
+        return []
     source_pattern = re.escape(source.casefold())
     if source.isascii() and any(character.isalnum() for character in source):
         source_pattern = rf"(?<!\w){source_pattern}(?!\w)"
-    return bool(re.search(source_pattern, normalize_space(source_text).casefold()))
+    normalized_text = normalize_space(source_text).casefold()
+    return [match.span() for match in re.finditer(source_pattern, normalized_text)]
+
+
+def source_contains_term(source_text: str, source_term: str) -> bool:
+    return bool(source_term_spans(source_text, source_term))
+
+
+CONTEXT_DEPENDENT_TERMINOLOGY_SOURCES = {
+    "sex",
+}
 
 
 def applicable_terminology_entries(
     entries: List[Dict[str, str]],
     source_text: str,
 ) -> List[Dict[str, str]]:
+    candidates: List[Tuple[int, Dict[str, str], List[Tuple[int, int]], int]] = []
+    for index, entry in enumerate(entries):
+        source = normalize_space(str(entry.get("source") or ""))
+        if source.casefold() in CONTEXT_DEPENDENT_TERMINOLOGY_SOURCES:
+            continue
+        spans = source_term_spans(source_text, source)
+        if spans:
+            candidates.append((index, entry, spans, len(source)))
+
+    covered_spans: List[Tuple[int, int]] = []
+    selected_indexes: set[int] = set()
+    for index, _entry, spans, _source_length in sorted(
+        candidates,
+        key=lambda candidate: (-candidate[3], candidate[0]),
+    ):
+        independent_spans = [
+            span
+            for span in spans
+            if not any(
+                span[0] >= covered[0] and span[1] <= covered[1]
+                for covered in covered_spans
+            )
+        ]
+        if not independent_spans:
+            continue
+        selected_indexes.add(index)
+        covered_spans.extend(independent_spans)
+
     return [
         entry
-        for entry in entries
-        if source_contains_term(source_text, str(entry.get("source") or ""))
+        for index, entry in enumerate(entries)
+        if index in selected_indexes
     ]
 
 
@@ -4158,16 +5576,21 @@ def format_terminology_glossary(
     if not glossary:
         return "(none yet)"
     values = list(glossary.values())
-    relevant = [
-        entry
+    relevant = applicable_terminology_entries(values, relevant_source_text)
+    relevant_keys = {
+        normalize_space(entry["source"]).casefold()
+        for entry in relevant
+    }
+    shadowed_relevant_keys = {
+        normalize_space(entry["source"]).casefold()
         for entry in values
         if source_contains_term(relevant_source_text, entry["source"])
-    ]
+    } - relevant_keys
     selected: List[Dict[str, str]] = []
     selected_keys: set[str] = set()
     for entry in relevant + values[-250:]:
         key = entry["source"].casefold()
-        if key in selected_keys:
+        if key in selected_keys or key in shadowed_relevant_keys:
             continue
         selected.append(entry)
         selected_keys.add(key)
@@ -4189,16 +5612,137 @@ def terminology_conflicts(
         if key and key not in combined:
             combined[key] = entry
 
-    target_folded = normalize_space(target_text).casefold()
     conflicts: List[Dict[str, str]] = []
-    for entry in combined.values():
+    for entry in applicable_terminology_entries(
+        list(combined.values()),
+        source_text,
+    ):
         source = normalize_space(entry["source"])
         target = normalize_space(entry["target"])
         if not source or not target:
             continue
-        if source_contains_term(source_text, source) and target.casefold() not in target_folded:
+        if not terminology_target_present(target_text, target):
             conflicts.append(dict(entry))
     return conflicts
+
+
+def terminology_target_present(target_text: str, required_target: str) -> bool:
+    compact_text = re.sub(r"\s+", "", normalize_space(target_text)).casefold()
+    compact_target = re.sub(r"\s+", "", normalize_space(required_target)).casefold()
+    return bool(compact_target and compact_target in compact_text)
+
+
+def canonicalize_approved_terminology_targets(
+    source_text: str,
+    target_text: str,
+    glossary: Dict[str, Dict[str, str]],
+) -> str:
+    output = normalize_space(target_text)
+    for entry in applicable_terminology_entries(
+        list(glossary.values()),
+        source_text,
+    ):
+        target = normalize_space(str(entry.get("target") or ""))
+        compact_target = re.sub(r"\s+", "", target)
+        if not compact_target:
+            continue
+        loose_pattern = r"\s*".join(re.escape(character) for character in compact_target)
+        output = re.sub(loose_pattern, target, output, flags=re.IGNORECASE)
+    return normalize_space(output)
+
+
+def preserve_authored_chinese_terminology(
+    segment: Segment,
+    original_chinese: str,
+    proposed_chinese: str,
+    source_text: str,
+    glossary: Dict[str, Dict[str, str]],
+) -> str:
+    proposed = canonicalize_approved_terminology_targets(
+        source_text,
+        proposed_chinese,
+        glossary,
+    )
+    required = applicable_terminology_entries(
+        list(glossary.values()),
+        source_text,
+    )
+    missing = [
+        entry
+        for entry in required
+        if not terminology_target_present(
+            proposed,
+            str(entry.get("target") or ""),
+        )
+    ]
+    if (
+        missing
+        and str(segment.get("chinese_text_authority") or "") == "authored"
+        and all(
+            terminology_target_present(
+                original_chinese,
+                str(entry.get("target") or ""),
+            )
+            or authored_chinese_satisfies_technical_term(
+                segment,
+                original_chinese,
+                entry,
+            )
+            for entry in missing
+        )
+    ):
+        return canonicalize_approved_terminology_targets(
+            source_text,
+            original_chinese,
+            glossary,
+        )
+    return proposed
+
+
+def authored_chinese_satisfies_technical_term(
+    segment: Segment,
+    original_chinese: str,
+    entry: Dict[str, str],
+) -> bool:
+    if str(segment.get("chinese_text_authority") or "") != "authored":
+        return False
+    source = normalize_space(str(entry.get("source") or ""))
+    target = re.sub(r"[\W_]+", "", str(entry.get("target") or ""), flags=re.UNICODE)
+    original = re.sub(r"[\W_]+", "", original_chinese, flags=re.UNICODE)
+    if (
+        not source
+        or source != source.casefold()
+        or not any("a" <= character <= "z" for character in source)
+        or len(target) < 4
+        or not original
+    ):
+        return False
+
+    positions: List[int] = []
+    cursor = 0
+    for character in target.casefold():
+        position = original.casefold().find(character, cursor)
+        if position < 0:
+            return False
+        positions.append(position)
+        cursor = position + 1
+    return positions[-1] - positions[0] + 1 <= len(target) + 8
+
+
+def filter_authored_chinese_terminology_conflicts(
+    segment: Segment,
+    original_chinese: str,
+    conflicts: List[Dict[str, str]],
+) -> List[Dict[str, str]]:
+    return [
+        entry
+        for entry in conflicts
+        if not authored_chinese_satisfies_technical_term(
+            segment,
+            original_chinese,
+            entry,
+        )
+    ]
 
 
 SPEAKER_LABEL_RE = re.compile(
@@ -4430,7 +5974,7 @@ def analyze_movie_style(
             if (
                 isinstance(cached, dict)
                 and cached.get("version") == STYLE_GUIDE_POLICY_VERSION
-                and cached.get("status") == "ready"
+                and cached.get("status") in {"ready", "unavailable"}
                 and cached.get("llm_model") == llm_model
                 and cached.get("input_fingerprint") == input_fingerprint
             ):
@@ -4456,22 +6000,35 @@ Required decisions:
 - punctuation_policy: punctuation suitable for professional on-screen Simplified Chinese.
 - terminology: only recurring names or terms with a stable source-to-Chinese mapping.
 
-Do not edit individual subtitle lines. Do not add markdown or explanations.
+    Do not edit individual subtitle lines. Do not add markdown or explanations.
 """
     response_schema = movie_style_schema()
-    raw = parse_json_response(
-        call_llm(
-            prompt,
-            (
-                "You are the lead subtitle editor establishing a movie-wide style bible "
-                "before independent translators begin."
-            ),
-            llm_model,
-            role="proofread",
-            response_schema=response_schema,
-        ),
-        response_schema=response_schema,
-    )
+    raw: Any = None
+    for attempt in range(3):
+        try:
+            raw = parse_json_response(
+                call_llm(
+                    prompt,
+                    (
+                        "You are the lead subtitle editor establishing a movie-wide style bible "
+                        "before independent translators begin."
+                    ),
+                    llm_model,
+                    role="proofread",
+                    response_schema=response_schema,
+                    seed_offset=attempt,
+                ),
+                response_schema=response_schema,
+            )
+            break
+        except Exception as exc:
+            print(
+                "Movie-wide style analysis failed "
+                f"(attempt {attempt + 1}/3): {exc}"
+            )
+            if attempt == 2:
+                raise
+            time.sleep(2)
     if not isinstance(raw, dict):
         raise ValueError("Movie-wide style analysis did not return a JSON object")
     style_guide = normalize_style_guide(
@@ -4514,7 +6071,13 @@ def apply_display_timing(
     context_end: float,
 ) -> Segment:
     output = dict(segment)
-    display = parse_display_flag(item.get("display", item.get("show", item.get("keep", True))))
+    display = (
+        False
+        if segment.get("non_content_credit")
+        else parse_display_flag(
+            item.get("display", item.get("show", item.get("keep", True)))
+        )
+    )
     output["display"] = display
     if display:
         output.pop("model_display_requested", None)
@@ -4565,9 +6128,13 @@ def is_language_valid(
     require_corrected: bool = True,
     original_translation: str = "",
 ) -> bool:
-    if require_corrected and not normalize_space(corrected):
+    original_text = clean_subtitle_text(original_text)
+    corrected = clean_subtitle_text(corrected)
+    translated = clean_subtitle_text(translated)
+    original_translation = clean_subtitle_text(original_translation)
+    if require_corrected and not corrected:
         return False
-    if not normalize_space(translated):
+    if not translated:
         return False
 
     orig_cjk_count = len(CJK_RE.findall(original_text))
@@ -4632,7 +6199,6 @@ def retry_single_segment_llm(
             0,
             segment,
             next_start=next_start,
-            include_readability_limits=True,
         )
         prompt = f"""
 You will proofread only the TARGET LINE(S).
@@ -4670,16 +6236,18 @@ Rules:
 - One input line must still produce one output object for checkpointing.
 {display_requirement}
 - Correct obvious source-language and Chinese OCR/subtitle recognition errors.
+- When SOURCE_AUTHORITY=ocr and the Chinese lane is authored, use the authored Chinese meaning to reconstruct fluent, grammatical source-language text instead of preserving nonsensical OCR wording.
+- Correct only the content present inside this TARGET timestamp. Fragments are valid: never copy, complete, or move words or meaning from PREVIOUS/FOLLOWING CONTEXT into the target.
 - When SOURCE_AUTHORITY=authored, copy the source-language text unchanged into corrected_english.
 - Only ASR/OCR events may be hidden as proven duplicate loops; authored subtitle events must remain visible.
 - Convert Traditional Chinese to natural Simplified Chinese.
 - If corrected_chinese is already non-empty and complete, preserve its meaning and only proofread it. Do not replace it with a fresh translation.
 - Translate source-track information into corrected_chinese only when the original Chinese is empty or clearly incomplete.
+- Preserve every unique fact, clause, speaker label, number, and sound cue inside this TARGET timestamp. Never summarize or omit content to make the object shorter.
+- This editing object may span several seconds and will be split into readable display cues after proofreading. Do not enforce final line-length limits here.
 - `corrected_english` is a legacy field name for the source track. Keep it in SOURCE_LANGUAGE and never translate it into English.
 - If the source contains SDH/non-speech cues such as music, applause, laughter, or speaker labels and the Chinese line lacks that information, add only that missing cue in concise Simplified Chinese.
 - You MUST translate uppercase descriptive text in parentheses or brackets (e.g. "(SIGHS)" or "[MUSIC]") into Simplified Chinese.
-- LIMITS are maximum visible character budgets calculated from the available display time. If Chinese exceeds ZH_MAX, condense it without losing the intended meaning. Otherwise preserve the existing Chinese meaning and wording as much as possible.
-- Keep each Chinese line within 16 characters and each source line within 42 characters where the text permits.
 - Keep names and recurring terminology consistent across the context. Do not translate a name in one line and leave the same name untranslated in another unless the context clearly requires it.
 - Reuse every applicable APPROVED MOVIE-WIDE TERMINOLOGY mapping exactly.
 - In terminology, return only personal names or recurring terms that occur in this target line. Use an empty list when there are none.
@@ -4693,7 +6261,6 @@ Rules:
             0,
             segment,
             next_start=next_start,
-            include_readability_limits=True,
         )
         prompt = f"""
 You will correct and translate only the TARGET LINE(S).
@@ -4734,13 +6301,14 @@ Rules:
 - Do not output previous or following context lines.
 - Do not add explanations, markdown, notes, or extra keys.
 - Correct obvious ASR/OCR/subtitle errors in the source text before translating.
+- Correct only the content present inside this TARGET timestamp. Fragments are valid: never copy, complete, or move words or meaning from PREVIOUS/FOLLOWING CONTEXT into the target.
 - When SOURCE_AUTHORITY=authored, copy the source text unchanged into corrected_text.
 - When SOURCE_AUTHORITY=ocr but RECOGNITION_RISK=no_recognition_risk, preserve the source unless the context proves an error.
 - Only ASR/OCR events may be hidden as proven duplicate loops; authored subtitle events must remain visible.
 - Keep corrected_text in the original source language.
 - Translate into natural Simplified Chinese.
-- LIMITS are maximum visible character budgets calculated from the available display time. Keep chinese_translation within ZH_MAX by using concise natural Chinese without dropping the intended meaning.
-- Keep each Chinese line within 16 characters and each source line within 42 characters where the text permits.
+- Preserve every unique fact, clause, speaker label, number, and sound cue inside this TARGET timestamp. Never summarize or omit content to make the object shorter.
+- This editing object may span several seconds and will be split into readable display cues after translation. Do not enforce final line-length limits here.
 - Keep personal names and recurring terminology consistent across the context. Do not translate a name in one line and leave the same name untranslated in another unless the context clearly requires it.
 - Reuse every applicable APPROVED MOVIE-WIDE TERMINOLOGY mapping exactly.
 - In terminology, return only personal names or recurring terms that occur in this target line. Use an empty list when there are none.
@@ -4768,9 +6336,27 @@ Every exact target string above must appear in the Chinese output. Do not shorte
 a full name to only a surname. These required names take precedence over the
 soft character target when both cannot be satisfied.
 """
+    required_authored_cues: List[str] = []
+    if is_proofread:
+        _, original_chinese = original_en_zh(segment)
+        if str(segment.get("chinese_text_authority") or "") == "authored":
+            required_authored_cues = AUTHORED_CHINESE_CUE_RE.findall(
+                original_chinese
+            )
+    if required_authored_cues:
+        cue_text = "\n".join(f"- {cue}" for cue in required_authored_cues)
+        prompt += f"""
+
+=== REQUIRED AUTHORED CHINESE LABELS OR CUES ===
+{cue_text}
+
+Preserve the complete meaning of every label or cue above. You may normalize
+brackets and punctuation, but must not omit a speaker name, role, or sound cue.
+"""
     response_role = "proofread" if is_proofread else "translation"
     response_schema = indexed_subtitle_schema(1, response_role)
     validation_feedback = ""
+    last_safe_proofread_item: Optional[Dict[str, Any]] = None
     for attempt in range(10):
         try:
             attempt_prompt = prompt
@@ -4816,16 +6402,35 @@ not an explanation.
                 if is_proofread:
                     orig_en, orig_zh = original_en_zh(segment)
                     corrected = (
-                        clean_subtitle_text(
-                            str(item.get("corrected_english") or orig_en)
+                        preserve_authored_source(
+                            segment,
+                            orig_en,
+                            clean_subtitle_text(
+                                str(item.get("corrected_english") or orig_en)
+                            ),
                         )
                         if orig_en
                         else ""
                     )
-                    translated = str(item.get("corrected_chinese") or item.get("chinese_translation") or "")
+                    translated = to_simplified_text(
+                        clean_subtitle_text(
+                            str(
+                                item.get("corrected_chinese")
+                                or item.get("chinese_translation")
+                                or ""
+                            )
+                        )
+                    )
                     translated = restore_glossary_speaker_label(
                         corrected or orig_en,
                         translated,
+                        terminology_glossary or {},
+                    )
+                    translated = preserve_authored_chinese_terminology(
+                        segment,
+                        orig_zh,
+                        translated,
+                        corrected or orig_en or orig_zh,
                         terminology_glossary or {},
                     )
                     item["corrected_chinese"] = translated
@@ -4845,17 +6450,44 @@ not an explanation.
                         require_corrected=bool(orig_en),
                         original_translation=orig_zh,
                     )
+                    content_retained = authored_chinese_content_retained(
+                        segment,
+                        orig_zh,
+                        translated,
+                    )
                     conflicts = terminology_conflicts(
                         terminology_glossary or {},
                         corrected or orig_en or orig_zh,
                         translated,
                         proposed_terminology,
                     )
+                    conflicts = filter_authored_chinese_terminology_conflicts(
+                        segment,
+                        orig_zh,
+                        conflicts,
+                    )
                     if language_preserved and language_valid and not conflicts:
+                        last_safe_proofread_item = dict(item)
+                    if (
+                        language_preserved
+                        and language_valid
+                        and content_retained
+                        and not conflicts
+                    ):
                         return item
                 else:
-                    corrected = str(item.get("corrected_text") or item.get("corrected_source") or segment.get("text", ""))
-                    translated = str(item.get("chinese_translation") or "")
+                    corrected = clean_subtitle_text(
+                        str(
+                            item.get("corrected_text")
+                            or item.get("corrected_source")
+                            or segment.get("text", "")
+                        )
+                    )
+                    translated = to_simplified_text(
+                        clean_subtitle_text(
+                            str(item.get("chinese_translation") or "")
+                        )
+                    )
                     translated = restore_glossary_speaker_label(
                         corrected,
                         translated,
@@ -4895,6 +6527,20 @@ not an explanation.
                         "The Chinese output or source-language output failed "
                         "language validation; return both complete tracks."
                     )
+                if is_proofread and not content_retained:
+                    cue_detail = (
+                        " Required labels or cues: "
+                        + "; ".join(required_authored_cues)
+                        + "."
+                        if required_authored_cues
+                        else ""
+                    )
+                    feedback.append(
+                        "The previous Chinese output omitted too much authored "
+                        "content. Preserve every unique fact, clause, label, "
+                        "number, and cue from this target."
+                        + cue_detail
+                    )
                 if conflicts:
                     missing = ", ".join(
                         f"{entry['source']} => {entry['target']}"
@@ -4920,6 +6566,31 @@ not an explanation.
                 "schema. Return only one complete raw JSON object in the list."
             )
     
+    if is_proofread and last_safe_proofread_item:
+        original_source, original_chinese = original_en_zh(segment)
+        fallback_chinese = preserve_authored_chinese_terminology(
+            segment,
+            original_chinese,
+            to_simplified_text(clean_subtitle_text(original_chinese)),
+            str(
+                last_safe_proofread_item.get("corrected_english")
+                or original_source
+                or original_chinese
+            ),
+            terminology_glossary or {},
+        )
+        fallback_item = dict(last_safe_proofread_item)
+        fallback_item["corrected_chinese"] = fallback_chinese
+        if authored_chinese_content_retained(
+            segment,
+            original_chinese,
+            fallback_chinese,
+        ):
+            print(
+                "All 10 single-item retries omitted authored content; "
+                "preserving the original Chinese track and continuing."
+            )
+            return fallback_item
     print(
         "All 10 single-item retries failed; stopping the current batch "
         "and preserving the latest checkpoint."
@@ -5018,7 +6689,6 @@ def translate_and_correct_segments(
                     if i + j + 1 < len(segments)
                     else None
                 ),
-                include_readability_limits=True,
             )
             for j, segment in enumerate(batch)
         )
@@ -5070,22 +6740,24 @@ Schema:
 
 Rules:
 - One input line must still produce one output object for checkpointing.
-- If adjacent TARGET lines are ASR repetitions or overlapping fragments of the same spoken sentence, keep the earliest suitable object visible and set only later redundant objects to "display": false.
-- For the kept object, use corrected_text and chinese_translation for the complete sentence.
+- Hide a later TARGET line only when it is a proven near-exact duplicate already fully represented by an overlapping visible cue.
+- Keep genuine continuations as separate timed fragments. Never complete an earlier object with words or meaning from a later TARGET line.
 - Never output or change timestamps. Timing is enforced by the subtitle pipeline.
 - If a TARGET line only repeats or continues a sentence already clearly represented in PREVIOUS CONTEXT, set "display": false.
 - If two TARGET lines are genuine consecutive new information, keep both visible.
 - Do not output previous or following context lines.
 - Do not add explanations, markdown, notes, or extra keys.
 - Correct obvious ASR/OCR/subtitle errors in the source text before translating.
+- Correct only the content present inside each TARGET timestamp. Context is evidence for recognition and terminology, not text to copy into the target.
 - When SOURCE_AUTHORITY=authored, copy the source text unchanged into corrected_text.
 - When SOURCE_AUTHORITY=ocr but RECOGNITION_RISK=no_recognition_risk, preserve the source unless the context proves an error.
 - Only ASR/OCR events may be hidden as proven duplicate loops; authored subtitle events must remain visible.
 - Keep corrected_text in the original source language.
 - Translate into natural Simplified Chinese.
 - You MUST translate uppercase descriptive text in parentheses or brackets (e.g. "(SIGHS)" or "[MUSIC]") into Simplified Chinese.
-- LIMITS are maximum visible character budgets calculated from the available display time. Keep chinese_translation within ZH_MAX by using concise natural Chinese without dropping the intended meaning.
-- Keep each Chinese line within 16 characters and each source line within 42 characters where the text permits.
+- Preserve every unique fact, clause, speaker label, number, and sound cue inside each TARGET timestamp. Never summarize or omit content to make an object shorter.
+- A TARGET object may span several seconds and will be split into readable display cues after translation. Do not enforce final line-length limits in this editing response.
+- Before returning, verify that object index N contains only the meaning of TARGET [N], never the preceding or following target.
 - Keep personal names and recurring terminology consistent across the context. Do not translate a name in one line and leave the same name untranslated in another unless the context clearly requires it.
 - Reuse every applicable APPROVED MOVIE-WIDE TERMINOLOGY mapping exactly.
 - In terminology, return only personal names or recurring terms that occur in that target line. Once a mapping is approved, never propose a different target. Use an empty list when there are none.
@@ -5417,7 +7089,6 @@ def proofread_existing_chinese_segments(
                     if i + j + 1 < len(segments)
                     else None
                 ),
-                include_readability_limits=True,
             )
             for j, segment in enumerate(batch)
         )
@@ -5470,20 +7141,23 @@ Schema:
 Rules:
 - One input line must still produce one output object for checkpointing.
 - Correct obvious source-language and Chinese OCR/subtitle recognition errors.
+- When SOURCE_AUTHORITY=ocr and the Chinese lane is authored, use the authored Chinese meaning to reconstruct fluent, grammatical source-language text instead of preserving nonsensical OCR wording.
+- Correct only the content present inside each TARGET timestamp. Fragments are valid: never copy, complete, or move words or meaning from neighboring TARGET or context lines.
 - When SOURCE_AUTHORITY=authored, copy the source-language text unchanged into corrected_english.
 - Only ASR/OCR events may be hidden as proven duplicate loops; authored subtitle events must remain visible.
 - Convert Traditional Chinese to natural Simplified Chinese.
 - If corrected_chinese is already non-empty and complete, preserve its meaning and only proofread it. Do not replace it with a fresh translation.
 - Translate source-track information into corrected_chinese only when the original Chinese is empty or clearly incomplete.
+- Preserve every unique fact, clause, speaker label, number, and sound cue inside each TARGET timestamp. Never summarize or omit content to make an object shorter.
+- A TARGET object may span several seconds and will be split into readable display cues after proofreading. Do not enforce final line-length limits in this editing response.
+- Before returning, verify that object index N contains only the meaning of TARGET [N], never the preceding or following target.
 - `corrected_english` is a legacy field name for the source track. Keep it in SOURCE_LANGUAGE and never translate it into English.
 - If the source contains SDH/non-speech cues such as music, applause, laughter, or speaker labels and the Chinese line lacks that information, add only that missing cue in concise Simplified Chinese.
 - You MUST translate uppercase descriptive text in parentheses or brackets (e.g. "(SIGHS)" or "[MUSIC]") into Simplified Chinese.
-- LIMITS are maximum visible character budgets calculated from the available display time. If Chinese exceeds ZH_MAX, condense it without losing the intended meaning. Otherwise preserve the existing Chinese meaning and wording as much as possible.
-- Keep each Chinese line within 16 characters and each source line within 42 characters where the text permits.
 - Keep names and recurring terminology consistent across the context. Do not translate a name in one line and leave the same name untranslated in another unless the context clearly requires it.
 - Reuse every applicable APPROVED MOVIE-WIDE TERMINOLOGY mapping exactly.
 - In terminology, return only personal names or recurring terms that occur in that target line. Once a mapping is approved, never propose a different target. Use an empty list when there are none.
-- If adjacent TARGET lines are repeated, overlapping, or fragments of the same subtitle, keep the earliest suitable object visible and set only later redundant objects to "display": false.
+- Hide a later TARGET line only when it is a proven near-exact duplicate already fully represented by an overlapping visible cue. Keep genuine continuations separately timed.
 - Never output or change timestamps. Timing is enforced by the subtitle pipeline.
 - Keep corrected_english empty only when no source track exists.
 - Do not output previous or following context lines.
@@ -5553,6 +7227,13 @@ Rules:
                     to_simplified_text(clean_subtitle_text(corrected_zh_val)),
                     glossary,
                 )
+                corrected_zh = preserve_authored_chinese_terminology(
+                    segment,
+                    original_zh,
+                    corrected_zh,
+                    corrected_en or original_en or original_zh,
+                    glossary,
+                )
                 candidate_metadata = {
                     **segment,
                     "en": corrected_en,
@@ -5586,6 +7267,36 @@ Rules:
                     corrected_zh,
                     proposed_terminology,
                 )
+                conflicts = filter_authored_chinese_terminology_conflicts(
+                    segment,
+                    original_zh,
+                    conflicts,
+                )
+                borrowed_phrase = adjacent_context_borrowed_phrase(
+                    segments,
+                    i + j,
+                    corrected_en,
+                )
+                if not borrowed_phrase:
+                    borrowed_phrase = previous_output_borrowed_phrase(
+                        segments,
+                        i + j,
+                        [*processed_segments, *batch_processed],
+                        corrected_en,
+                        corrected_zh,
+                    )
+                if authored_chinese_title_card_allows_ocr_reconstruction(
+                    segment,
+                    original_zh,
+                    corrected_en,
+                    borrowed_phrase,
+                ):
+                    borrowed_phrase = ""
+                content_retained = authored_chinese_content_retained(
+                    segment,
+                    original_zh,
+                    corrected_zh,
+                )
 
                 if display and (
                     not source_language_preserved(
@@ -5600,7 +7311,9 @@ Rules:
                         require_corrected=bool(original_en),
                         original_translation=original_zh,
                     )
+                    or not content_retained
                     or conflicts
+                    or borrowed_phrase
                 ):
                     forced_model_hide = (
                         guarded_candidate.get("display_guard") == "forced_visible"
@@ -5651,6 +7364,13 @@ Rules:
                         to_simplified_text(clean_subtitle_text(corrected_zh_val)),
                         glossary,
                     )
+                    corrected_zh = preserve_authored_chinese_terminology(
+                        segment,
+                        original_zh,
+                        corrected_zh,
+                        corrected_en or original_en or original_zh,
+                        glossary,
+                    )
                     candidate_metadata.update(
                         {
                             "en": corrected_en,
@@ -5685,6 +7405,36 @@ Rules:
                         corrected_zh,
                         proposed_terminology,
                     )
+                    conflicts = filter_authored_chinese_terminology_conflicts(
+                        segment,
+                        original_zh,
+                        conflicts,
+                    )
+                    borrowed_phrase = adjacent_context_borrowed_phrase(
+                        segments,
+                        i + j,
+                        corrected_en,
+                    )
+                    if not borrowed_phrase:
+                        borrowed_phrase = previous_output_borrowed_phrase(
+                            segments,
+                            i + j,
+                            [*processed_segments, *batch_processed],
+                            corrected_en,
+                            corrected_zh,
+                        )
+                    if authored_chinese_title_card_allows_ocr_reconstruction(
+                        segment,
+                        original_zh,
+                        corrected_en,
+                        borrowed_phrase,
+                    ):
+                        borrowed_phrase = ""
+                    content_retained = authored_chinese_content_retained(
+                        segment,
+                        original_zh,
+                        corrected_zh,
+                    )
                     if display and (
                         not source_language_preserved(
                             segment,
@@ -5698,9 +7448,80 @@ Rules:
                             require_corrected=bool(original_en),
                             original_translation=original_zh,
                         )
+                        or not content_retained
                         or conflicts
+                        or borrowed_phrase
                     ):
-                        raise RuntimeError(f"LLM returned an invalid proofread result for segment {i + j}")
+                        suppression_reason = None
+                        if ocr_fragment_covered_by_adjacent_chinese(
+                            segments,
+                            i + j,
+                        ):
+                            suppression_reason = (
+                                "ocr_fragment_covered_by_adjacent_chinese"
+                            )
+                        elif ocr_tiny_fragment_covered_by_following_chinese(
+                            segments,
+                            i + j,
+                        ):
+                            suppression_reason = (
+                                "ocr_tiny_fragment_covered_by_following_chinese"
+                            )
+                        if suppression_reason:
+                            guarded_candidate.update(
+                                {
+                                    "en": "",
+                                    "zh": "",
+                                    "display": False,
+                                    "display_suppression": suppression_reason,
+                                    "display_guard": "accepted_hidden",
+                                    "display_guard_reason": suppression_reason,
+                                }
+                            )
+                            proposed_terminology = []
+                            display = False
+                        else:
+                            validation_failures = []
+                            if not source_language_preserved(
+                                segment,
+                                original_en,
+                                corrected_en,
+                            ):
+                                validation_failures.append(
+                                    "source_language_changed"
+                                )
+                            if not is_language_valid(
+                                original_en or original_zh,
+                                corrected_en,
+                                corrected_zh,
+                                require_corrected=bool(original_en),
+                                original_translation=original_zh,
+                            ):
+                                validation_failures.append(
+                                    "invalid_language"
+                                )
+                            if not content_retained:
+                                validation_failures.append(
+                                    "authored_content_omitted"
+                                )
+                            if conflicts:
+                                validation_failures.append(
+                                    "terminology_conflict"
+                                )
+                            if borrowed_phrase:
+                                validation_failures.append(
+                                    "adjacent_context_borrowed"
+                                )
+                            raise RuntimeError(
+                                "LLM returned an invalid proofread result "
+                                f"for segment {i + j}: "
+                                f"{','.join(validation_failures) or 'unknown'}"
+                                + (
+                                    f"; copied adjacent context: {borrowed_phrase!r}"
+                                    if borrowed_phrase
+                                    else ""
+                                )
+                            )
 
                 terminology = (
                     register_terminology(glossary, proposed_terminology)
@@ -5744,23 +7565,64 @@ def final_qa_segment_fingerprint_row(segment: Segment) -> Dict[str, Any]:
     }
 
 
+DEFAULT_FINAL_QA_REVIEW_PROFILE = "independent_final"
+AUTONOMOUS_REVIEW_PASSES = (
+    {
+        "profile": "semantic_integrity",
+        "directive": (
+            "Audit semantic fidelity and source-boundary integrity. Prioritize residual "
+            "ASR/OCR mistakes, missing or invented facts, numbers, names, forms of address, "
+            "speaker labels, and source-only SDH/music/sound cues that Chinese still lacks. "
+            "Change text only when there is a concrete defect; do not make preference-only "
+            "rewrites."
+        ),
+    },
+    {
+        "profile": "professional_readability",
+        "directive": (
+            "Audit professional subtitle language and movie-wide consistency. Correct only "
+            "clear unnatural Chinese, inconsistent names or register, ambiguous punctuation, "
+            "and wording that is unnecessarily hard to read. Preserve every fact and cue, "
+            "never shorten by omission, and never rewrite an authored source track."
+        ),
+    },
+    {
+        "profile": "adversarial_residual",
+        "directive": (
+            "Perform an adversarial residual-error audit. Look specifically for context "
+            "leakage between adjacent timestamps, duplicated recognition loops, language or "
+            "script changes, contradictory terminology, and content present in only one lane. "
+            "Make no stylistic changes unless they fix a demonstrable delivery defect."
+        ),
+    },
+)
+
+
 def final_qa_fingerprint(
     segments: List[Segment],
     llm_model: str,
     style_guide: Optional[Dict[str, Any]],
+    *,
+    review_profile: str = DEFAULT_FINAL_QA_REVIEW_PROFILE,
+    review_directive: str = "",
 ) -> str:
     rows = [final_qa_segment_fingerprint_row(segment) for segment in segments]
+    descriptor: Dict[str, Any] = {
+        "policy_version": FINAL_QA_POLICY_VERSION,
+        "llm_model": llm_model,
+        "style_fingerprint": (style_guide or {}).get("input_fingerprint"),
+        "terminology_review_fingerprint": (style_guide or {}).get(
+            "terminology_review_fingerprint"
+        ),
+        "style_terminology": (style_guide or {}).get("terminology") or [],
+        "segments": rows,
+    }
+    if review_profile != DEFAULT_FINAL_QA_REVIEW_PROFILE:
+        descriptor["review_profile"] = review_profile
+    if review_directive:
+        descriptor["review_directive"] = review_directive
     serialized = json.dumps(
-        {
-            "policy_version": FINAL_QA_POLICY_VERSION,
-            "llm_model": llm_model,
-            "style_fingerprint": (style_guide or {}).get("input_fingerprint"),
-            "terminology_review_fingerprint": (style_guide or {}).get(
-                "terminology_review_fingerprint"
-            ),
-            "style_terminology": (style_guide or {}).get("terminology") or [],
-            "segments": rows,
-        },
+        descriptor,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -5808,8 +7670,17 @@ def run_final_subtitle_qa(
     *,
     style_guide: Optional[Dict[str, Any]] = None,
     batch_size: int = 16,
+    review_profile: str = DEFAULT_FINAL_QA_REVIEW_PROFILE,
+    review_directive: str = "",
+    seed_base: int = 0,
 ) -> Tuple[List[Segment], Dict[str, Any]]:
-    input_fingerprint = final_qa_fingerprint(segments, llm_model, style_guide)
+    input_fingerprint = final_qa_fingerprint(
+        segments,
+        llm_model,
+        style_guide,
+        review_profile=review_profile,
+        review_directive=review_directive,
+    )
     cached: Optional[Dict[str, Any]] = None
     if artifact_path.exists():
         try:
@@ -5842,7 +7713,13 @@ def run_final_subtitle_qa(
         and cached.get("status") in {"pass", "review"}
         and cached.get("llm_model") == llm_model
         and cached.get("output_fingerprint")
-        == final_qa_fingerprint(cached_segments or [], llm_model, style_guide)
+        == final_qa_fingerprint(
+            cached_segments or [],
+            llm_model,
+            style_guide,
+            review_profile=review_profile,
+            review_directive=review_directive,
+        )
         and final_qa_cache_accepts_manual_overrides(cached_segments, segments)
     ):
         reviewed = [dict(segment) for segment in segments]
@@ -5868,6 +7745,8 @@ def run_final_subtitle_qa(
                     reviewed,
                     llm_model,
                     style_guide,
+                    review_profile=review_profile,
+                    review_directive=review_directive,
                 ),
                 "reviewed_count": len(reviewed),
                 "manual_preserved_count": len(manual_ids),
@@ -5875,6 +7754,8 @@ def run_final_subtitle_qa(
                 "rejected_count": len(rejected_items),
                 "rejected_items": rejected_items,
                 "segments": reviewed,
+                "review_profile": review_profile,
+                "review_directive": review_directive,
             }
         )
         write_json_atomic(artifact_path, report)
@@ -5914,6 +7795,9 @@ def run_final_subtitle_qa(
 
     style_text = format_style_guide(style_guide)
     editing_policy = source_editing_policy(segments)
+    review_focus = review_directive or (
+        "Review all residual content, language, terminology, and subtitle-delivery defects."
+    )
     glossary = terminology_from_segments(
         reviewed or segments,
         (style_guide or {}).get("terminology"),
@@ -5937,12 +7821,24 @@ def run_final_subtitle_qa(
             )
         ) or "(none)"
         batch_text = "\n".join(
-            format_bilingual_prompt_segment(index, segment)
+            format_bilingual_prompt_segment(
+                index,
+                segment,
+                next_start=(
+                    float(segments[batch_start + index + 1]["start"])
+                    if batch_start + index + 1 < len(segments)
+                    else None
+                ),
+            )
             for index, segment in enumerate(batch)
         )
         prompt = f"""
 Perform an independent final quality review of only the TARGET LINE(S).
-Another editor already translated and proofread them. Do not trust earlier wording blindly.
+ Another editor already translated and proofread them. Do not trust earlier wording blindly.
+
+=== REVIEW PASS ===
+PROFILE: {review_profile}
+FOCUS: {review_focus}
 
 === MOVIE-WIDE STYLE GUIDE ===
 {style_text}
@@ -5978,6 +7874,9 @@ Schema:
 Rules:
 - Preserve every local index, timestamp, and display decision.
 - Correct residual ASR/OCR errors, grammar, mistranslation, inconsistent names, forms of address, and terminology.
+- When SOURCE_AUTHORITY=ocr and the Chinese lane is authored, use the authored Chinese meaning to reconstruct fluent, grammatical source-language text instead of preserving nonsensical OCR wording.
+- Correct only content present inside each TARGET timestamp. Context is reference only; never copy, complete, or move words or meaning from neighboring cues.
+- Subtitle fragments are valid. Keep genuine continuations separately timed and remove only proven near-exact duplicate loops.
 - Never remove an existing speaker label or SDH/music/sound cue from either language track.
 - Never wrap an entire subtitle in quotation marks unless the original line was already wrapped.
 - When SOURCE_AUTHORITY=authored, preserve the source-language text exactly and review only the Chinese lane.
@@ -5987,7 +7886,9 @@ Rules:
 - Keep a non-empty Chinese subtitle's meaning; translate only source-track information missing from Chinese.
 - Translate source-only SDH/music/sound/speaker cues into concise Simplified Chinese when Chinese lacks them.
 - Apply one rendering for every recurring personal name throughout the movie.
-- Keep source/English within 42 characters and Chinese within 16 characters where meaning permits.
+- Preserve every unique fact, clause, speaker label, number, and sound cue inside each TARGET timestamp. Never summarize or omit content to make an object shorter.
+- A TARGET object may span several seconds and will be split into readable display cues after this review. Do not enforce final line-length limits in the editing response.
+- Before returning, verify that object index N contains only the meaning of TARGET [N], never the preceding or following target.
 - Never add commentary or keys outside the schema.
 """
         response_schema = indexed_subtitle_schema(len(batch), "proofread")
@@ -5997,14 +7898,15 @@ Rules:
                 data = parse_json_response(
                     call_llm(
                         prompt,
-                        (
-                            "You are the independent senior subtitle QC editor. "
-                            "Review the completed bilingual deliverable against the movie-wide style guide."
-                        ),
+                         (
+                            "You are the independent senior subtitle QC editor for the "
+                            f"{review_profile} pass. Review the completed bilingual "
+                            "deliverable against the movie-wide style guide."
+                         ),
                         llm_model,
                         role="proofread",
                         response_schema=response_schema,
-                        seed_offset=attempt,
+                        seed_offset=max(0, int(seed_base)) + attempt,
                     ),
                     response_schema=response_schema,
                 )
@@ -6072,6 +7974,13 @@ Rules:
                 original_zh,
                 corrected_zh,
             )
+            corrected_zh = preserve_authored_chinese_terminology(
+                segment,
+                original_zh,
+                corrected_zh,
+                corrected_source or original_source or original_zh,
+                glossary,
+            )
             proposed_terminology = applicable_terminology_entries(
                 extract_terminology_entries(item),
                 corrected_source or original_source,
@@ -6086,10 +7995,32 @@ Rules:
                 corrected_zh,
                 proposed_terminology,
             )
+            conflicts = filter_authored_chinese_terminology_conflicts(
+                segment,
+                original_zh,
+                conflicts,
+            )
+            borrowed_phrase = adjacent_context_borrowed_phrase(
+                segments,
+                batch_start + local_index,
+                corrected_source,
+            )
+            if authored_chinese_title_card_allows_ocr_reconstruction(
+                segment,
+                original_zh,
+                corrected_source,
+                borrowed_phrase,
+            ):
+                borrowed_phrase = ""
             language_preserved = source_language_preserved(
                 segment,
                 original_source,
                 corrected_source,
+            )
+            content_retained = authored_chinese_content_retained(
+                segment,
+                original_zh,
+                corrected_zh,
             )
             valid = language_preserved and is_language_valid(
                 original_source or original_zh,
@@ -6097,20 +8028,34 @@ Rules:
                 corrected_zh,
                 require_corrected=bool(original_source),
                 original_translation=original_zh,
-            ) and not conflicts
+            ) and content_retained and not conflicts and not borrowed_phrase
             if not valid:
                 batch_reviewed.append(dict(segment))
-                rejected_items.append(
-                    {
-                        "id": segment.get("id"),
-                        "start": segment.get("start"),
-                        "reason": (
-                            "source_language_changed"
-                            if not language_preserved
-                            else "invalid_language_or_terminology"
-                        ),
-                    }
-                )
+                if segment.get("display", True) is not False:
+                    rejected_items.append(
+                        {
+                            "id": segment.get("id"),
+                            "start": segment.get("start"),
+                            "reason": (
+                                "source_language_changed"
+                                if not language_preserved
+                                else (
+                                    "adjacent_context_borrowed"
+                                    if borrowed_phrase
+                                    else (
+                                        "authored_content_omitted"
+                                        if not content_retained
+                                        else "invalid_language_or_terminology"
+                                    )
+                                )
+                            ),
+                            **(
+                                {"detail": borrowed_phrase}
+                                if borrowed_phrase
+                                else {}
+                            ),
+                        }
+                    )
                 continue
 
             output = {
@@ -6174,6 +8119,9 @@ Rules:
                 "changes": changes,
                 "rejected_items": rejected_items,
                 "segments": reviewed,
+                "review_profile": review_profile,
+                "review_directive": review_directive,
+                "seed_base": max(0, int(seed_base)),
             },
         )
 
@@ -6186,6 +8134,8 @@ Rules:
             reviewed,
             llm_model,
             style_guide,
+            review_profile=review_profile,
+            review_directive=review_directive,
         ),
         "reviewed_count": len(reviewed),
         "manual_preserved_count": sum(
@@ -6196,6 +8146,264 @@ Rules:
         "rejected_count": len(rejected_items),
         "changes": changes,
         "rejected_items": rejected_items,
+        "segments": reviewed,
+        "review_profile": review_profile,
+        "review_directive": review_directive,
+        "seed_base": max(0, int(seed_base)),
+    }
+    write_json_atomic(artifact_path, report)
+    return reviewed, report
+
+
+def autonomous_review_fingerprint(
+    segments: List[Segment],
+    llm_model: str,
+    style_guide: Optional[Dict[str, Any]],
+    rounds: int,
+) -> str:
+    selected_passes = AUTONOMOUS_REVIEW_PASSES[:rounds]
+    serialized = json.dumps(
+        {
+            "policy_version": AUTONOMOUS_REVIEW_POLICY_VERSION,
+            "llm_model": llm_model,
+            "rounds": rounds,
+            "passes": list(selected_passes),
+            "input_fingerprint": final_qa_fingerprint(
+                segments,
+                llm_model,
+                style_guide,
+            ),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def autonomous_review_round_artifact_path(
+    artifact_path: Path,
+    round_number: int,
+) -> Path:
+    return artifact_path.with_name(
+        f"{artifact_path.stem}.round-{round_number}{artifact_path.suffix}"
+    )
+
+
+def run_autonomous_subtitle_review(
+    segments: List[Segment],
+    llm_model: str,
+    artifact_path: Path,
+    *,
+    style_guide: Optional[Dict[str, Any]] = None,
+    batch_size: int = 16,
+    rounds: int = 2,
+) -> Tuple[List[Segment], Dict[str, Any]]:
+    if rounds < 1 or rounds > len(AUTONOMOUS_REVIEW_PASSES):
+        raise ValueError(
+            "Autonomous review rounds must be between 1 and "
+            f"{len(AUTONOMOUS_REVIEW_PASSES)}."
+        )
+
+    input_fingerprint = autonomous_review_fingerprint(
+        segments,
+        llm_model,
+        style_guide,
+        rounds,
+    )
+    current_output_fingerprint = final_qa_fingerprint(
+        segments,
+        llm_model,
+        style_guide,
+    )
+    cached: Optional[Dict[str, Any]] = None
+    if artifact_path.exists():
+        try:
+            raw = json.loads(artifact_path.read_text(encoding="utf-8"))
+            if (
+                isinstance(raw, dict)
+                and raw.get("version") == AUTONOMOUS_REVIEW_POLICY_VERSION
+            ):
+                cached = raw
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+
+    if (
+        cached
+        and cached.get("status") in {"pass", "review"}
+        and cached.get("llm_model") == llm_model
+        and cached.get("rounds_requested") == rounds
+        and cached.get("output_fingerprint") == current_output_fingerprint
+    ):
+        print(f"Autonomous review already matches the checkpoint: {artifact_path}")
+        return [dict(segment) for segment in segments], cached
+
+    cached_segments = cached.get("segments") if cached else None
+    if (
+        cached
+        and cached.get("status") in {"pass", "review"}
+        and cached.get("llm_model") == llm_model
+        and cached.get("rounds_requested") == rounds
+        and cached.get("input_fingerprint") == input_fingerprint
+        and isinstance(cached_segments, list)
+        and len(cached_segments) == len(segments)
+        and cached.get("output_fingerprint")
+        == final_qa_fingerprint(cached_segments, llm_model, style_guide)
+    ):
+        print(f"Using cached autonomous subtitle review: {artifact_path}")
+        return [dict(segment) for segment in cached_segments], cached
+
+    reviewed = [dict(segment) for segment in segments]
+    round_summaries: List[Dict[str, Any]] = []
+    changes: List[Dict[str, Any]] = []
+    rejected_items: List[Dict[str, Any]] = []
+    manual_preserved_ids: set[Any] = set()
+
+    for round_index, review_pass in enumerate(
+        AUTONOMOUS_REVIEW_PASSES[:rounds],
+        start=1,
+    ):
+        profile = str(review_pass["profile"])
+        directive = str(review_pass["directive"])
+        round_artifact = autonomous_review_round_artifact_path(
+            artifact_path,
+            round_index,
+        )
+        print(
+            "Autonomous overnight review: "
+            f"round={round_index}/{rounds}, profile={profile}",
+            flush=True,
+        )
+        try:
+            reviewed, round_report = run_final_subtitle_qa(
+                reviewed,
+                llm_model,
+                round_artifact,
+                style_guide=style_guide,
+                batch_size=batch_size,
+                review_profile=profile,
+                review_directive=directive,
+                seed_base=round_index * 1000,
+            )
+        except Exception as exc:
+            failure_report = {
+                "version": AUTONOMOUS_REVIEW_POLICY_VERSION,
+                "status": "failed",
+                "llm_model": llm_model,
+                "rounds_requested": rounds,
+                "rounds_completed": len(round_summaries),
+                "failed_round": round_index,
+                "failed_profile": profile,
+                "input_fingerprint": input_fingerprint,
+                "output_fingerprint": final_qa_fingerprint(
+                    reviewed,
+                    llm_model,
+                    style_guide,
+                ),
+                "reviewed_count": len(reviewed),
+                "manual_preserved_count": len(manual_preserved_ids),
+                "changed_count": len(changes),
+                "rejected_count": len(rejected_items),
+                "changes": changes,
+                "rejected_items": rejected_items,
+                "round_reports": round_summaries,
+                "segments": reviewed,
+                "error": str(exc),
+            }
+            write_json_atomic(artifact_path, failure_report)
+            print(
+                "Autonomous overnight review stopped after the last valid round: "
+                f"{exc}"
+            )
+            return reviewed, failure_report
+
+        tagged_changes = [
+            {
+                **dict(item),
+                "round": round_index,
+                "review_profile": profile,
+            }
+            for item in round_report.get("changes") or []
+            if isinstance(item, dict)
+        ]
+        tagged_rejected = [
+            {
+                **dict(item),
+                "round": round_index,
+                "review_profile": profile,
+            }
+            for item in round_report.get("rejected_items") or []
+            if isinstance(item, dict)
+        ]
+        changes.extend(tagged_changes)
+        rejected_items.extend(tagged_rejected)
+        manual_preserved_ids.update(
+            segment.get("id")
+            for segment in reviewed
+            if segment.get("manual_reviewed_at")
+        )
+        round_summaries.append(
+            {
+                "round": round_index,
+                "profile": profile,
+                "status": round_report.get("status"),
+                "artifact_path": str(round_artifact),
+                "reviewed_count": round_report.get("reviewed_count", len(reviewed)),
+                "changed_count": round_report.get("changed_count", 0),
+                "rejected_count": round_report.get("rejected_count", 0),
+                "manual_preserved_count": round_report.get(
+                    "manual_preserved_count",
+                    0,
+                ),
+            }
+        )
+        write_json_atomic(
+            artifact_path,
+            {
+                "version": AUTONOMOUS_REVIEW_POLICY_VERSION,
+                "status": "running",
+                "llm_model": llm_model,
+                "rounds_requested": rounds,
+                "rounds_completed": round_index,
+                "input_fingerprint": input_fingerprint,
+                "output_fingerprint": final_qa_fingerprint(
+                    reviewed,
+                    llm_model,
+                    style_guide,
+                ),
+                "reviewed_count": len(reviewed),
+                "manual_preserved_count": len(manual_preserved_ids),
+                "changed_count": len(changes),
+                "rejected_count": len(rejected_items),
+                "changes": changes,
+                "rejected_items": rejected_items,
+                "round_reports": round_summaries,
+                "segments": reviewed,
+            },
+        )
+
+    report = {
+        "version": AUTONOMOUS_REVIEW_POLICY_VERSION,
+        "status": "review" if rejected_items else "pass",
+        "llm_model": llm_model,
+        "rounds_requested": rounds,
+        "rounds_completed": rounds,
+        "input_fingerprint": input_fingerprint,
+        "output_fingerprint": final_qa_fingerprint(
+            reviewed,
+            llm_model,
+            style_guide,
+        ),
+        "reviewed_count": len(reviewed),
+        "manual_preserved_count": len(manual_preserved_ids),
+        "changed_count": len(changes),
+        "changed_segment_count": len(
+            {item.get("id") for item in changes if item.get("id") is not None}
+        ),
+        "rejected_count": len(rejected_items),
+        "changes": changes,
+        "rejected_items": rejected_items,
+        "round_reports": round_summaries,
         "segments": reviewed,
     }
     write_json_atomic(artifact_path, report)
@@ -6483,6 +8691,18 @@ def main() -> None:
     parser.add_argument("--subtitle-file", type=str, help="Explicit sidecar subtitle path: srt, ass, ssa, or vtt.")
     parser.add_argument("--chinese-subtitle-file", type=str, help="Explicit Chinese sidecar subtitle path for bilingual merge.")
     parser.add_argument("--english-subtitle-file", type=str, help="Explicit English sidecar subtitle path for bilingual merge.")
+    parser.add_argument(
+        "--chinese-subtitle-text-authority",
+        choices=["authored", "ocr"],
+        default="authored",
+        help="Whether the selected Chinese sidecar is authored text or OCR text.",
+    )
+    parser.add_argument(
+        "--english-subtitle-text-authority",
+        choices=["authored", "ocr"],
+        default="authored",
+        help="Whether the selected English sidecar is authored text or OCR text.",
+    )
     parser.add_argument("--subtitle-stream", type=int, help="Embedded subtitle stream index, e.g. 2 for 0:2.")
     parser.add_argument("--chinese-subtitle-stream", type=int, help="Embedded Chinese subtitle stream index for bilingual merge.")
     parser.add_argument("--english-subtitle-stream", type=int, help="Embedded English subtitle stream index for bilingual merge.")
@@ -6508,6 +8728,16 @@ def main() -> None:
     parser.add_argument("--llm-model", type=str, default="qwen3:14b", help="Ollama model name")
     parser.add_argument("--batch-size", type=int, default=5, help="LLM batch size in subtitle sentence units.")
     parser.add_argument("--context-lines", type=int, default=30, help="Reference this many subtitle lines before and after each target batch.")
+    parser.add_argument(
+        "--autonomous-review-rounds",
+        type=int,
+        choices=range(0, len(AUTONOMOUS_REVIEW_PASSES) + 1),
+        default=0,
+        help=(
+            "Run zero to three checkpointed independent overnight review passes "
+            "before final layout and delivery validation."
+        ),
+    )
     parser.add_argument("--max-words", type=int, default=12, help="Maximum English words per subtitle event")
     parser.add_argument(
         "--max-chars",
@@ -6568,6 +8798,7 @@ def main() -> None:
     )
     style_guide_path = out_dir / f"{movie_name}.style-guide.json"
     final_qa_path = out_dir / f"{movie_name}.final-qa.json"
+    autonomous_review_path = out_dir / f"{movie_name}.autonomous-review.json"
     run_state_file = Path(args.run_state_file) if args.run_state_file else None
 
     sidecar_path = Path(args.subtitle_file or args.srt) if (args.subtitle_file or args.srt) else None
@@ -6916,6 +9147,8 @@ def main() -> None:
                     explicit_path=sidecar_path if (args.subtitle_file or args.srt) else None,
                     explicit_zh_path=chinese_sidecar_path,
                     explicit_en_path=english_sidecar_path,
+                    chinese_text_authority=args.chinese_subtitle_text_authority,
+                    english_text_authority=args.english_subtitle_text_authority,
                 )
                 if existing_tracks:
                     actual_source = "existing Chinese sidecar subtitles"
@@ -6959,6 +9192,8 @@ def main() -> None:
                     explicit_path=None,
                     explicit_zh_path=chinese_sidecar_path,
                     explicit_en_path=english_sidecar_path,
+                    chinese_text_authority=args.chinese_subtitle_text_authority,
+                    english_text_authority=args.english_subtitle_text_authority,
                 )
                 if existing_tracks:
                     actual_source = "existing Chinese sidecar subtitles"
@@ -7296,6 +9531,10 @@ def main() -> None:
                     "version": STYLE_GUIDE_POLICY_VERSION,
                     "status": "unavailable",
                     "llm_model": args.llm_model,
+                    "input_fingerprint": style_guide_fingerprint(
+                        subtitle_segments,
+                        args.llm_model,
+                    ),
                     "error": str(exc),
                     "terminology": [],
                 }
@@ -7306,6 +9545,10 @@ def main() -> None:
                 "version": STYLE_GUIDE_POLICY_VERSION,
                 "status": "skipped_short",
                 "llm_model": args.llm_model,
+                "input_fingerprint": style_guide_fingerprint(
+                    subtitle_segments,
+                    args.llm_model,
+                ),
                 "reason": "Fewer than 12 subtitle events.",
                 "terminology": [],
             }
@@ -7464,6 +9707,71 @@ def main() -> None:
             }
             write_json_atomic(final_qa_path, final_qa_report)
 
+        delivery_qa_report = final_qa_report
+        if args.autonomous_review_rounds and len(processed_segments) >= 12:
+            processed_segments, autonomous_review_report = (
+                run_autonomous_subtitle_review(
+                    processed_segments,
+                    args.llm_model,
+                    autonomous_review_path,
+                    style_guide=style_guide,
+                    batch_size=max(8, args.batch_size * 2),
+                    rounds=args.autonomous_review_rounds,
+                )
+            )
+            delivery_qa_report = autonomous_review_report
+            autonomous_status = str(autonomous_review_report.get("status") or "")
+            combined_status = (
+                autonomous_status
+                if autonomous_status in {"pass", "review"}
+                else final_qa_report.get("status", "failed")
+            )
+            final_qa_report = {
+                **final_qa_report,
+                "status": combined_status,
+                "segments": processed_segments,
+                "output_fingerprint": final_qa_fingerprint(
+                    processed_segments,
+                    args.llm_model,
+                    style_guide,
+                ),
+                "autonomous_review": {
+                    "artifact_path": str(autonomous_review_path),
+                    "status": autonomous_status,
+                    "rounds_requested": autonomous_review_report.get(
+                        "rounds_requested",
+                        args.autonomous_review_rounds,
+                    ),
+                    "rounds_completed": autonomous_review_report.get(
+                        "rounds_completed",
+                        0,
+                    ),
+                    "changed_count": autonomous_review_report.get(
+                        "changed_count",
+                        0,
+                    ),
+                    "rejected_count": autonomous_review_report.get(
+                        "rejected_count",
+                        0,
+                    ),
+                    **(
+                        {"error": autonomous_review_report.get("error")}
+                        if autonomous_review_report.get("error")
+                        else {}
+                    ),
+                },
+            }
+            write_json_atomic(checkpoint_path, processed_segments)
+            write_json_atomic(final_qa_path, final_qa_report)
+            print(
+                "Autonomous overnight review complete: "
+                f"status={autonomous_status}, "
+                f"rounds={autonomous_review_report.get('rounds_completed', 0)}/"
+                f"{args.autonomous_review_rounds}, "
+                f"changed={autonomous_review_report.get('changed_count', 0)}, "
+                f"rejected={autonomous_review_report.get('rejected_count', 0)}"
+            )
+
         subtitle_font_file = (
             validate_font_path(Path(args.subtitle_font_file))
             if args.subtitle_font_file
@@ -7559,6 +9867,8 @@ def main() -> None:
             "render_validation": str(render_validation_path),
             **srt_artifacts,
         }
+        if args.autonomous_review_rounds and autonomous_review_path.exists():
+            artifact_paths["autonomous_review"] = str(autonomous_review_path)
         if render_preview_path.exists():
             artifact_paths["render_preview"] = str(render_preview_path)
         if sync_report_path.exists():
@@ -7605,7 +9915,7 @@ def main() -> None:
             video_duration_seconds=probe_video_duration_seconds(video_path),
             min_duration_seconds=MIN_SUBTITLE_DURATION,
             style_guide=style_guide,
-            final_qa_report=final_qa_report,
+            final_qa_report=delivery_qa_report,
             render_validation=render_validation,
         )
         write_quality_report(quality_report_path, quality_report)

@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import shutil
 from pathlib import Path
 from unittest.mock import patch
 
@@ -109,12 +110,53 @@ class SubtitleDeliveryTests(unittest.TestCase):
         self.assertGreater(report["changed_pixels"], 32)
         command, kwargs = calls[0]
         video_filter = command[command.index("-vf") + 1]
+        self.assertTrue(video_filter.startswith("settb=AVTB,setpts="))
         self.assertRegex(
             video_filter,
             r"ass=filename='subtitle-render-[^']+\.ass'",
         )
         self.assertNotIn(str(ass_path.resolve()), video_filter)
         self.assertEqual(Path(kwargs["cwd"]), root.resolve())
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg is required")
+    def test_ass_render_validation_preserves_fractional_sample_time(self) -> None:
+        segments = [
+            {
+                "id": 0,
+                "checkpoint_segment_id": 0,
+                "start": 0.1,
+                "end": 1.899,
+                "en": "Tonight",
+                "zh": "\u4eca\u665a",
+            }
+        ]
+        ass = """[Script Info]
+ScriptType: v4.00+
+PlayResX: 320
+PlayResY: 180
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,24,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,12,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.10,0:00:01.90,Default,,0,0,0,,Tonight
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            ass_path = root / "Movie.ass"
+            ass_path.write_text(ass, encoding="utf-8")
+            preview_path = root / "preview.png"
+            report = subtitle_delivery.validate_ass_rendering(
+                ass_path,
+                segments,
+                preview_path,
+                play_resolution=(320, 180),
+            )
+
+        self.assertEqual(report["status"], "pass")
+        self.assertGreater(report["changed_pixels"], 32)
 
 
 if __name__ == "__main__":

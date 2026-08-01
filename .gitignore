@@ -6,6 +6,9 @@ test_outputs*/
 runtime/logs/*
 runtime/scratch/*
 runtime/audits/*
+runtime/queue/*
+runtime/remote-bridge/*
+**/.review-evidence/
 !runtime/logs/README.md
 !runtime/scratch/README.md
 

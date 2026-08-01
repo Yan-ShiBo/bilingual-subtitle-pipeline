@@ -262,7 +262,7 @@ class SSHTunnelManager:
                 if exc.errno != errno.EADDRINUSE:
                     raise
                 server.bind(("127.0.0.1", 0))
-                self.local_port = int(server.getsockname()[1])
+            self.local_port = int(server.getsockname()[1])
             server.listen(100)
             server.settimeout(1.0)
             self._server_socket = server

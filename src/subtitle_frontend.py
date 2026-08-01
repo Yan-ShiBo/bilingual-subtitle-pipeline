@@ -2,8 +2,10 @@ import argparse
 import hashlib
 import json
 import math
+import mimetypes
 import os
 import re
+import secrets
 import socket
 import subprocess
 import sys
@@ -20,6 +22,9 @@ from ass_styles import STYLE_PROFILE_NAMES
 from frontend_settings import settings_store
 from output_paths import resolve_output_root
 from pipeline_policy import PROCESSING_POLICY_VERSION, TERMINOLOGY_POLICY_VERSION
+from remote_bridge_manager import bridge_status, ensure_remote_bridge
+from review_evidence import generate_review_evidence
+from subtitle_queue import discover_episode_files, ensure_queue_worker, queue_store
 from subtitle_sources import (
     SubtitleAsset,
     asset_from_dict,
@@ -54,6 +59,9 @@ RUNS: Dict[int, Dict[str, Any]] = {}
 RUNS_LOCK = threading.Lock()
 NAME_CACHE: Dict[str, Dict[str, str]] = {}
 USER_STOP_MARKER = "Frontend task stopped by user"
+REVIEW_MEDIA: Dict[str, Dict[str, Any]] = {}
+REVIEW_MEDIA_LOCK = threading.Lock()
+REVIEW_MEDIA_LIMIT = 600
 
 
 def frontend_source_fingerprint() -> str:
@@ -87,6 +95,17 @@ def strip_release_tags(name: str) -> str:
     value = re.sub(r"\[[^\]]+\]", " ", name or "")
     value = re.sub(r"\(([^)]*)\)", r" \1 ", value)
     value = value.replace(".", " ").replace("_", " ")
+    language_tag = (
+        r"(?:eng(?:lish)?|fre|fra|french|ger|deu|german|ita|italian|por|pt|"
+        r"spa|es|spanish|cze|ces|hun|pol|rus|tha|tur|jpn|japanese|kor|"
+        r"korean|chi|zho|chs|cht)"
+    )
+    value = re.sub(
+        rf"\b{language_tag}(?:[\s-]+{language_tag}){{1,}}\b.*$",
+        " ",
+        value,
+        flags=re.I,
+    )
     tag_pattern = (
         r"\b(2160p|1080p|720p|480p|uhd|bluray|blu-ray|bdrip|remux|web[- ]?dl|webrip|"
         r"hdr10\+?|hdr|dv|dovi|dolby|vision|hevc|h265|x265|avc|h264|x264|"
@@ -132,18 +151,82 @@ def parse_json_response(text: str) -> Any:
         return json.loads(cleaned[start : end + 1])
 
 
+def remote_ollama_base_url(*, wait_for_connection: bool = True) -> str:
+    configured = str(os.environ.get("SUBTITLE_REMOTE_OLLAMA_URL") or "").rstrip("/")
+    if configured:
+        return configured
+    try:
+        status = ensure_remote_bridge(
+            wait_for_connection=wait_for_connection,
+            timeout=25 if wait_for_connection else 3,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "远程 Ollama 桥接尚未就绪；后台会持续重连，请检查 SSH 配置后重试。"
+        ) from exc
+    base_url = str(status.get("base_url") or "").rstrip("/")
+    if not base_url:
+        raise RuntimeError("远程 Ollama 桥接没有发布本地访问地址。")
+    return base_url
+
+
+def remote_settings_support_restart(remote: Dict[str, Any]) -> bool:
+    auth_method = str(remote.get("auth_method") or "key").strip().casefold()
+    if auth_method != "password":
+        return bool(str(remote.get("host") or "").strip())
+    return bool(
+        str(remote.get("host") or "").strip()
+        and remote.get("remember_password")
+        and str(remote.get("password") or "")
+    )
+
+
+def persistent_remote_status(*, start_if_configured: bool = True) -> Dict[str, Any]:
+    status = bridge_status()
+    if not status.get("running") and start_if_configured:
+        loaded = settings_store.load()
+        remote = loaded.get("remote") if isinstance(loaded, dict) else {}
+        if isinstance(remote, dict) and remote_settings_support_restart(remote):
+            try:
+                status = ensure_remote_bridge(
+                    wait_for_connection=False,
+                    timeout=3,
+                )
+            except Exception as exc:
+                status = {
+                    **status,
+                    "connected": False,
+                    "status": "reconnecting",
+                    "error": str(exc),
+                }
+    if status.get("running"):
+        status["persistent_reconnect"] = True
+        return status
+
+    if tunnel_manager:
+        frontend_status = tunnel_manager.status()
+        if frontend_status.get("connected"):
+            frontend_status.update(
+                {
+                    "running": True,
+                    "status": "connected",
+                    "models": tunnel_manager.fetch_models(),
+                    "persistent_reconnect": False,
+                    "connection_owner": "frontend",
+                }
+            )
+            return frontend_status
+    status["persistent_reconnect"] = False
+    return status
+
+
 def call_ollama_json(prompt: str, system_prompt: str, model: str = "qwen3:14b", timeout: int = 45) -> Dict[str, Any]:
     base_url = "http://127.0.0.1:11434"
     if model.startswith("remote:"):
         parts = model.split(":", 2)
         if len(parts) != 3:
             raise ValueError("远程模型标识无效，请重新连接远程服务器。")
-        if not tunnel_manager:
-            raise RuntimeError("当前网页实例没有 SSH 隧道管理器。")
-        remote_status = tunnel_manager.status()
-        if not remote_status.get("connected") or not remote_status.get("local_port"):
-            raise RuntimeError("当前网页实例尚未连接远程服务器，请先点击“远程”连接。")
-        base_url = f"http://127.0.0.1:{int(remote_status['local_port'])}"
+        base_url = remote_ollama_base_url()
         model = parts[2]
 
     payload = {
@@ -238,9 +321,17 @@ def safe_file_part(name: str) -> str:
     return value or "subtitle"
 
 
-def frontend_log_paths(series_name: str, movie_name: str) -> tuple[Path, Path]:
+def frontend_log_paths(
+    series_name: str,
+    movie_name: str,
+    scope: Path | str | None = None,
+) -> tuple[Path, Path]:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     base = f"{safe_file_part(series_name)}__{safe_file_part(movie_name)}"
+    if scope is not None:
+        scope_key = str(Path(scope).expanduser().resolve(strict=False)).replace("\\", "/").casefold()
+        scope_digest = hashlib.sha256(scope_key.encode("utf-8")).hexdigest()[:12]
+        base = f"{base}.{scope_digest}"
     return LOG_DIR / f"{base}.stdout.log", LOG_DIR / f"{base}.stderr.log"
 
 
@@ -651,6 +742,85 @@ def write_json_atomic(path: Path, payload: Any) -> None:
     temporary.replace(path)
 
 
+def register_review_media(path: Path) -> str:
+    resolved = path.resolve(strict=True)
+    if not resolved.is_file():
+        raise FileNotFoundError(f"Review media not found: {resolved}")
+    token = secrets.token_urlsafe(24)
+    with REVIEW_MEDIA_LOCK:
+        if len(REVIEW_MEDIA) >= REVIEW_MEDIA_LIMIT:
+            oldest = sorted(
+                REVIEW_MEDIA,
+                key=lambda key: float(REVIEW_MEDIA[key].get("created_at") or 0),
+            )[: max(1, REVIEW_MEDIA_LIMIT // 5)]
+            for old_token in oldest:
+                REVIEW_MEDIA.pop(old_token, None)
+        REVIEW_MEDIA[token] = {
+            "path": str(resolved),
+            "created_at": time.time(),
+        }
+    return f"/api/review/media/{token}"
+
+
+def review_media_path(token: str) -> Path | None:
+    with REVIEW_MEDIA_LOCK:
+        item = REVIEW_MEDIA.get(str(token or ""))
+    if not item:
+        return None
+    path = Path(str(item.get("path") or ""))
+    return path if path.is_file() else None
+
+
+def build_review_evidence(payload: Dict[str, Any]) -> Dict[str, Any]:
+    selected = Path(str(payload.get("path") or "")).expanduser()
+    video = resolve_video_path(selected)
+    series_name = str(payload.get("series_name") or "").strip()
+    movie_name = str(payload.get("movie_name") or "").strip()
+    if not series_name or not movie_name:
+        names = default_names(
+            selected,
+            video,
+            str(payload.get("llm_model") or "qwen3:14b"),
+        )
+        series_name = series_name or names["series_name"]
+        movie_name = movie_name or names["movie_name"]
+    output_root, _source = resolve_request_output_root(
+        payload,
+        video,
+        series_name,
+        movie_name,
+    )
+    out_dir = output_dir(output_root, series_name, movie_name)
+    checkpoint_path = out_dir / f"{movie_name}.segments.checkpoint.json"
+    if not checkpoint_path.is_file():
+        raise RequestValidationError("没有可用于视听复核的 checkpoint", status=404)
+    checkpoint_items = read_json(checkpoint_path)
+    if not isinstance(checkpoint_items, list):
+        raise RequestValidationError("checkpoint 格式无效")
+    audio_stream_raw = payload.get("audio_stream")
+    audio_stream = None
+    if audio_stream_raw not in (None, ""):
+        try:
+            audio_stream = int(audio_stream_raw)
+        except (TypeError, ValueError) as exc:
+            raise RequestValidationError("音轨编号无效") from exc
+
+    evidence = generate_review_evidence(
+        video,
+        [item for item in checkpoint_items if isinstance(item, dict)],
+        payload.get("id"),
+        out_dir / ".review-evidence",
+        expected_start=payload.get("expected_start"),
+        audio_stream=audio_stream,
+    )
+    evidence["frame_url"] = register_review_media(Path(evidence["frame_path"]))
+    evidence["audio_url"] = register_review_media(Path(evidence["audio_path"]))
+    evidence["waveform_url"] = register_review_media(Path(evidence["waveform_path"]))
+    for key in ("frame_path", "audio_path", "waveform_path"):
+        evidence.pop(key, None)
+    return evidence
+
+
 def flatten_quality_review_items(
     report: Dict[str, Any],
     checkpoint_items: List[Dict[str, Any]],
@@ -1002,6 +1172,9 @@ def analyze_input(payload: Dict[str, Any]) -> Dict[str, Any]:
             "auto_source": auto_source,
             "source_assets": [asset.to_dict() for asset in assets],
             "processing_plan": processing_plan,
+            "analysis_config_fingerprint": str(
+                payload.get("analysis_config_fingerprint") or ""
+            ),
         }
     )
     return info
@@ -1059,6 +1232,11 @@ def remove_translation_outputs(out_dir: Path, movie_name: str) -> None:
     names = [
         f"{movie_name}.segments.checkpoint.json",
         f"{movie_name}.terminology.json",
+        f"{movie_name}.final-qa.json",
+        f"{movie_name}.autonomous-review.json",
+        f"{movie_name}.autonomous-review.round-1.json",
+        f"{movie_name}.autonomous-review.round-2.json",
+        f"{movie_name}.autonomous-review.round-3.json",
         f"{movie_name}.en.ass",
         f"{movie_name}.zh.ass",
         f"{movie_name}.bilingual.ass",
@@ -1115,12 +1293,7 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
     if llm_model.startswith("remote:"):
         if len(llm_model.split(":", 2)) != 3:
             raise ValueError("远程模型标识无效，请重新连接远程服务器。")
-        if not tunnel_manager:
-            raise RuntimeError("当前网页实例没有 SSH 隧道管理器。")
-        remote_status = tunnel_manager.status()
-        if not remote_status.get("connected") or not remote_status.get("local_port"):
-            raise RuntimeError("当前网页实例尚未连接远程服务器，请先点击“远程”连接。")
-        remote_ollama_url = f"http://127.0.0.1:{int(remote_status['local_port'])}"
+        remote_ollama_url = remote_ollama_base_url()
     video = resolve_video_path(selected)
     if not series_name or not movie_name:
         names = default_names(selected, video, llm_model)
@@ -1138,6 +1311,16 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
     merge_existing_subtitles = bool(payload.get("merge_existing_subtitles", True))
     chinese_sidecar_path = payload.get("chinese_subtitle_file")
     english_sidecar_path = payload.get("english_subtitle_file")
+    chinese_subtitle_text_authority = str(
+        payload.get("chinese_subtitle_text_authority") or "authored"
+    ).strip().lower()
+    english_subtitle_text_authority = str(
+        payload.get("english_subtitle_text_authority") or "authored"
+    ).strip().lower()
+    if chinese_subtitle_text_authority not in {"authored", "ocr"}:
+        raise ValueError("Chinese subtitle text authority must be authored or ocr.")
+    if english_subtitle_text_authority not in {"authored", "ocr"}:
+        raise ValueError("English subtitle text authority must be authored or ocr.")
     subtitle_stream = payload.get("subtitle_stream")
     chinese_subtitle_stream = payload.get("chinese_subtitle_stream")
     english_subtitle_stream = payload.get("english_subtitle_stream")
@@ -1147,6 +1330,9 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
     subtitle_ocr_lang = payload.get("subtitle_ocr_lang") or "auto"
     batch_size = int(payload.get("batch_size") or 5)
     context_lines = int(payload.get("context_lines") or 30)
+    autonomous_review_rounds = int(payload.get("autonomous_review_rounds") or 0)
+    if not 0 <= autonomous_review_rounds <= 3:
+        raise ValueError("Autonomous review rounds must be between 0 and 3.")
     max_words = int(payload.get("max_words") or 12)
     max_chars = int(payload.get("max_chars") or 42)
     max_duration = float(payload.get("max_duration") or 5.5)
@@ -1164,7 +1350,7 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     state_path = run_state_path(out_dir, movie_name)
 
-    log_path, err_path = frontend_log_paths(series_name, movie_name)
+    log_path, err_path = frontend_log_paths(series_name, movie_name, out_dir)
 
     args = [
         sys.executable,
@@ -1191,6 +1377,8 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
         str(batch_size),
         "--context-lines",
         str(context_lines),
+        "--autonomous-review-rounds",
+        str(autonomous_review_rounds),
         "--max-words",
         str(max_words),
         "--max-chars",
@@ -1205,6 +1393,10 @@ def start_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
         subtitle_sync,
         "--merge-existing-subtitles",
         "yes" if merge_existing_subtitles else "no",
+        "--chinese-subtitle-text-authority",
+        chinese_subtitle_text_authority,
+        "--english-subtitle-text-authority",
+        english_subtitle_text_authority,
         "--run-state-file",
         str(state_path),
     ]
@@ -1353,7 +1545,15 @@ def stop_processing(payload: Dict[str, Any]) -> Dict[str, Any]:
         recovered_info = None
     stopped = stop_process_tree(pid, recovered_info=recovered_info)
     if stopped:
-        log_path, _ = frontend_log_paths(series_name, movie_name)
+        log_path = (
+            Path(recovered_info["stdout_log"])
+            if recovered_info and recovered_info.get("stdout_log")
+            else frontend_log_paths(
+                series_name,
+                movie_name,
+                output_dir(output_root, series_name, movie_name),
+            )[0]
+        )
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(f"\n{USER_STOP_MARKER}\n")
     status = run_status(payload)
@@ -1381,6 +1581,8 @@ def tail_text(path: Path, max_chars: int = 8000) -> str:
 def active_stage_info(stdout_text: str) -> tuple[str, int]:
     lines = stdout_text.strip().split("\n")
     for line in reversed(lines):
+        if "Autonomous overnight review:" in line:
+            return "大模型自动复核中", 2
         if "Generating bilingual subtitles" in line:
             return "合并中英文字幕中", 2
         if "Starting sentence-level LLM" in line or "Processing segments" in line or "Starting LLM proofreading" in line or "Proofreading segments" in line:
@@ -1489,7 +1691,11 @@ def run_status(payload: Dict[str, Any]) -> Dict[str, Any]:
         with RUNS_LOCK:
             RUNS.pop(pid, None)
         remove_run_state(Path(info_proc["state_path"]) if info_proc.get("state_path") else None)
-    log_path, err_path = frontend_log_paths(series_name, movie_name)
+    if info_proc and info_proc.get("stdout_log") and info_proc.get("stderr_log"):
+        log_path = Path(info_proc["stdout_log"])
+        err_path = Path(info_proc["stderr_log"])
+    else:
+        log_path, err_path = frontend_log_paths(series_name, movie_name, out_dir)
 
     info = checkpoint_info(
         output_root,
@@ -1572,6 +1778,9 @@ def html_page() -> str:
     .field-actions { display: flex; gap: 8px; align-items: end; }
     .field-actions select, .field-actions input { min-width: 0; }
     .field-actions button { flex: 0 0 auto; white-space: nowrap; }
+    .field-note { margin-top: 6px; color: #66717f; font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
+    .field-note.warning { color: #854d0e; }
+    .field-note.success { color: #1a6e35; }
     .actions-row { grid-column: span 12; display: flex; justify-content: flex-end; gap: 8px; }
     details.advanced { grid-column: span 12; border-top: 1px solid #e5e7eb; padding-top: 12px; }
     details.advanced summary { width: fit-content; color: #1f6feb; font-size: 13px; cursor: pointer; user-select: none; }
@@ -1611,6 +1820,18 @@ def html_page() -> str:
     .stage-line { flex: 1; height: 2px; background: #dde1e7; margin: 0 16px; }
     .status-message { margin: 14px 0 0; padding: 10px 12px; border-left: 4px solid #bf8700; background: #fff8c5; color: #633c01; line-height: 1.55; overflow-wrap: anywhere; }
     .status-message.error { border-left-color: #da3633; background: #ffebe9; color: #82071e; }
+    .run-preflight { margin-top: 14px; padding: 14px 0; border-top: 1px solid #e5e7eb; border-bottom: 1px solid #e5e7eb; }
+    .run-preflight-header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+    .run-preflight-header h3 { margin: 0; font-size: 14px; }
+    .preflight-state { color: #854d0e; font-size: 13px; font-weight: 600; }
+    .preflight-state.ready { color: #1a6e35; }
+    .run-summary-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+    .run-summary-item { min-width: 0; }
+    .run-summary-item.output { grid-column: 1 / -1; }
+    .run-summary-item span { display: block; color: #66717f; font-size: 12px; margin-bottom: 3px; }
+    .run-summary-item b { display: block; font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
+    .preflight-message { margin: 10px 0 0; color: #854d0e; font-size: 13px; line-height: 1.45; }
+    .preflight-message.ready { color: #4f5a66; }
     .quality-toolbar { display: flex; align-items: end; gap: 12px; margin-bottom: 10px; }
     .quality-toolbar > div { width: min(320px, 100%); }
     .quality-toolbar .muted { margin-left: auto; padding-bottom: 10px; }
@@ -1619,6 +1840,34 @@ def html_page() -> str:
     .quality-status.fail { color: #b42318; }
     .quality-status.review { color: #854d0e; }
     .compact-button { height: 30px; padding: 0 10px; white-space: nowrap; }
+    .section-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+    .section-header h2 { margin: 0; }
+    .queue-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .queue-toolbar .muted { margin-left: auto; }
+    .queue-discovery { margin-top: 14px; padding-top: 14px; border-top: 1px solid #e5e7eb; }
+    .queue-discovery-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+    .episode-list { max-height: 230px; overflow: auto; border-top: 1px solid #e5e7eb; }
+    .episode-row { display: grid; grid-template-columns: 28px minmax(0, 1fr) 88px; gap: 8px; align-items: center; min-height: 38px; border-bottom: 1px solid #eef0f3; }
+    .episode-row input { width: auto; height: auto; margin: 0 0 0 7px; }
+    .episode-row span { min-width: 0; overflow-wrap: anywhere; }
+    .episode-size { color: #66717f; text-align: right; padding-right: 8px; }
+    .queue-table td:first-child { width: 32px; color: #66717f; }
+    .queue-name { max-width: 360px; overflow-wrap: anywhere; }
+    .queue-status { font-weight: 600; white-space: nowrap; }
+    .queue-status.running { color: #854d0e; }
+    .queue-status.success { color: #1a6e35; }
+    .queue-status.failed { color: #b42318; }
+    .queue-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+    progress { width: 150px; height: 12px; accent-color: #1f6feb; }
+    .review-media { min-width: 0; }
+    .review-frame { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: contain; background: #111827; border-radius: 6px; }
+    .review-waveform { display: block; width: 100%; aspect-ratio: 20 / 3; object-fit: contain; margin-top: 10px; border: 1px solid #dde1e7; border-radius: 6px; }
+    .review-audio { width: 100%; margin-top: 10px; }
+    .review-context { margin-top: 14px; padding-top: 12px; border-top: 1px solid #e5e7eb; }
+    .review-context h3 { font-size: 14px; margin: 0 0 8px; }
+    .review-context tr.current { background: #fff8c5; }
+    .review-context td:first-child { white-space: nowrap; }
+    .review-evidence-status { min-height: 20px; margin: 0 0 8px; }
     @media (max-width: 800px) {
       main { padding: 14px; }
       .grid { grid-template-columns: 1fr; }
@@ -1640,26 +1889,45 @@ def html_page() -> str:
       .quality-toolbar .muted { margin-left: 0; padding-bottom: 0; }
       .source-plan-header { align-items: flex-start; flex-direction: column; gap: 2px; }
       .source-plan-row { grid-template-columns: 1fr; gap: 3px; }
+      .run-summary-grid { grid-template-columns: 1fr 1fr; }
+      .run-preflight-header { align-items: flex-start; flex-direction: column; gap: 3px; }
+      .queue-toolbar .muted { flex-basis: 100%; margin-left: 0; }
     }
     .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); align-items: center; justify-content: center; z-index: 1000; }
     .modal { background: white; padding: 24px; border-radius: 8px; width: 100%; max-width: 400px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
-    .modal.review-modal { max-width: 720px; }
+    .modal.review-modal { box-sizing: border-box; max-width: 1080px; max-height: calc(100vh - 32px); overflow-y: auto; }
     .modal h2 { margin-top: 0; }
     .modal .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
     .review-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
     .review-grid .full { grid-column: 1 / -1; }
+    .review-workbench { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(320px, .8fr); gap: 20px; align-items: start; }
     @media (max-width: 640px) {
       .modal-overlay { align-items: stretch; }
       .modal { max-width: none; margin: 12px; overflow-y: auto; }
       .review-grid { grid-template-columns: 1fr; }
       .review-grid .full { grid-column: 1; }
+      .review-workbench { grid-template-columns: 1fr; }
+      .review-context .table-scroll { overflow: visible; }
+      .review-context table,
+      .review-context tbody { display: block; width: 100%; }
+      .review-context thead { display: none; }
+      .review-context tr { display: grid; gap: 7px; padding: 10px; border-bottom: 1px solid #e5e7eb; }
+      .review-context tr.current { border-radius: 6px; }
+      .review-context td { display: grid; grid-template-columns: 52px minmax(0, 1fr); gap: 8px; padding: 0; white-space: normal; overflow-wrap: anywhere; }
+      .review-context td::before { content: attr(data-label); color: #66717f; font-weight: 600; }
+      .review-context td[colspan] { display: block; }
+      .review-context td[colspan]::before { content: none; }
+      .run-summary-grid { grid-template-columns: 1fr; }
+      .episode-row { grid-template-columns: 28px minmax(0, 1fr) 64px; }
+      .modal .actions { flex-wrap: wrap; }
+      .modal .actions button { flex: 1; }
     }
   </style>
 </head>
 <body>
 <div class="modal-overlay" id="remoteModal">
-  <div class="modal">
-    <h2>远程服务器设置</h2>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="remoteModalTitle">
+    <h2 id="remoteModalTitle">远程服务器设置</h2>
     <label for="remoteName">连接名称</label><input id="remoteName" value="AI Server" style="margin-bottom:12px">
     <label for="remoteHost">服务器</label><input id="remoteHost" value="10.12.96.203" placeholder="10.12.96.203 或 ai-server" style="margin-bottom:12px">
     <label for="remotePort">SSH 端口</label><input id="remotePort" type="number" value="22" style="margin-bottom:12px">
@@ -1678,7 +1946,7 @@ def html_page() -> str:
       <input id="remotePass" type="password" autocomplete="current-password" style="margin-bottom:12px">
       <label style="display:flex;align-items:center;gap:8px;margin-bottom:12px"><input id="remoteRememberPassword" type="checkbox">使用 Windows 凭据保护保存密码</label>
     </div>
-    <div id="remoteError" style="color:#b42318; font-size:13px; margin-bottom:8px;"></div>
+    <div id="remoteError" role="status" aria-live="polite" style="color:#b42318; font-size:13px; margin-bottom:8px;"></div>
     <div class="actions">
       <button class="secondary" onclick="closeRemoteModal()">取消</button>
       <button onclick="connectRemoteServer()" id="remoteConnectBtn">连接</button>
@@ -1687,32 +1955,51 @@ def html_page() -> str:
 </div>
 <div class="modal-overlay" id="reviewModal">
   <div class="modal review-modal" role="dialog" aria-modal="true" aria-labelledby="reviewModalTitle">
-    <h2 id="reviewModalTitle">复核字幕</h2>
+    <h2 id="reviewModalTitle">视听复核工作台</h2>
     <p class="muted" id="reviewIssue"></p>
-    <div class="review-grid">
-      <div>
-        <label for="reviewStart">开始时间（秒）</label>
-        <input id="reviewStart" type="number" min="0" step="0.001">
+    <div class="review-workbench">
+      <div class="review-media">
+        <p class="muted review-evidence-status" id="reviewEvidenceStatus">正在生成视听证据…</p>
+        <img class="review-frame" id="reviewFrame" alt="当前字幕时间点的视频帧" hidden>
+        <img class="review-waveform" id="reviewWaveform" alt="当前字幕附近的音频波形" hidden>
+        <audio class="review-audio" id="reviewAudio" controls preload="metadata" hidden></audio>
+        <div class="review-context">
+          <h3>相邻字幕</h3>
+          <div class="table-scroll">
+            <table>
+              <thead><tr><th>时间</th><th>源文 / 英文</th><th>中文</th></tr></thead>
+              <tbody id="reviewNeighborRows"><tr><td colspan="3" class="muted">正在读取…</td></tr></tbody>
+            </table>
+          </div>
+        </div>
       </div>
-      <div>
-        <label for="reviewEnd">结束时间（秒）</label>
-        <input id="reviewEnd" type="number" min="0" step="0.001">
-      </div>
-      <div class="full">
-        <label for="reviewEnglish">源文 / 英文</label>
-        <textarea id="reviewEnglish"></textarea>
-      </div>
-      <div class="full">
-        <label for="reviewChinese">中文</label>
-        <textarea id="reviewChinese"></textarea>
-      </div>
-      <div class="full">
-        <label class="checkbox-control"><input id="reviewDisplay" type="checkbox" checked>在成片中显示</label>
+      <div class="review-grid">
+        <div>
+          <label for="reviewStart">开始时间（秒）</label>
+          <input id="reviewStart" type="number" min="0" step="0.001">
+        </div>
+        <div>
+          <label for="reviewEnd">结束时间（秒）</label>
+          <input id="reviewEnd" type="number" min="0" step="0.001">
+        </div>
+        <div class="full">
+          <label for="reviewEnglish">源文 / 英文</label>
+          <textarea id="reviewEnglish"></textarea>
+        </div>
+        <div class="full">
+          <label for="reviewChinese">中文</label>
+          <textarea id="reviewChinese"></textarea>
+        </div>
+        <div class="full">
+          <label class="checkbox-control"><input id="reviewDisplay" type="checkbox" checked>在成片中显示</label>
+        </div>
       </div>
     </div>
     <p class="status-message error" id="reviewError" hidden></p>
     <div class="actions">
-      <button class="secondary" onclick="closeReviewModal()">取消</button>
+      <button class="secondary" onclick="openAdjacentReview(-1)">上一条</button>
+      <button class="secondary" onclick="openAdjacentReview(1)">下一条</button>
+      <button class="secondary" onclick="closeReviewModal()">关闭</button>
       <button onclick="saveCheckpointReview()" id="reviewSaveBtn">保存复核</button>
     </div>
   </div>
@@ -1769,8 +2056,9 @@ def html_page() -> str:
           <select id="llmModel">
             <option value="qwen3:14b">[Local] qwen3:14b</option>
           </select>
-          <button class="secondary" onclick="openRemoteModal()" title="设置远程 Ollama 服务器">远程</button>
+          <button class="secondary" id="remoteBtn" onclick="openRemoteModal()" title="连接远程 Ollama 服务器">连接</button>
         </div>
+        <div class="field-note" id="modelConnectionState" role="status" aria-live="polite">本地模型会使用本机计算资源</div>
       </div>
 
       <div class="workflow-group" id="sourcePlan" hidden>
@@ -1888,6 +2176,12 @@ def html_page() -> str:
             <label for="maxDuration">最长秒数</label>
             <input id="maxDuration" type="number" value="5.5" min="1" max="20" step="0.5">
           </div>
+          <div class="span-4">
+            <label class="checkbox-control">
+              <input id="autonomousReview" type="checkbox">
+              夜间无人值守复核（2 轮）
+            </label>
+          </div>
         </div>
       </details>
       <details class="advanced" id="subtitleAppearance">
@@ -1926,6 +2220,33 @@ def html_page() -> str:
     </div>
   </section>
 
+  <section id="queueSection" aria-labelledby="queueHeading">
+    <div class="section-header">
+      <h2 id="queueHeading">系列批量队列</h2>
+      <span class="muted" id="queueSummary">尚未加入剧集</span>
+    </div>
+    <div class="queue-toolbar">
+      <button class="secondary" id="queueScanBtn" onclick="scanSeriesQueue()">扫描同目录剧集</button>
+      <button id="queueResumeBtn" onclick="queueAction('resume')">开始队列</button>
+      <button class="secondary" id="queuePauseBtn" onclick="queueAction('pause')">暂停领取</button>
+      <button class="secondary" onclick="refreshQueue()">刷新</button>
+      <span class="muted" id="queueWorkerState">worker 未启动</span>
+    </div>
+    <div class="queue-discovery" id="queueDiscovery" hidden>
+      <div class="queue-discovery-header">
+        <label class="checkbox-control"><input id="queueSelectAll" type="checkbox" onchange="toggleAllEpisodes(this.checked)">全选可加入剧集</label>
+        <button class="secondary" id="queueAddBtn" onclick="addSelectedEpisodes()">加入队列</button>
+      </div>
+      <div class="episode-list" id="episodeList"></div>
+    </div>
+    <div class="table-scroll" id="queueTableWrap" hidden>
+      <table class="queue-table">
+        <thead><tr><th>#</th><th>剧集</th><th>状态</th><th>进度</th><th>模型</th><th>操作</th></tr></thead>
+        <tbody id="queueRows"></tbody>
+      </table>
+    </div>
+  </section>
+
   <section>
     <h2>状态</h2>
     <div class="stats">
@@ -1940,13 +2261,27 @@ def html_page() -> str:
     </div>
     <p class="muted" id="paths"></p>
     <p class="status-message" id="runMessage" role="alert" aria-live="polite" hidden></p>
+    <div class="run-preflight" id="runPreflight">
+      <div class="run-preflight-header">
+        <h3>运行前确认</h3>
+        <span class="preflight-state" id="preflightState">等待分析</span>
+      </div>
+      <div class="run-summary-grid">
+        <div class="run-summary-item"><span>字幕来源</span><b id="runSummarySource">等待分析</b></div>
+        <div class="run-summary-item"><span>模型位置</span><b id="runSummaryModel">未选择</b></div>
+        <div class="run-summary-item"><span>复核策略</span><b id="runSummaryReview">标准终审</b></div>
+        <div class="run-summary-item output"><span>输出位置</span><b id="runSummaryOutput">等待分析</b></div>
+      </div>
+      <p class="preflight-message" id="preflightMessage">请先分析视频，确认字幕轨、同步音轨和处理方案。</p>
+    </div>
     <div class="inline">
-      <div class="radio">
+      <div class="radio" id="runModeGroup" hidden>
         <label><input type="radio" name="runMode" value="resume" checked>继续任务</label>
         <label><input type="radio" name="runMode" value="reprocess">重新校对（保留识别）</label>
         <label><input type="radio" name="runMode" value="restart">完全重建</label>
       </div>
-      <button id="runBtn" onclick="startRun()">运行程序</button>
+      <span class="muted" id="newTaskMode">新任务</span>
+      <button id="runBtn" onclick="startRun()" disabled>运行程序</button>
       <button id="stopBtn" class="danger" onclick="stopRun()" disabled>终止运行</button>
       <button class="secondary" onclick="refreshStatus()">刷新状态</button>
     </div>
@@ -2004,12 +2339,19 @@ const LEGACY_DEFAULT_OUTPUT_ROOT = __LEGACY_DEFAULT_OUTPUT_ROOT_JSON__;
 const CONFIGURED_OUTPUT_ROOT = __INITIAL_OUTPUT_ROOT_JSON__;
 const state = {
   pid: 0,
+  running: false,
   lastAnalysis: null,
+  currentData: {},
   analyzing: false,
   restoringSettings: false,
   serverSettings: {form: {}, remote: {}},
+  remoteStatus: {checked: false, connected: false, status: 'stopped', name: '', error: '', persistentReconnect: false},
   qualityReviewItems: [],
-  currentReviewItem: null
+  currentReviewItem: null,
+  reviewPayloadOverride: null,
+  queue: null,
+  discoveredEpisodes: [],
+  selectedPath: ''
 };
 let settingsSaveTimer = 0;
 document.getElementById('outputRoot').value = CONFIGURED_OUTPUT_ROOT;
@@ -2057,16 +2399,200 @@ async function selectFont() {
   }
 }
 
+const QUEUE_STATUS_LABELS = {
+  queued: '等待',
+  running: '运行中',
+  success: '已完成',
+  failed: '失败',
+  cancelled: '已取消'
+};
+
+function queueModelLabel(item) {
+  const model = String(item?.prepared_payload?.llm_model || item?.payload?.llm_model || '');
+  if (!model) return '-';
+  const parts = model.split(':');
+  return model.startsWith('remote:') ? `远程 ${parts.slice(2).join(':')}` : `本地 ${model}`;
+}
+
+function renderEpisodeDiscovery() {
+  const discovery = document.getElementById('queueDiscovery');
+  discovery.hidden = state.discoveredEpisodes.length === 0;
+  document.getElementById('episodeList').innerHTML = state.discoveredEpisodes.map((episode, index) => {
+    const disabled = Boolean(episode.already_queued);
+    return `<label class="episode-row">
+      <input type="checkbox" class="episode-check" data-index="${index}" ${disabled ? 'disabled' : 'checked'}>
+      <span>${escapeHtml(episode.relative_path || episode.name)}${disabled ? '（已在队列）' : ''}</span>
+      <span class="episode-size">${escapeHtml(episode.size_mb)} MB</span>
+    </label>`;
+  }).join('');
+  document.getElementById('queueSelectAll').checked = state.discoveredEpisodes.some(item => !item.already_queued);
+}
+
+function toggleAllEpisodes(checked) {
+  document.querySelectorAll('.episode-check:not(:disabled)').forEach(input => {
+    input.checked = Boolean(checked);
+  });
+}
+
+async function scanSeriesQueue() {
+  const button = document.getElementById('queueScanBtn');
+  const selectedPath = document.getElementById('path').value.trim();
+  if (!selectedPath) {
+    document.getElementById('log').textContent = '请先选择系列中的一个视频或系列文件夹。';
+    return;
+  }
+  button.disabled = true;
+  button.textContent = '扫描中…';
+  try {
+    const data = await api('/api/queue/discover', {path: selectedPath});
+    state.discoveredEpisodes = Array.isArray(data.episodes) ? data.episodes : [];
+    renderEpisodeDiscovery();
+    document.getElementById('log').textContent = `找到 ${state.discoveredEpisodes.length} 个视频文件。`;
+  } catch (e) {
+    document.getElementById('log').textContent = `扫描剧集失败：${e.message}`;
+  } finally {
+    button.disabled = false;
+    button.textContent = '扫描同目录剧集';
+  }
+}
+
+async function addSelectedEpisodes() {
+  const selected = [...document.querySelectorAll('.episode-check:checked:not(:disabled)')]
+    .map(input => state.discoveredEpisodes[Number(input.dataset.index)]?.path)
+    .filter(Boolean);
+  if (!selected.length) {
+    document.getElementById('log').textContent = '没有选择可加入的剧集。';
+    return;
+  }
+  const button = document.getElementById('queueAddBtn');
+  button.disabled = true;
+  try {
+    const data = await api('/api/queue/add', {paths: selected, payload: payload(), start: false});
+    state.queue = data;
+    renderQueue();
+    state.discoveredEpisodes = state.discoveredEpisodes.map(episode => ({
+      ...episode,
+      already_queued: episode.already_queued || selected.includes(episode.path)
+    }));
+    renderEpisodeDiscovery();
+    document.getElementById('log').textContent = `已将 ${selected.length} 集加入持久化队列。`;
+  } catch (e) {
+    document.getElementById('log').textContent = `加入队列失败：${e.message}`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function queueItemActions(item) {
+  const id = JSON.stringify(String(item.id));
+  if (item.status === 'running') {
+    return `<button class="danger compact-button" onclick='queueAction("cancel", ${id})'>终止</button>`;
+  }
+  if (item.status === 'queued') {
+    return [
+      `<button class="secondary compact-button" onclick='queueAction("move", ${id}, -1)' title="上移">上移</button>`,
+      `<button class="secondary compact-button" onclick='queueAction("move", ${id}, 1)' title="下移">下移</button>`,
+      `<button class="secondary compact-button" onclick='queueAction("cancel", ${id})'>取消</button>`
+    ].join('');
+  }
+  const review = Number(item.review_pending_count || 0) > 0
+    ? `<button class="secondary compact-button" onclick='loadQueueItem(${id})'>复核</button>`
+    : `<button class="secondary compact-button" onclick='loadQueueItem(${id})'>查看</button>`;
+  const retry = item.status === 'failed' || item.status === 'cancelled'
+    ? `<button class="secondary compact-button" onclick='queueAction("retry", ${id})'>重试</button>`
+    : '';
+  return `${review}${retry}<button class="secondary compact-button" onclick='queueAction("remove", ${id})'>移除</button>`;
+}
+
+function renderQueue() {
+  const data = state.queue || {items: [], summary: {}, worker: {}, paused: true};
+  const items = Array.isArray(data.items) ? data.items : [];
+  const summary = data.summary || {};
+  document.getElementById('queueSummary').textContent = items.length
+    ? `${summary.running || 0} 运行 / ${summary.queued || 0} 等待 / ${summary.success || 0} 完成 / ${summary.failed || 0} 失败`
+    : '尚未加入剧集';
+  const worker = data.worker || {};
+  document.getElementById('queueWorkerState').textContent = worker.running
+    ? `worker ${worker.pid || ''}：${worker.status || '运行中'}`
+    : 'worker 未启动';
+  const hasRunnableItem = items.some(item => item.status === 'queued' || item.status === 'running');
+  document.getElementById('queueResumeBtn').disabled = !hasRunnableItem
+    || (!data.paused && Boolean(worker.running));
+  document.getElementById('queuePauseBtn').disabled = Boolean(data.paused) || !worker.running;
+  document.getElementById('queueTableWrap').hidden = items.length === 0;
+  document.getElementById('queueRows').innerHTML = items.map((item, index) => {
+    const completed = Number(item.completed_count || 0);
+    const total = Number(item.total_count || 0);
+    const percent = Number(item.progress_percent || 0);
+    const detail = total > 0 ? `${completed}/${total}` : (item.stage || '等待处理');
+    const errorTitle = item.error ? ` title="${escapeHtml(item.error)}"` : '';
+    return `<tr>
+      <td>${index + 1}</td>
+      <td class="queue-name"><b>${escapeHtml(item.movie_name || item.name || '')}</b><br><span class="muted">${escapeHtml(item.path || '')}</span></td>
+      <td><span class="queue-status ${escapeHtml(item.status || '')}"${errorTitle}>${escapeHtml(QUEUE_STATUS_LABELS[item.status] || item.status || '-')}</span><br><span class="muted">${escapeHtml(item.stage || '')}</span></td>
+      <td><progress max="100" value="${Math.max(0, Math.min(100, percent))}"></progress><br><span class="muted">${escapeHtml(detail)}</span></td>
+      <td>${escapeHtml(queueModelLabel(item))}</td>
+      <td><div class="queue-actions">${queueItemActions(item)}</div></td>
+    </tr>`;
+  }).join('');
+}
+
+async function refreshQueue() {
+  try {
+    state.queue = await api('/api/queue/list');
+    renderQueue();
+  } catch (e) {
+    document.getElementById('queueWorkerState').textContent = `队列读取失败：${e.message}`;
+  }
+}
+
+async function queueAction(action, id = '', direction = 0) {
+  try {
+    state.queue = await api('/api/queue/action', {action, id, direction});
+    renderQueue();
+  } catch (e) {
+    document.getElementById('log').textContent = `队列操作失败：${e.message}`;
+  }
+}
+
+async function loadQueueItem(id) {
+  const item = (state.queue?.items || []).find(entry => String(entry.id) === String(id));
+  if (!item) return;
+  const prepared = {...(item.prepared_payload || item.payload || {}), pid: Number(item.pid || 0)};
+  setSelectedPath(item.path);
+  document.getElementById('outputRoot').value = prepared.output_root || item.output_root || '';
+  document.getElementById('seriesName').value = prepared.series_name || item.series_name || '';
+  document.getElementById('movieName').value = prepared.movie_name || item.movie_name || '';
+  if (prepared.llm_model) restoreModelSelection(document.getElementById('llmModel'), prepared.llm_model);
+  state.reviewPayloadOverride = prepared;
+  state.pid = item.status === 'running' ? Number(item.pid || 0) : 0;
+  try {
+    const data = await api('/api/status', prepared);
+    data.selected_path = item.path;
+    data.video_path = item.path;
+    render(data);
+    setLastAnalysis(data);
+    document.getElementById('qualityReview')?.scrollIntoView({behavior: 'smooth', block: 'start'});
+  } catch (e) {
+    document.getElementById('log').textContent = `加载队列剧集失败：${e.message}`;
+  }
+}
+
 function setSelectedPath(path) {
   const input = document.getElementById('path');
-  if (input.value !== path) {
+  const changed = normalizePathForCompare(input.value) !== normalizePathForCompare(path)
+    || (state.selectedPath && normalizePathForCompare(state.selectedPath) !== normalizePathForCompare(path));
+  if (changed) {
     clearSourceSelections();
     clearLastAnalysis();
     state.pid = 0;
+    state.reviewPayloadOverride = null;
     document.getElementById('seriesName').value = '';
     document.getElementById('movieName').value = '';
+    resetAnalysisPresentation('已选择新视频，请重新分析字幕轨和处理方案。');
   }
   input.value = path;
+  state.selectedPath = path;
 }
 
 const SOURCE_SELECTION_IDS = [
@@ -2180,6 +2706,25 @@ function updateWorkflowVisibility() {
     usesAudio ? '用于语音识别的音轨' : '用于字幕同步的音轨';
 }
 
+function analysisConfigurationFingerprint() {
+  const source = document.getElementById('source').value;
+  const ids = ['source', 'source_language', 'mergeExistingSubtitles', 'subtitleSync', 'subtitleOcrLang'];
+  if (source === 'sidecar') {
+    ids.push('sidecarPath', 'chineseSidecarPath', 'englishSidecarPath');
+  }
+  if (source === 'embedded') {
+    ids.push('subtitleStream', 'chineseSubtitleStream', 'englishSubtitleStream');
+  }
+  if (source === 'audio') ids.push('asrLanguage');
+  if (source === 'auto' || source === 'audio' || document.getElementById('subtitleSync').value !== 'off') {
+    ids.push('audioStream');
+  }
+  return JSON.stringify(ids.map(id => {
+    const element = document.getElementById(id);
+    return [id, element?.type === 'checkbox' ? Boolean(element.checked) : String(element?.value || '')];
+  }));
+}
+
 function payload() {
   const sourceLanguage = document.getElementById('source_language').value;
   const source = document.getElementById('source').value;
@@ -2215,13 +2760,15 @@ function payload() {
     llm_model: document.getElementById('llmModel').value,
     batch_size: Number(document.getElementById('batchSize').value || 5),
     context_lines: Number(document.getElementById('contextLines').value || 30),
+    autonomous_review_rounds: document.getElementById('autonomousReview').checked ? 2 : 0,
     max_words: Number(document.getElementById('maxWords').value || 12),
     max_chars: Number(document.getElementById('maxChars').value || 42),
     max_duration: Number(document.getElementById('maxDuration').value || 5.5),
     subtitle_style_profile: document.getElementById('subtitleStyleProfile').value,
     subtitle_font_name: document.getElementById('subtitleFontName').value.trim(),
     subtitle_font_scale: Number(document.getElementById('subtitleFontScale').value || 100),
-    subtitle_font_file: document.getElementById('subtitleFontFile').value.trim()
+    subtitle_font_file: document.getElementById('subtitleFontFile').value.trim(),
+    analysis_config_fingerprint: analysisConfigurationFingerprint()
   };
 }
 
@@ -2246,6 +2793,9 @@ async function analyze() {
     document.getElementById('seriesName').value = data.series_name;
     document.getElementById('movieName').value = data.movie_name;
     render(data);
+    data.analysis_config_fingerprint = analysisConfigurationFingerprint();
+    setLastAnalysis(data);
+    updateRunControls(data);
     saveFormState();
     const outputNote = data.output_root_source === 'existing'
       ? `已找到已有输出：${data.output_root}`
@@ -2265,6 +2815,12 @@ async function analyze() {
 async function startRun() {
   const runBtn = document.getElementById('runBtn');
   if (state.pid) return;
+  const blockReason = runBlockReason();
+  if (blockReason) {
+    updateRunControls();
+    document.getElementById('log').textContent = blockReason;
+    return;
+  }
   runBtn.disabled = true;
   try {
     const base = payload();
@@ -2283,7 +2839,7 @@ async function startRun() {
     setTimeout(refreshStatus, 1500);
   } catch (e) {
     document.getElementById('log').textContent = `启动失败: ${e.message}`;
-    runBtn.disabled = false;
+    updateRunControls();
   }
 }
 
@@ -2293,9 +2849,9 @@ async function stopRun() {
     base.pid = state.pid;
     const data = await api('/api/stop', base);
     const merged = mergeWithAnalysis(data);
+    if (data.stopped) state.pid = 0;
     render(merged);
     setLastAnalysis(merged);
-    if (data.stopped) state.pid = 0;
     const tail = [data.stdout_tail || '', data.stderr_tail || ''].filter(Boolean).join('\n\n--- stderr ---\n');
     document.getElementById('log').textContent = `${data.message || '终止请求已发送'}\n${tail}`;
   } catch (e) {
@@ -2311,9 +2867,9 @@ async function refreshStatus() {
       state.pid = data.pid;
   }
   const merged = mergeWithAnalysis(data);
+  if (!merged.running) state.pid = 0;
   render(merged);
   setLastAnalysis(merged);
-  if (!merged.running) state.pid = 0;
   document.getElementById('log').textContent = [data.stdout_tail || '', data.stderr_tail || ''].filter(Boolean).join('\n\n--- stderr ---\n');
 }
 
@@ -2321,7 +2877,7 @@ function setAnalyzeBusy(isBusy) {
   state.analyzing = isBusy;
   const btn = document.getElementById('analyzeBtn');
   if (btn) {
-    btn.textContent = isBusy ? '分析中...' : '分析';
+    btn.textContent = isBusy ? '分析中...' : '分析视频';
     btn.disabled = isBusy;
   }
   if (isBusy) {
@@ -2331,6 +2887,7 @@ function setAnalyzeBusy(isBusy) {
     document.getElementById('autoSourceState').textContent = '分析中';
     document.getElementById('paths').textContent = '正在识别片名、扫描字幕来源并读取 checkpoint...';
   }
+  updateRunControls();
 }
 
 function mergeWithAnalysis(data) {
@@ -2356,6 +2913,14 @@ function setLastAnalysis(data) {
 function clearLastAnalysis() {
   state.lastAnalysis = null;
   try { localStorage.removeItem(ANALYSIS_STORAGE_KEY); } catch (e) {}
+}
+
+function resetAnalysisPresentation(message = '请先分析视频，确认字幕轨、同步音轨和处理方案。') {
+  state.currentData = {};
+  state.running = false;
+  render({outcome: 'idle', stage_index: -1});
+  const log = document.getElementById('log');
+  if (log && message) log.textContent = message;
 }
 
 function getMatchingAnalysis() {
@@ -2497,7 +3062,30 @@ function renderQualityReviewRows() {
   }).join('') || '<tr><td colspan="6" class="muted">当前筛选没有待复核项目</td></tr>';
 }
 
-function openQualityReview(index) {
+function formatReviewTime(value) {
+  const total = Math.max(0, Number(value || 0));
+  const minutes = Math.floor(total / 60);
+  const seconds = (total - minutes * 60).toFixed(3).padStart(6, '0');
+  return `${minutes}:${seconds}`;
+}
+
+function resetReviewEvidence() {
+  const frame = document.getElementById('reviewFrame');
+  const waveform = document.getElementById('reviewWaveform');
+  const audio = document.getElementById('reviewAudio');
+  frame.hidden = true;
+  waveform.hidden = true;
+  audio.hidden = true;
+  frame.removeAttribute('src');
+  waveform.removeAttribute('src');
+  audio.pause();
+  audio.removeAttribute('src');
+  audio.load();
+  document.getElementById('reviewNeighborRows').innerHTML =
+    '<tr><td colspan="3" class="muted">正在读取…</td></tr>';
+}
+
+async function openQualityReview(index) {
   const item = state.qualityReviewItems[index];
   if (!item?.segment) return;
   state.currentReviewItem = item;
@@ -2510,10 +3098,61 @@ function openQualityReview(index) {
   document.getElementById('reviewChinese').value = segment.zh || '';
   document.getElementById('reviewDisplay').checked = segment.display !== false;
   document.getElementById('reviewError').hidden = true;
+  resetReviewEvidence();
+  const evidenceStatus = document.getElementById('reviewEvidenceStatus');
+  evidenceStatus.textContent = '正在按当前时间点生成视频帧、音频和波形…';
   document.getElementById('reviewModal').style.display = 'flex';
+  try {
+    const request = {...(state.reviewPayloadOverride || payload())};
+    request.id = segment.id;
+    request.expected_start = segment.start;
+    const evidence = await api('/api/review/evidence', request);
+    if (state.currentReviewItem !== item) return;
+    const frame = document.getElementById('reviewFrame');
+    const waveform = document.getElementById('reviewWaveform');
+    const audio = document.getElementById('reviewAudio');
+    frame.src = evidence.frame_url;
+    waveform.src = evidence.waveform_url;
+    audio.src = evidence.audio_url;
+    frame.hidden = false;
+    waveform.hidden = false;
+    audio.hidden = false;
+    const neighbors = Array.isArray(evidence.neighbors) ? evidence.neighbors : [];
+    document.getElementById('reviewNeighborRows').innerHTML = neighbors.map(neighbor =>
+      `<tr class="${neighbor.is_current ? 'current' : ''}">
+        <td data-label="时间">${escapeHtml(`${formatReviewTime(neighbor.start)} → ${formatReviewTime(neighbor.end)}`)}</td>
+        <td data-label="英文">${escapeHtml(neighbor.en || '')}</td>
+        <td data-label="中文">${escapeHtml(neighbor.zh || '')}</td>
+      </tr>`
+    ).join('') || '<tr><td colspan="3" class="muted">没有相邻字幕</td></tr>';
+    evidenceStatus.textContent =
+      `音频范围 ${formatReviewTime(evidence.clip_start)} → ${formatReviewTime(evidence.clip_end)}，目标字幕从音频第 ${Number(evidence.event_offset || 0).toFixed(2)} 秒开始`;
+  } catch (e) {
+    if (state.currentReviewItem !== item) return;
+    evidenceStatus.textContent = `视听证据生成失败：${e.message}。仍可直接编辑字幕。`;
+    document.getElementById('reviewNeighborRows').innerHTML =
+      '<tr><td colspan="3" class="muted">无法读取相邻字幕</td></tr>';
+  }
+}
+
+function openAdjacentReview(direction) {
+  const current = state.currentReviewItem;
+  if (!current) return;
+  const currentIndex = state.qualityReviewItems.indexOf(current);
+  for (
+    let index = currentIndex + Number(direction);
+    index >= 0 && index < state.qualityReviewItems.length;
+    index += Number(direction)
+  ) {
+    if (state.qualityReviewItems[index]?.segment) {
+      openQualityReview(index);
+      return;
+    }
+  }
 }
 
 function closeReviewModal() {
+  resetReviewEvidence();
   state.currentReviewItem = null;
   document.getElementById('reviewModal').style.display = 'none';
 }
@@ -2526,7 +3165,7 @@ async function saveCheckpointReview() {
   button.disabled = true;
   error.hidden = true;
   try {
-    const request = payload();
+    const request = {...(state.reviewPayloadOverride || payload())};
     Object.assign(request, {
       id: item.segment.id,
       expected_start: item.segment.start,
@@ -2569,6 +3208,147 @@ const SOURCE_OPERATION_LABELS = {
   final_bilingual_quality_review: '整片终审'
 };
 
+function selectedModelOption() {
+  const select = document.getElementById('llmModel');
+  return select && select.selectedIndex >= 0 ? select.options[select.selectedIndex] : null;
+}
+
+function isRemoteModel(value) {
+  return String(value || '').startsWith('remote:');
+}
+
+function restoreModelSelection(select, value) {
+  const requested = String(value || '').trim();
+  if (!requested) {
+    select.value = 'qwen3:14b';
+    return;
+  }
+  const existing = [...select.options].find(option => option.value === requested);
+  if (existing) {
+    select.value = requested;
+    return;
+  }
+  const modelName = requested.split(':').slice(2).join(':') || requested;
+  const label = isRemoteModel(requested)
+    ? `[需重新连接] ${modelName}`
+    : `[当前不可用] ${requested}`;
+  const unavailable = new Option(label, requested, true, true);
+  unavailable.disabled = true;
+  select.add(unavailable);
+  select.value = requested;
+}
+
+function runOutputLabel(analysis) {
+  const root = document.getElementById('outputRoot').value.trim();
+  const series = document.getElementById('seriesName').value.trim();
+  const movie = document.getElementById('movieName').value.trim();
+  if (analysis?.output_dir && series === analysis.series_name && movie === analysis.movie_name) {
+    return analysis.output_dir;
+  }
+  if (!root) return analysis?.output_dir || '自动选择';
+  const separator = root.includes('\\') ? '\\' : '/';
+  return [root.replace(/[\\/]+$/g, ''), series, movie].filter(Boolean).join(separator);
+}
+
+function runBlockReason() {
+  if (state.analyzing) return '正在分析视频，请等待分析完成。';
+  if (state.running || state.pid) return '任务正在运行。';
+  if (!document.getElementById('path').value.trim()) return '请先选择视频文件或蓝光文件夹。';
+  const analysis = getMatchingAnalysis();
+  if (!analysis) return '请先分析视频，确认字幕轨、同步音轨和处理方案。';
+  if (
+    !analysis.analysis_config_fingerprint
+    || analysis.analysis_config_fingerprint !== analysisConfigurationFingerprint()
+  ) {
+    return '来源或音轨设置已经变化，请重新分析后再运行。';
+  }
+  if (!analysis.processing_plan) return '来源设置已经变化，请重新分析后再运行。';
+  if (analysis.processing_plan.route === 'no_safe_source') {
+    return '没有可安全使用的完整对白来源，请调整字幕来源或音轨后重新分析。';
+  }
+  if (!document.getElementById('seriesName').value.trim() || !document.getElementById('movieName').value.trim()) {
+    return '系列名和片名不能为空。';
+  }
+  const model = document.getElementById('llmModel').value.trim();
+  const option = selectedModelOption();
+  if (!model) return '请选择校对与翻译模型。';
+  if (option?.disabled) return '上次选择的模型当前不可用，请重新连接远程服务器或明确选择本地模型。';
+  if (isRemoteModel(model) && !state.remoteStatus.connected) {
+    return '所选远程模型尚未连接。请先点击“连接”，本任务不会自动改用本地模型。';
+  }
+  return '';
+}
+
+function updateModelConnectionState() {
+  const note = document.getElementById('modelConnectionState');
+  const model = document.getElementById('llmModel').value;
+  const option = selectedModelOption();
+  note.className = 'field-note';
+  if (isRemoteModel(model)) {
+    if (state.remoteStatus.connected && !option?.disabled) {
+      note.textContent = state.remoteStatus.persistentReconnect
+        ? `已连接 ${state.remoteStatus.name || '远程服务器'}，独立 SSH 桥接会在网页退出或网络切换后自动重连`
+        : `已连接 ${state.remoteStatus.name || '远程服务器'}，当前连接依赖此网页进程`;
+      note.classList.add('success');
+    } else if (state.remoteStatus.status === 'reconnecting') {
+      note.textContent = `SSH 桥接正在自动重连：${state.remoteStatus.error || '等待网络恢复'}`;
+      note.classList.add('warning');
+    } else {
+      note.textContent = '远程模型未连接，运行已锁定，不会静默改用本地 GPU';
+      note.classList.add('warning');
+    }
+  } else if (model) {
+    note.textContent = '本地模型会使用本机计算资源';
+  } else {
+    note.textContent = '尚未选择可用模型';
+    note.classList.add('warning');
+  }
+}
+
+function updateRunControls(data = state.currentData) {
+  const analysis = getMatchingAnalysis();
+  const source = analysis?.processing_plan
+    ? (SOURCE_ROUTE_LABELS[analysis.processing_plan.route] || analysis.processing_plan.route || '自动推荐')
+    : '等待分析';
+  const option = selectedModelOption();
+  const model = document.getElementById('llmModel').value;
+  const modelLabel = option?.textContent?.trim() || '未选择';
+  const reviewLabel = document.getElementById('autonomousReview').checked
+    ? '标准终审 + 夜间复核 2 轮'
+    : '标准终审';
+  const hasCheckpoint = Boolean((data || {}).checkpoint_exists ?? analysis?.checkpoint_exists);
+  const runModeGroup = document.getElementById('runModeGroup');
+  const newTaskMode = document.getElementById('newTaskMode');
+  runModeGroup.hidden = !hasCheckpoint;
+  newTaskMode.hidden = hasCheckpoint;
+  if (!hasCheckpoint) {
+    const resume = document.querySelector('input[name="runMode"][value="resume"]');
+    if (resume) resume.checked = true;
+  }
+
+  document.getElementById('runSummarySource').textContent = source;
+  document.getElementById('runSummaryModel').textContent = modelLabel;
+  document.getElementById('runSummaryReview').textContent = reviewLabel;
+  document.getElementById('runSummaryOutput').textContent = runOutputLabel(analysis);
+  updateModelConnectionState();
+
+  const reason = runBlockReason();
+  const preflightState = document.getElementById('preflightState');
+  const preflightMessage = document.getElementById('preflightMessage');
+  const runBtn = document.getElementById('runBtn');
+  const ready = !reason;
+  preflightState.textContent = state.running ? '运行中' : (ready ? '可以运行' : '需要处理');
+  preflightState.className = ready ? 'preflight-state ready' : 'preflight-state';
+  preflightMessage.textContent = reason || (
+    isRemoteModel(model)
+      ? '远程连接、字幕来源和输出位置已确认。'
+      : '当前明确选择本地模型，翻译阶段可能占用本机 GPU。'
+  );
+  preflightMessage.className = ready ? 'preflight-message ready' : 'preflight-message';
+  runBtn.disabled = Boolean(state.running || state.analyzing || reason);
+  runBtn.title = reason || '按以上设置启动任务';
+}
+
 function sourceAssetLabel(asset) {
   if (!asset) return '不使用';
   const origins = {embedded: '内封', sidecar: '外置', audio: '音频'};
@@ -2588,6 +3368,45 @@ function sourceAssetLabel(asset) {
     representations[asset.representation] || asset.representation,
     roles[asset.role] || asset.role
   ].filter(Boolean).join(' · ');
+}
+
+function setPlannedSelectValue(id, value) {
+  if (value === undefined || value === null || value === '') return;
+  const select = document.getElementById(id);
+  if (select && [...select.options].some(option => option.value === String(value) && !option.disabled)) {
+    select.value = String(value);
+  }
+}
+
+function applyProcessingPlanSelections(plan) {
+  if (!plan || !Array.isArray(plan.selected_assets)) return;
+  const assets = new Map(plan.selected_assets.map(asset => [asset.asset_id, asset]));
+  const lane = plan.lanes || {};
+  const chinese = assets.get(lane.chinese);
+  const sourceAsset = assets.get(lane.source);
+  const audio = assets.get(lane.audio_reference);
+  const sourceMode = document.getElementById('source').value;
+  const merge = document.getElementById('mergeExistingSubtitles').checked;
+
+  if (sourceMode === 'sidecar') {
+    if (merge) {
+      if (chinese?.origin === 'sidecar') setPlannedSelectValue('chineseSidecarPath', chinese.path);
+      if (sourceAsset?.origin === 'sidecar') setPlannedSelectValue('englishSidecarPath', sourceAsset.path);
+    } else {
+      const primary = chinese || sourceAsset;
+      if (primary?.origin === 'sidecar') setPlannedSelectValue('sidecarPath', primary.path);
+    }
+  }
+  if (sourceMode === 'embedded') {
+    if (merge) {
+      if (chinese?.origin === 'embedded') setPlannedSelectValue('chineseSubtitleStream', chinese.stream_index);
+      if (sourceAsset?.origin === 'embedded') setPlannedSelectValue('englishSubtitleStream', sourceAsset.stream_index);
+    } else {
+      const primary = chinese || sourceAsset;
+      if (primary?.origin === 'embedded') setPlannedSelectValue('subtitleStream', primary.stream_index);
+    }
+  }
+  if (audio?.origin === 'audio') setPlannedSelectValue('audioStream', audio.stream_index);
 }
 
 function renderProcessingPlan(plan) {
@@ -2640,12 +3459,16 @@ function invalidateProcessingPlanPreview() {
     });
   }
   renderProcessingPlan(null);
+  updateRunControls();
 }
 
 function render(data) {
+  state.currentData = data || {};
+  state.running = Boolean(data.running);
   if (data.sidecar_subtitles) updateSidecarOptions(data.sidecar_subtitles);
   if (data.embedded_subtitles) updateEmbeddedOptions(data.embedded_subtitles);
   if (data.embedded_audio) updateAudioOptions(data.embedded_audio);
+  applyProcessingPlanSelections(data.processing_plan);
   renderProcessingPlan(data.processing_plan);
 
   document.getElementById('videoSize').textContent = data.video_size_gb ? `${data.video_size_gb} GB` : '-';
@@ -2660,7 +3483,6 @@ function render(data) {
     idle: '未运行'
   };
   document.getElementById('runningState').textContent = outcomeLabels[data.outcome] || (data.running ? '运行中' : '未运行');
-  document.getElementById('runBtn').disabled = Boolean(data.running);
   document.getElementById('stopBtn').disabled = !data.running;
   document.getElementById('sidecarState').textContent = data.has_sidecar_subtitles === undefined ? '未知' : (data.has_sidecar_subtitles ? `${(data.sidecar_subtitles || []).length} 个` : '无');
   const embeddedItems = (data.embedded_subtitles || []).filter(item => !item.error);
@@ -2759,6 +3581,7 @@ function render(data) {
   document.getElementById('preview').innerHTML = rows || '<tr><td colspan="4" class="muted">暂无 checkpoint 内容</td></tr>';
   renderQualityReview(data);
   updateWorkflowVisibility();
+  updateRunControls(data);
 }
 
 function updateSidecarOptions(items) {
@@ -2860,10 +3683,11 @@ function escapeHtml(value) {
 }
 
 const INPUT_IDS = [
+  ...SOURCE_SELECTION_IDS,
   'path', 'outputRoot', 'seriesName', 'movieName', 'source',
   'mergeExistingSubtitles', 'subtitleSync',
   'source_language', 'asrLanguage', 'subtitleOcrLang', 'llmModel',
-  'batchSize', 'contextLines', 'maxWords', 'maxChars', 'maxDuration',
+  'batchSize', 'contextLines', 'autonomousReview', 'maxWords', 'maxChars', 'maxDuration',
   'subtitleStyleProfile', 'subtitleFontName', 'subtitleFontScale', 'subtitleFontFile'
 ];
 
@@ -2893,10 +3717,12 @@ function openRemoteModal() {
   document.getElementById('remotePass').value = conf.password || '';
   document.getElementById('remoteRememberPassword').checked = Boolean(conf.remember_password || conf.password);
   updateRemoteAuthVisibility();
+  document.getElementById('remoteHost').focus();
 }
 
 function closeRemoteModal() {
   document.getElementById('remoteModal').style.display = 'none';
+  document.getElementById('remoteBtn')?.focus();
 }
 
 async function connectRemoteServer() {
@@ -2947,22 +3773,34 @@ async function connectRemoteServer() {
       if (!(payload.auth_method === 'password' && rememberPassword)) {
         document.getElementById('remotePass').value = '';
       }
+      state.remoteStatus = {
+        checked: true,
+        connected: true,
+        status: data.status || 'connected',
+        name: data.name || payload.name,
+        error: '',
+        persistentReconnect: Boolean(data.persistent_reconnect)
+      };
       updateLlmModels(data.models, data.name || payload.name);
-      closeRemoteModal();
+      if (data.warning) {
+        document.getElementById('remoteError').textContent = data.warning;
+      }
       if (data.models && data.models.length > 0) {
-        const authLabel = data.auth_method === 'key' ? 'SSH 密钥' : '密码';
-        alert(authLabel + '连接成功！获取到 ' + data.models.length + ' 个模型。');
+        closeRemoteModal();
       } else {
-        alert('SSH 连接成功，但未能获取到远程 Ollama 模型列表 (Ollama服务可能未启动或端口不通)。');
+        document.getElementById('remoteError').textContent = 'SSH 已连接，但远程 Ollama 没有返回可用模型。';
       }
     } else {
+      state.remoteStatus = {checked: true, connected: false, status: 'stopped', name: '', error: data.error || '连接失败', persistentReconnect: false};
       document.getElementById('remoteError').textContent = data.error || '连接失败';
     }
   } catch(e) {
+    state.remoteStatus = {checked: true, connected: false, status: 'stopped', name: '', error: String(e), persistentReconnect: false};
     document.getElementById('remoteError').textContent = String(e);
   } finally {
     btn.textContent = '连接';
     btn.disabled = false;
+    updateRunControls();
   }
 }
 
@@ -2984,25 +3822,40 @@ function updateLlmModels(remoteModels, remoteName) {
   }
   if ([...select.options].some(o => o.value === current)) {
     select.value = current;
+  } else if (current) {
+    restoreModelSelection(select, current);
   }
+  updateRunControls();
 }
 
 async function checkRemoteStatus() {
   try {
     const res = await fetch('/api/remote/status', {method: 'POST'});
-    if (res.ok) {
-      const data = await res.json();
-      if (data.connected && data.models) {
-        updateLlmModels(data.models, data.name);
-      }
+    const data = await res.json();
+    state.remoteStatus = {
+      checked: true,
+      connected: Boolean(res.ok && data.connected),
+      status: data.status || (data.connected ? 'connected' : 'stopped'),
+      name: data.name || '',
+      error: data.error || '',
+      persistentReconnect: Boolean(data.persistent_reconnect)
+    };
+    if (state.remoteStatus.connected && data.models) {
+      updateLlmModels(data.models, data.name);
     }
-  } catch(e) {}
+  } catch(e) {
+    state.remoteStatus = {checked: true, connected: false, status: 'stopped', name: '', error: String(e), persistentReconnect: false};
+  } finally {
+    updateRunControls();
+  }
 }
 
 function saveFormState() {
+  let analysisInvalidated = false;
   if (state.lastAnalysis && !analysisMatchesCurrentPath(state.lastAnalysis)) {
     clearSourceSelections();
     clearLastAnalysis();
+    analysisInvalidated = true;
   }
   const data = {};
   INPUT_IDS.forEach(id => {
@@ -3011,6 +3864,11 @@ function saveFormState() {
   });
   localStorage.setItem(FORM_STORAGE_KEY, JSON.stringify(data));
   if (!state.restoringSettings) scheduleServerFormSave(data);
+  if (analysisInvalidated) {
+    resetAnalysisPresentation('输入已变化，请重新分析视频。');
+  } else {
+    updateRunControls();
+  }
 }
 
 function scheduleServerFormSave(data) {
@@ -3036,26 +3894,39 @@ function restoreFormState(serverForm = {}) {
   state.restoringSettings = true;
   try {
     const local = JSON.parse(localStorage.getItem(FORM_STORAGE_KEY) || '{}');
-    const data = {...(serverForm || {}), ...(local || {})};
+    const data = {...(local || {}), ...(serverForm || {})};
     if (data) {
       INPUT_IDS.forEach(id => {
         const el = document.getElementById(id);
         if (el && data[id] !== undefined) {
           if (el.type === 'checkbox') el.checked = Boolean(data[id]);
+          else if (id === 'llmModel') restoreModelSelection(el, data[id]);
           else el.value = data[id];
         }
       });
       migrateOutputRootDefault();
       migrateRecognitionLanguageState();
       const analysis = getMatchingAnalysis();
-      if (analysis) render(analysis);
+      if (analysis) {
+        render(analysis);
+        SOURCE_SELECTION_IDS.forEach(id => {
+          const el = document.getElementById(id);
+          if (el && data[id] !== undefined && [...el.options].some(option => option.value === String(data[id]))) {
+            el.value = String(data[id]);
+          }
+        });
+      } else {
+        resetAnalysisPresentation('已恢复上次输入。请重新分析视频后再运行。');
+      }
       if (data.seriesName && data.movieName) {
         refreshStatus().catch(() => {});
       }
     }
   } catch (e) {
   } finally {
+    state.selectedPath = document.getElementById('path').value;
     state.restoringSettings = false;
+    updateRunControls();
   }
 }
 
@@ -3122,6 +3993,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   migrateRecognitionLanguageState();
   migrateDisplayLimitDefaults();
   const source = document.getElementById('source');
+  document.getElementById('path').addEventListener('input', event => {
+    setSelectedPath(event.target.value);
+  });
+  document.getElementById('path').addEventListener('change', event => {
+    setSelectedPath(event.target.value);
+  });
   source.addEventListener('change', () => {
     invalidateProcessingPlanPreview();
     updateWorkflowVisibility();
@@ -3148,11 +4025,19 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
   updateWorkflowVisibility();
   checkRemoteStatus();
+  refreshQueue();
 });
 document.addEventListener('input', saveFormState);
 document.addEventListener('change', saveFormState);
+document.addEventListener('keydown', event => {
+  if (event.key !== 'Escape') return;
+  if (document.getElementById('reviewModal').style.display === 'flex') closeReviewModal();
+  if (document.getElementById('remoteModal').style.display === 'flex') closeRemoteModal();
+});
 
 setInterval(() => { if (state.pid) refreshStatus().catch(() => {}); }, 5000);
+setInterval(() => { refreshQueue().catch(() => {}); }, 5000);
+setInterval(() => { checkRemoteStatus().catch(() => {}); }, 10000);
 </script>
 </body>
 </html>""".replace(
@@ -3209,6 +4094,13 @@ class Handler(BaseHTTPRequestHandler):
                     "source_sha256": FRONTEND_SOURCE_SHA256,
                 }
             )
+        elif parsed.path.startswith("/api/review/media/"):
+            token = parsed.path.rsplit("/", 1)[-1]
+            media_path = review_media_path(token)
+            if media_path is None:
+                self.send_json({"error": "Review media token is invalid or expired"}, status=404)
+                return
+            self.send_media(media_path)
         else:
             self.send_json({"error": "Not found"}, status=404)
 
@@ -3241,6 +4133,57 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(run_status(self.read_json_body()))
             elif self.path == "/api/checkpoint/update":
                 self.send_json(update_checkpoint_segment(self.read_json_body()))
+            elif self.path == "/api/review/evidence":
+                self.send_json(build_review_evidence(self.read_json_body()))
+            elif self.path == "/api/queue/discover":
+                body = self.read_json_body()
+                episodes = discover_episode_files(str(body.get("path") or ""))
+                queued_paths = {
+                    os.path.normcase(str(item.get("path") or ""))
+                    for item in queue_store.snapshot().get("items", [])
+                    if item.get("status") in {"queued", "running"}
+                }
+                for episode in episodes:
+                    episode["already_queued"] = (
+                        os.path.normcase(str(episode["path"])) in queued_paths
+                    )
+                self.send_json({"episodes": episodes, "count": len(episodes)})
+            elif self.path == "/api/queue/add":
+                body = self.read_json_body()
+                paths = body.get("paths")
+                base_payload = body.get("payload")
+                if not isinstance(paths, list) or not paths:
+                    raise RequestValidationError("至少选择一个剧集视频")
+                if not isinstance(base_payload, dict):
+                    raise RequestValidationError("队列处理参数无效")
+                queue_store.enqueue([str(path) for path in paths], base_payload)
+                if body.get("start"):
+                    queue_store.set_paused(False)
+                    ensure_queue_worker()
+                self.send_json(queue_store.snapshot())
+            elif self.path == "/api/queue/list":
+                snapshot = queue_store.snapshot()
+                summary = snapshot.get("summary") or {}
+                if not snapshot.get("paused") and (
+                    int(summary.get("queued") or 0) > 0
+                    or int(summary.get("running") or 0) > 0
+                ):
+                    ensure_queue_worker()
+                    snapshot = queue_store.snapshot()
+                self.send_json(snapshot)
+            elif self.path == "/api/queue/action":
+                body = self.read_json_body()
+                action = str(body.get("action") or "")
+                queue_store.action(
+                    action,
+                    str(body.get("id") or ""),
+                    int(body.get("direction") or 0),
+                )
+                if action in {"resume", "retry"}:
+                    if action == "resume":
+                        queue_store.set_paused(False)
+                    ensure_queue_worker()
+                self.send_json(queue_store.snapshot())
             elif self.path == "/api/remote/connect":
                 if not tunnel_manager:
                     self.send_json({"error": "paramiko not installed or ssh_tunnel not found"}, status=500)
@@ -3257,20 +4200,48 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 if success:
                     models = tunnel_manager.fetch_models()
+                    saved = settings_store.save_remote(body)
+                    saved_remote = saved.get("remote") if isinstance(saved, dict) else {}
                     connection_status = tunnel_manager.status()
-                    settings_store.save_remote(body)
-                    connection_status.update({"status": "connected", "models": models})
+                    connection_status.update(
+                        {
+                            "status": "connected",
+                            "models": models,
+                            "persistent_reconnect": False,
+                            "connection_owner": "frontend",
+                        }
+                    )
+                    if isinstance(saved_remote, dict) and remote_settings_support_restart(saved_remote):
+                        try:
+                            bridge_connection = ensure_remote_bridge(
+                                wait_for_connection=True,
+                                timeout=30,
+                                reload_config=True,
+                            )
+                            bridge_models = bridge_connection.get("models") or models
+                            bridge_connection.update(
+                                {
+                                    "status": "connected",
+                                    "models": bridge_models,
+                                    "persistent_reconnect": True,
+                                    "connection_owner": "bridge",
+                                }
+                            )
+                            connection_status = bridge_connection
+                            tunnel_manager.disconnect()
+                        except Exception as exc:
+                            connection_status["warning"] = (
+                                "SSH 已验证，但独立自动重连桥接仍在启动：" + str(exc)
+                            )
+                    elif str(body.get("auth_method") or "").casefold() == "password":
+                        connection_status["warning"] = (
+                            "未保存密码；当前连接可用，但关闭网页后不能自动恢复。"
+                        )
                     self.send_json(connection_status)
                 else:
                     self.send_json({"error": tunnel_manager.last_error}, status=400)
             elif self.path == "/api/remote/status":
-                if not tunnel_manager:
-                    self.send_json({"connected": False, "error": "Not installed"})
-                    return
-                st = tunnel_manager.status()
-                if st["connected"]:
-                    st["models"] = tunnel_manager.fetch_models()
-                self.send_json(st)
+                self.send_json(persistent_remote_status())
             else:
                 self.send_json({"error": "Not found"}, status=404)
         except RequestValidationError as exc:
@@ -3312,6 +4283,48 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def send_media(self, path: Path) -> None:
+        size = path.stat().st_size
+        start = 0
+        end = size - 1
+        status = 200
+        range_header = str(self.headers.get("Range") or "").strip()
+        if range_header.startswith("bytes="):
+            raw_start, _separator, raw_end = range_header[6:].partition("-")
+            try:
+                start = int(raw_start) if raw_start else 0
+                end = int(raw_end) if raw_end else size - 1
+            except ValueError:
+                self.send_error(416)
+                return
+            if start < 0 or start >= size or end < start:
+                self.send_error(416)
+                return
+            end = min(end, size - 1)
+            status = 206
+
+        content_length = end - start + 1
+        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        if path.suffix.casefold() == ".wav":
+            content_type = "audio/wav"
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "private, max-age=3600")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(content_length))
+        if status == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.end_headers()
+        remaining = content_length
+        with path.open("rb") as handle:
+            handle.seek(start)
+            while remaining > 0:
+                chunk = handle.read(min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
 
     def log_message(self, fmt: str, *args: Any) -> None:
         return

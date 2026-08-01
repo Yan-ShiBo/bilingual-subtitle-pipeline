@@ -51,7 +51,7 @@ function Test-TcpPort {
     }
 }
 
-foreach ($port in 8765..8775) {
+foreach ($port in 8765..8799) {
     $url = "http://127.0.0.1:$port"
     if (Test-TcpPort -HostName "127.0.0.1" -Port $port) {
         try {
@@ -78,7 +78,7 @@ foreach ($port in 8765..8775) {
 }
 
 if ($null -eq $selectedPort) {
-    throw "No free frontend port found in range 8765-8775."
+    throw "No free frontend port found in range 8765-8799."
 }
 
 $frontendUrl = "http://127.0.0.1:$selectedPort/"

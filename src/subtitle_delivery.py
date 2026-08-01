@@ -167,7 +167,11 @@ def validate_ass_rendering(
                 ":fontsdir='"
                 f"{_filter_path(font_directory, relative_to=working_directory)}'"
             )
-        video_filter = f"setpts=PTS+{midpoint:.6f}/TB,{ass_filter}"
+        # The 1 fps synthetic source has a one-second time base, so a
+        # fractional midpoint would otherwise be rounded back to zero.
+        video_filter = (
+            f"settb=AVTB,setpts=PTS+{midpoint:.6f}/TB,{ass_filter}"
+        )
         command = [
             ffmpeg,
             "-hide_banner",

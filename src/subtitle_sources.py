@@ -315,17 +315,24 @@ def build_sidecar_asset(
     language: str = "",
     likely_match: bool = False,
     score: int = 0,
+    text_authority: str = "authored",
 ) -> SubtitleAsset:
     resolved = path.expanduser().resolve()
     detected_language = normalize_language(language or infer_sidecar_language(resolved))
     codec = resolved.suffix.lower().lstrip(".")
     representation = representation_for(codec, "sidecar")
+    normalized_text_authority = str(text_authority or "authored").casefold()
+    if normalized_text_authority not in {"authored", "ocr", "unknown"}:
+        raise ValueError(
+            "Sidecar text authority must be authored, ocr, or unknown."
+        )
     descriptor = {
         "origin": "sidecar",
         "path": str(resolved),
         "size": resolved.stat().st_size if resolved.exists() else None,
         "mtime_ns": resolved.stat().st_mtime_ns if resolved.exists() else None,
         "video": str(video_path.resolve()),
+        "text_authority": normalized_text_authority,
     }
     return SubtitleAsset(
         asset_id=_stable_hash(descriptor, prefix="sidecar"),
@@ -336,7 +343,7 @@ def build_sidecar_asset(
         role=classify_role(resolved.stem),
         codec=codec,
         label=resolved.name,
-        text_authority="authored",
+        text_authority=normalized_text_authority,
         timing_authority="authored_unverified",
         path=str(resolved),
         exact_edition=bool(likely_match),

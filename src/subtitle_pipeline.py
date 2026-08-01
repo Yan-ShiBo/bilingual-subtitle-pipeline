@@ -498,7 +498,13 @@ def srt_time_to_seconds(value: str) -> float:
 
 def clean_text(text: str) -> str:
     text = html.unescape(text)
-    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"</?(?:i|b|u|s|font|span|c|v|ruby|rt)(?:[.\s][^>]*)?>",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
     text = re.sub(r"\{\\.*?\}", "", text)
     text = text.replace("\ufeff", "")
     text = re.sub(r"[ \t]+", " ", text)
@@ -1469,16 +1475,48 @@ def strong_overlap(first: SubtitleEvent, second: SubtitleEvent) -> bool:
     return overlap / shorter_duration >= 0.5
 
 
+def is_subtitle_credit_text(text: str) -> bool:
+    raw = clean_text(text)
+    if not raw or len(raw) > 96:
+        return False
+    compact = re.sub(r"\s+", "", raw)
+    if re.search(
+        r"(?:\u5b57\u5e55(?:\u5236\u4f5c|\u7ffb\u8bd1|\u6821\u5bf9|\u65f6\u95f4\u8f74|\u538b\u5236|\u542c\u8bd1|\u7ec4)|"
+        r"(?:\u7ffb\u8bd1|\u6821\u5bf9|\u65f6\u95f4\u8f74|\u538b\u5236|\u542c\u8bd1)[\uff1a:])",
+        compact,
+    ):
+        return True
+    lowered = raw.casefold()
+    return bool(
+        re.search(
+            r"\b(?:subtitles?|captions?)\s+(?:by|translated|synced|edited)\b",
+            lowered,
+        )
+        or re.search(
+            r"\b(?:translated|captioned|subtitled|synced)\s+by\b",
+            lowered,
+        )
+    )
+
+
 def join_subtitle_events(events: list[SubtitleEvent], language: str) -> SubtitleEvent:
     ordered = sorted(events, key=lambda event: (event.start, event.end))
     texts: list[str] = []
-    previous = ""
     for event in ordered:
         text = clean_text(event.text)
         normalized = re.sub(r"\s+", "", text).casefold()
-        if text and normalized != previous:
+        if not text:
+            continue
+        if not texts:
             texts.append(text)
-            previous = normalized
+            continue
+        previous_normalized = re.sub(r"\s+", "", texts[-1]).casefold()
+        if normalized == previous_normalized or normalized in previous_normalized:
+            continue
+        if previous_normalized in normalized:
+            texts[-1] = text
+            continue
+        texts.append(text)
     separator = "" if language == "zh" else " "
     confidences = [event.confidence for event in ordered if event.confidence is not None]
     event_metadata = [
@@ -1494,14 +1532,28 @@ def join_subtitle_events(events: list[SubtitleEvent], language: str) -> Subtitle
                 source_assets[str(asset["asset_id"])] = dict(asset)
     if source_assets:
         metadata["source_assets"] = list(source_assets.values())
+    authority_field = (
+        "chinese_text_authority"
+        if language == "zh"
+        else "source_text_authority"
+    )
     authorities = [
-        str(item.get("source_text_authority") or "")
+        str(
+            item.get(authority_field)
+            or item.get("source_text_authority")
+            or item.get("chinese_text_authority")
+            or ""
+        )
         for item in event_metadata
-        if item.get("source_text_authority")
+        if (
+            item.get(authority_field)
+            or item.get("source_text_authority")
+            or item.get("chinese_text_authority")
+        )
     ]
     if authorities:
         authority_rank = {"asr": 0, "ocr": 1, "unknown": 2, "authored": 3}
-        metadata["source_text_authority"] = min(
+        metadata[authority_field] = min(
             authorities,
             key=lambda value: authority_rank.get(value, 2),
         )
@@ -1521,13 +1573,356 @@ def join_subtitle_events(events: list[SubtitleEvent], language: str) -> Subtitle
             metadata[field_name] = values.pop()
     if any(bool(item.get("supplementary_source")) for item in event_metadata):
         metadata["supplementary_source"] = True
+    joined_text = clean_text(separator.join(texts))
+    if language == "zh":
+        seen_labels: set[str] = set()
+
+        def keep_first_label(match: re.Match[str]) -> str:
+            label = re.sub(r"\s+", " ", match.group(0)).strip()
+            key = re.sub(r"\s+", "", label).casefold()
+            if key in seen_labels:
+                return ""
+            seen_labels.add(key)
+            return label
+
+        joined_text = clean_text(
+            re.sub(r"\[[^\]]{1,160}\]", keep_first_label, joined_text)
+        )
     return SubtitleEvent(
         min(event.start for event in ordered),
         max(event.end for event in ordered),
-        clean_text(separator.join(texts)),
+        joined_text,
         min(confidences) if confidences else None,
         metadata or None,
     )
+
+
+def event_text_authority(event: SubtitleEvent) -> str:
+    if not isinstance(event.metadata, dict):
+        return "unknown"
+    return str(
+        event.metadata.get("source_text_authority")
+        or event.metadata.get("chinese_text_authority")
+        or "unknown"
+    )
+
+
+def collapse_rolling_authored_events(
+    events: list[SubtitleEvent],
+    *,
+    boundary_tolerance: float = 0.08,
+) -> list[SubtitleEvent]:
+    """Collapse cumulative subtitle frames into one appearance per text unit."""
+    output: list[SubtitleEvent] = []
+    recent_units: dict[str, tuple[int, float]] = {}
+    recent_labels: dict[str, tuple[int, float]] = {}
+    label_pattern = re.compile(r"\[[^\]]{1,160}\]", re.DOTALL)
+
+    def compact_key(value: str) -> str:
+        return re.sub(r"[\W_]+", "", value, flags=re.UNICODE).casefold()
+
+    def normalized_labels(value: str) -> list[str]:
+        labels: list[str] = []
+        seen: set[str] = set()
+        for match in label_pattern.finditer(value):
+            label = re.sub(r"\s+", " ", match.group(0)).strip()
+            key = compact_key(label)
+            if key and key not in seen:
+                labels.append(label)
+                seen.add(key)
+        return labels
+
+    for event in sorted(events, key=lambda item: (item.start, item.end)):
+        raw_text = clean_text(event.text)
+        if not raw_text:
+            continue
+        labels = normalized_labels(raw_text)
+        content_text = clean_text(label_pattern.sub("\n", raw_text))
+        units = [
+            clean_text(unit)
+            for unit in content_text.splitlines()
+            if clean_text(unit)
+        ]
+        duplicate_indices: list[int] = []
+        unique_units: list[str] = []
+        for unit in units:
+            key = compact_key(unit)
+            previous = recent_units.get(key)
+            if (
+                key
+                and previous is not None
+                and event.start <= previous[1] + boundary_tolerance
+            ):
+                duplicate_indices.append(previous[0])
+                continue
+            unique_units.append(unit)
+
+        if units and not unique_units and duplicate_indices:
+            target_index = max(duplicate_indices)
+            target = output[target_index]
+            existing_label_keys = {
+                compact_key(label)
+                for label in normalized_labels(target.text)
+            }
+            new_labels = [
+                label
+                for label in labels
+                if compact_key(label) not in existing_label_keys
+            ]
+            if new_labels:
+                target.text = clean_text(
+                    "\n".join([*new_labels, target.text])
+                )
+            target.end = max(target.end, event.end)
+            for unit in units:
+                key = compact_key(unit)
+                if key:
+                    recent_units[key] = (target_index, target.end)
+            for label in labels:
+                key = compact_key(label)
+                if key:
+                    recent_labels[key] = (target_index, target.end)
+            continue
+
+        if not units and labels and not sdh_cue_categories(raw_text):
+            candidate_indices = [
+                recent_labels[compact_key(label)][0]
+                for label in labels
+                if compact_key(label) in recent_labels
+                and event.start
+                <= recent_labels[compact_key(label)][1] + boundary_tolerance
+            ]
+            if candidate_indices:
+                target_index = max(candidate_indices)
+                target = output[target_index]
+                target.end = max(target.end, event.end)
+                for label in labels:
+                    key = compact_key(label)
+                    if key and key in recent_labels:
+                        recent_labels[key] = (target_index, target.end)
+                continue
+
+        kept_labels: list[str] = []
+        for label in labels:
+            key = compact_key(label)
+            previous = recent_labels.get(key)
+            if (
+                key
+                and previous is not None
+                and event.start <= previous[1] + boundary_tolerance
+            ):
+                continue
+            kept_labels.append(label)
+
+        parts = [*kept_labels, *unique_units]
+        if not parts:
+            if labels and sdh_cue_categories(raw_text):
+                parts = labels
+            else:
+                continue
+        item = SubtitleEvent(
+            event.start,
+            event.end,
+            clean_text("\n".join(parts)),
+            event.confidence,
+            dict(event.metadata) if isinstance(event.metadata, dict) else event.metadata,
+        )
+        output_index = len(output)
+        output.append(item)
+        for unit in unique_units:
+            key = compact_key(unit)
+            if key:
+                recent_units[key] = (output_index, item.end)
+        for label in kept_labels:
+            key = compact_key(label)
+            if key:
+                recent_labels[key] = (output_index, item.end)
+    return output
+
+
+def pair_ocr_events_to_authored_anchors(
+    ocr_events: list[SubtitleEvent],
+    authored_events: list[SubtitleEvent],
+) -> list[tuple[SubtitleEvent | None, SubtitleEvent | None]]:
+    authored_events = collapse_rolling_authored_events(authored_events)
+    pairs: list[tuple[SubtitleEvent | None, SubtitleEvent | None]] = []
+    reserved_ocr: set[int] = {
+        index
+        for index, event in enumerate(ocr_events)
+        if is_subtitle_credit_text(event.text)
+    }
+    reserved_authored: set[int] = {
+        index
+        for index, event in enumerate(authored_events)
+        if is_subtitle_credit_text(event.text)
+    }
+    cue_candidates: list[tuple[float, float, int, int]] = []
+    for ocr_index, ocr_event in enumerate(ocr_events):
+        categories = sdh_cue_categories(ocr_event.text)
+        if not categories:
+            continue
+        for authored_index, authored_event in enumerate(authored_events):
+            if not (categories & sdh_cue_categories(authored_event.text)):
+                continue
+            if not strong_overlap(ocr_event, authored_event):
+                continue
+            overlap = max(
+                0.0,
+                min(ocr_event.end, authored_event.end)
+                - max(ocr_event.start, authored_event.start),
+            )
+            shorter_duration = min(
+                max(0.01, ocr_event.end - ocr_event.start),
+                max(0.01, authored_event.end - authored_event.start),
+            )
+            cue_candidates.append(
+                (
+                    -(overlap / shorter_duration),
+                    -overlap,
+                    ocr_index,
+                    authored_index,
+                )
+            )
+    for _ratio, _overlap, ocr_index, authored_index in sorted(cue_candidates):
+        if ocr_index in reserved_ocr or authored_index in reserved_authored:
+            continue
+        reserved_ocr.add(ocr_index)
+        reserved_authored.add(authored_index)
+        pairs.append((ocr_events[ocr_index], authored_events[authored_index]))
+
+    eligible_ocr = [
+        index
+        for index, event in enumerate(ocr_events)
+        if index not in reserved_ocr
+        and not is_sdh_sound_cue(event.text)
+    ]
+    eligible_authored = [
+        index
+        for index, event in enumerate(authored_events)
+        if index not in reserved_authored
+        and not is_sdh_sound_cue(event.text)
+    ]
+    parent = {index: index for index in eligible_ocr}
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(first: int, second: int) -> None:
+        first_root = find(first)
+        second_root = find(second)
+        if first_root == second_root:
+            return
+        members = [
+            index
+            for index in eligible_ocr
+            if find(index) in {first_root, second_root}
+        ]
+        combined_start = min(ocr_events[index].start for index in members)
+        combined_end = max(ocr_events[index].end for index in members)
+        if combined_end - combined_start > 20.0:
+            return
+        parent[second_root] = first_root
+
+    for authored_index in eligible_authored:
+        anchor = authored_events[authored_index]
+        overlaps: list[tuple[float, int]] = []
+        for ocr_index in eligible_ocr:
+            event = ocr_events[ocr_index]
+            overlap = max(
+                0.0,
+                min(anchor.end, event.end) - max(anchor.start, event.start),
+            )
+            if overlap >= 0.2:
+                overlaps.append((overlap, ocr_index))
+        if len(overlaps) < 2:
+            continue
+        overlaps.sort(reverse=True)
+        strongest = overlaps[0][0]
+        selected = sorted(
+            index
+            for overlap, index in overlaps
+            if overlap >= strongest * 0.05
+        )
+        for first, second in zip(selected, selected[1:]):
+            if second != first + 1:
+                continue
+            union(first, second)
+
+    components_by_root: dict[int, list[int]] = {}
+    for index in eligible_ocr:
+        components_by_root.setdefault(find(index), []).append(index)
+    components = sorted(
+        components_by_root.values(),
+        key=lambda indices: min(ocr_events[index].start for index in indices),
+    )
+
+    authored_by_component: dict[int, list[int]] = {}
+    unassigned_authored: set[int] = set(eligible_authored)
+    for authored_index in eligible_authored:
+        anchor = authored_events[authored_index]
+        best: tuple[float, float, int] | None = None
+        for component_index, indices in enumerate(components):
+            overlap = sum(
+                max(
+                    0.0,
+                    min(anchor.end, ocr_events[index].end)
+                    - max(anchor.start, ocr_events[index].start),
+                )
+                for index in indices
+            )
+            component_start = min(ocr_events[index].start for index in indices)
+            component_end = max(ocr_events[index].end for index in indices)
+            gap = max(component_start - anchor.end, anchor.start - component_end, 0.0)
+            if overlap <= 0.0 and gap > 0.75:
+                continue
+            score = overlap * 10.0 - gap
+            center_distance = abs(
+                (anchor.start + anchor.end) / 2
+                - (component_start + component_end) / 2
+            )
+            candidate = (score, -center_distance, component_index)
+            if best is None or candidate > best:
+                best = candidate
+        if best is not None:
+            component_index = best[2]
+            authored_by_component.setdefault(component_index, []).append(authored_index)
+            unassigned_authored.discard(authored_index)
+
+    for component_index, indices in enumerate(components):
+        ocr_event = join_subtitle_events(
+            [ocr_events[index] for index in indices],
+            "en",
+        )
+        anchor_indices = authored_by_component.get(component_index, [])
+        authored_event = (
+            join_subtitle_events(
+                [authored_events[index] for index in anchor_indices],
+                "zh",
+            )
+            if anchor_indices
+            else None
+        )
+        pairs.append((ocr_event, authored_event))
+
+    paired_ocr = set(eligible_ocr) | reserved_ocr
+    for index, event in enumerate(ocr_events):
+        if index not in paired_ocr:
+            pairs.append((event, None))
+    paired_authored = (set(eligible_authored) - unassigned_authored) | reserved_authored
+    for index, event in enumerate(authored_events):
+        if index not in paired_authored:
+            pairs.append((None, event))
+    for index in sorted(reserved_ocr):
+        if is_subtitle_credit_text(ocr_events[index].text):
+            pairs.append((ocr_events[index], None))
+    for index in sorted(reserved_authored):
+        if is_subtitle_credit_text(authored_events[index].text):
+            pairs.append((None, authored_events[index]))
+    pairs.sort(key=lambda item: min(event.start for event in item if event is not None))
+    return pairs
 
 
 def pair_ambiguous_component(
@@ -1576,10 +1971,121 @@ def pair_ambiguous_component(
     return pairs
 
 
+def rebalance_fragment_pairs(
+    pairs: list[tuple[SubtitleEvent | None, SubtitleEvent | None]],
+) -> list[tuple[SubtitleEvent | None, SubtitleEvent | None]]:
+    working = sorted(
+        pairs,
+        key=lambda item: min(event.start for event in item if event is not None),
+    )
+    while True:
+        merged_fragment = False
+        for index, (en_event, zh_event) in enumerate(working):
+            if en_event is None or zh_event is None:
+                continue
+            if is_subtitle_credit_text(en_event.text) or is_subtitle_credit_text(zh_event.text):
+                continue
+            if is_sdh_sound_cue(en_event.text) or is_sdh_sound_cue(zh_event.text):
+                continue
+
+            en_duration = max(0.01, en_event.end - en_event.start)
+            zh_duration = max(0.01, zh_event.end - zh_event.start)
+            if en_duration <= 1.0 and zh_duration >= max(1.5, en_duration * 2.0):
+                fragment_lane = 0
+                covering_event = zh_event
+            elif zh_duration <= 1.0 and en_duration >= max(1.5, zh_duration * 2.0):
+                fragment_lane = 1
+                covering_event = en_event
+            else:
+                continue
+
+            candidates: list[tuple[float, int]] = []
+            for neighbor_index in (index - 1, index + 1):
+                if neighbor_index < 0 or neighbor_index >= len(working):
+                    continue
+                neighbor = working[neighbor_index]
+                lane_event = neighbor[fragment_lane]
+                if lane_event is None:
+                    continue
+                if any(
+                    event is not None
+                    and (
+                        is_subtitle_credit_text(event.text)
+                        or is_sdh_sound_cue(event.text)
+                    )
+                    for event in neighbor
+                ):
+                    continue
+                overlap = max(
+                    0.0,
+                    min(covering_event.end, lane_event.end)
+                    - max(covering_event.start, lane_event.start),
+                )
+                if overlap > 0.05:
+                    candidates.append((overlap, neighbor_index))
+            if not candidates:
+                continue
+
+            selected = {index}
+            for _overlap, neighbor_index in sorted(candidates, reverse=True):
+                proposed = selected | {neighbor_index}
+                proposed_events = [
+                    event
+                    for pair_index in proposed
+                    for event in working[pair_index]
+                    if event is not None
+                ]
+                span = max(event.end for event in proposed_events) - min(
+                    event.start for event in proposed_events
+                )
+                if span <= 20.0:
+                    selected = proposed
+            if len(selected) == 1:
+                continue
+
+            first = min(selected)
+            last = max(selected)
+            selected_pairs = working[first : last + 1]
+            english_events = [event for event, _ in selected_pairs if event is not None]
+            chinese_events = [event for _, event in selected_pairs if event is not None]
+            replacement = (
+                join_subtitle_events(english_events, "en") if english_events else None,
+                join_subtitle_events(chinese_events, "zh") if chinese_events else None,
+            )
+            working[first : last + 1] = [replacement]
+            merged_fragment = True
+            break
+        if not merged_fragment:
+            return working
+
+
 def pair_events(en_events: list[SubtitleEvent], zh_events: list[SubtitleEvent]) -> list[tuple[SubtitleEvent | None, SubtitleEvent | None]]:
+    en_authorities = {
+        event_text_authority(event)
+        for event in en_events
+        if not is_subtitle_credit_text(event.text)
+    }
+    zh_authorities = {
+        event_text_authority(event)
+        for event in zh_events
+        if not is_subtitle_credit_text(event.text)
+    }
+    if en_authorities == {"ocr"} and zh_authorities == {"authored"}:
+        return rebalance_fragment_pairs(
+            pair_ocr_events_to_authored_anchors(en_events, zh_events)
+        )
+
     paired: list[tuple[SubtitleEvent | None, SubtitleEvent | None]] = []
     used_en: set[int] = set()
     used_zh: set[int] = set()
+    for en_idx, en in enumerate(en_events):
+        if is_subtitle_credit_text(en.text):
+            used_en.add(en_idx)
+            paired.append((en, None))
+    for zh_idx, zh in enumerate(zh_events):
+        if is_subtitle_credit_text(zh.text):
+            used_zh.add(zh_idx)
+            paired.append((None, zh))
     cue_candidates: list[tuple[float, float, float, int, int]] = []
     for en_idx, en in enumerate(en_events):
         en_categories = sdh_cue_categories(en.text)
@@ -1699,7 +2205,7 @@ def pair_events(en_events: list[SubtitleEvent], zh_events: list[SubtitleEvent]) 
         if idx not in used_zh:
             paired.append((None, zh))
     paired.sort(key=lambda item: min(e.start for e in item if e is not None))
-    return paired
+    return rebalance_fragment_pairs(paired)
 
 
 def ass_escape(text: str) -> str:

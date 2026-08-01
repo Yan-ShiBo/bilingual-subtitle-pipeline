@@ -421,6 +421,44 @@ class SubtitleSourcePlanningTests(unittest.TestCase):
         self.assertEqual(tracks.english_asset.role, "sdh")
         self.assertEqual(tracks.english[0]["text"], "(MUSIC PLAYING)")
 
+    def test_explicit_ocr_sidecar_cleans_trailing_zero_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video = root / "film.mkv"
+            english = root / "film.en.srt"
+            chinese = root / "film.zh.srt"
+            video.write_bytes(b"video")
+            english.write_text(
+                "1\n00:00:01,000 --> 00:00:02,000\nHello 0\n\n"
+                "2\n00:00:02,000 --> 00:00:03,000\n0\n",
+                encoding="utf-8",
+            )
+            chinese.write_text(
+                "1\n00:00:01,000 --> 00:00:02,000\n\u4f60\u597d\n",
+                encoding="utf-8",
+            )
+
+            tracks = audio_to_subtitle.find_existing_sidecar_subtitle_tracks(
+                video,
+                root,
+                explicit_zh_path=chinese,
+                explicit_en_path=english,
+                english_text_authority="ocr",
+            )
+            assert tracks is not None
+            merged = audio_to_subtitle.merge_existing_subtitle_segments(
+                tracks.english,
+                tracks.chinese,
+                tracks.source_label,
+                english_asset=tracks.english_asset,
+                chinese_asset=tracks.chinese_asset,
+            )
+
+        self.assertEqual(tracks.english_asset.text_authority, "ocr")
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["en"], "Hello")
+        self.assertEqual(merged[0]["zh"], "\u4f60\u597d")
+
     def test_cross_origin_merge_adds_sidecar_source_to_embedded_chinese(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
