@@ -148,8 +148,8 @@ class TaskArtifactTests(unittest.TestCase):
             )
             with patch.object(task_artifacts.subprocess, "Popen") as popen:
                 task_artifacts.open_in_file_manager(target)
+            self.assertTrue(target.samefile(out_dir / "Movie.bilingual.ass"))
 
-        self.assertEqual(target, out_dir / "Movie.bilingual.ass")
         popen.assert_called_once()
 
 
