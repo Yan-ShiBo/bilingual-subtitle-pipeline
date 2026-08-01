@@ -44,6 +44,7 @@ py-modules = [
   "remote_bridge_manager",
   "remote_ollama_bridge",
   "review_evidence",
+  "run_estimator",
   "scene_timing",
   "ssh_tunnel",
   "subtitle_delivery",
@@ -54,6 +55,7 @@ py-modules = [
   "subtitle_quality",
   "subtitle_sources",
   "subtitle_sync",
+  "task_artifacts",
 ]
 
 [tool.ruff]

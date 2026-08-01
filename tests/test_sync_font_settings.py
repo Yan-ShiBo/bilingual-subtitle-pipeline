@@ -207,7 +207,29 @@ class FrontendSettingsTests(unittest.TestCase):
 
             self.assertEqual(second.load()["form"]["source"], "embedded")
             self.assertEqual(second.load()["form"]["subtitleSync"], "auto")
-            self.assertEqual([item.name for item in path.parent.iterdir()], ["settings.json"])
+            self.assertEqual(
+                {item.name for item in path.parent.iterdir()},
+                {"settings.json", ".settings.json.lock"},
+            )
+
+    def test_form_update_preserves_remote_settings_under_shared_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "settings.json"
+            store = FrontendSettingsStore(path)
+            store.save_remote(
+                {
+                    "host": "10.12.96.203",
+                    "user": "csynth",
+                    "auth_method": "key",
+                    "remember_password": False,
+                }
+            )
+            store.save_form({"source": "embedded"})
+
+            loaded = FrontendSettingsStore(path).load()
+
+        self.assertEqual(loaded["remote"]["host"], "10.12.96.203")
+        self.assertEqual(loaded["form"]["source"], "embedded")
 
     @unittest.skipUnless(os.name == "nt", "Windows DPAPI test")
     def test_password_is_dpapi_protected_at_rest(self) -> None:

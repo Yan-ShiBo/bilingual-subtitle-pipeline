@@ -18,12 +18,13 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from ass_styles import STYLE_PROFILE_NAMES
+from ass_styles import STYLE_PROFILE_NAMES, probe_video_duration_seconds
 from frontend_settings import settings_store
 from output_paths import resolve_output_root
 from pipeline_policy import PROCESSING_POLICY_VERSION, TERMINOLOGY_POLICY_VERSION
 from remote_bridge_manager import bridge_status, ensure_remote_bridge
 from review_evidence import generate_review_evidence
+from run_estimator import estimate_run_workload
 from subtitle_queue import discover_episode_files, ensure_queue_worker, queue_store
 from subtitle_sources import (
     SubtitleAsset,
@@ -34,6 +35,12 @@ from subtitle_sources import (
     build_sidecar_asset,
 )
 from subtitle_sync import SUBTITLE_SYNC_MODES
+from task_artifacts import (
+    collect_task_artifacts,
+    discover_recent_tasks,
+    open_in_file_manager,
+    resolve_known_target,
+)
 
 try:
     import psutil
@@ -902,8 +909,12 @@ def checkpoint_info(
     source = out_dir / f"{movie_name}.segments.source.json"
     processing_plan = out_dir / f"{movie_name}.processing-plan.json"
     quality_report = out_dir / f"{movie_name}.quality-report.json"
+    style_guide = out_dir / f"{movie_name}.style-guide.json"
+    terminology_review = out_dir / f"{movie_name}.terminology-review.json"
+    final_qa = out_dir / f"{movie_name}.final-qa.json"
     info: Dict[str, Any] = {
         "output_dir": str(out_dir),
+        "output_dir_exists": out_dir.is_dir(),
         "checkpoint_path": str(checkpoint),
         "source_segments_path": str(source),
         "processing_plan_path": str(processing_plan),
@@ -920,6 +931,17 @@ def checkpoint_info(
         "quality_review_items": [],
         "quality_review_pending_count": 0,
         "manual_reviewed_count": 0,
+        "artifacts": [],
+        "artifact_count": 0,
+        "artifact_cache": {
+            "style_guide_exists": style_guide.exists(),
+            "terminology_review_exists": terminology_review.exists(),
+            "final_qa_exists": final_qa.exists(),
+            "autonomous_rounds_completed": sum(
+                (out_dir / f"{movie_name}.autonomous-review.round-{round_number}.json").exists()
+                for round_number in range(1, 4)
+            ),
+        },
     }
     checkpoint_items: List[Dict[str, Any]] = []
 
@@ -991,6 +1013,9 @@ def checkpoint_info(
             info["manual_review_pending"] = bool(report.get("manual_review_pending"))
         except Exception as exc:
             info["quality_report_error"] = str(exc)
+
+    info["artifacts"] = collect_task_artifacts(out_dir, movie_name)
+    info["artifact_count"] = len(info["artifacts"])
 
     return info
 
@@ -1156,6 +1181,7 @@ def analyze_input(payload: Dict[str, Any]) -> Dict[str, Any]:
             "selected_is_folder": selected.is_dir(),
             "video_path": str(video),
             "video_size_gb": round(video.stat().st_size / 1024 / 1024 / 1024, 2),
+            "video_duration_seconds": probe_video_duration_seconds(video),
             "output_root": str(output_root),
             "output_root_source": output_root_source,
             "series_name": series_name,
@@ -1178,6 +1204,56 @@ def analyze_input(payload: Dict[str, Any]) -> Dict[str, Any]:
         }
     )
     return info
+
+
+def estimate_workload_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+    operations = payload.get("operations")
+    artifact_cache = payload.get("artifact_cache")
+    return estimate_run_workload(
+        total_segments=payload.get("total_count"),
+        completed_segments=payload.get("completed_count"),
+        video_duration_seconds=payload.get("video_duration_seconds"),
+        batch_size=payload.get("batch_size"),
+        autonomous_review_rounds=payload.get("autonomous_review_rounds"),
+        llm_model=str(payload.get("llm_model") or ""),
+        run_mode=str(payload.get("run_mode") or "resume"),
+        operations=(operations if isinstance(operations, list) else []),
+        source_cache_reused=bool(payload.get("source_cache_reused")),
+        artifact_cache=(artifact_cache if isinstance(artifact_cache, dict) else {}),
+        checkpoint_compatible=payload.get("checkpoint_compatible"),
+    )
+
+
+def recent_tasks_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+    raw_root = str(payload.get("output_root") or "").strip()
+    output_root = Path(raw_root).expanduser() if raw_root else DEFAULT_OUTPUT_ROOT
+    try:
+        limit = int(payload.get("limit") or 20)
+    except (TypeError, ValueError) as exc:
+        raise RequestValidationError("最近任务数量必须是整数") from exc
+    tasks = discover_recent_tasks(output_root, limit=limit)
+    return {"output_root": str(output_root.resolve(strict=False)), "tasks": tasks}
+
+
+def open_artifact_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+    raw_root = str(payload.get("output_root") or "").strip()
+    output_root = Path(raw_root).expanduser() if raw_root else DEFAULT_OUTPUT_ROOT
+    series_name = str(payload.get("series_name") or "").strip()
+    movie_name = str(payload.get("movie_name") or "").strip()
+    artifact_key = str(payload.get("artifact_key") or "output_dir").strip()
+    try:
+        target = resolve_known_target(
+            output_root,
+            series_name,
+            movie_name,
+            artifact_key,
+        )
+    except ValueError as exc:
+        raise RequestValidationError(str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise RequestValidationError(str(exc), status=404) from exc
+    open_in_file_manager(target)
+    return {"opened": True, "artifact_key": artifact_key, "target": str(target)}
 
 
 def choose_file() -> str:
@@ -1825,7 +1901,7 @@ def html_page() -> str:
     .run-preflight-header h3 { margin: 0; font-size: 14px; }
     .preflight-state { color: #854d0e; font-size: 13px; font-weight: 600; }
     .preflight-state.ready { color: #1a6e35; }
-    .run-summary-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+    .run-summary-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
     .run-summary-item { min-width: 0; }
     .run-summary-item.output { grid-column: 1 / -1; }
     .run-summary-item span { display: block; color: #66717f; font-size: 12px; margin-bottom: 3px; }
@@ -1842,6 +1918,25 @@ def html_page() -> str:
     .compact-button { height: 30px; padding: 0 10px; white-space: nowrap; }
     .section-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
     .section-header h2 { margin: 0; }
+    .section-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    .artifact-name { max-width: 420px; overflow-wrap: anywhere; }
+    .artifact-kind { white-space: nowrap; font-weight: 600; }
+    #currentArtifacts table { min-width: 780px; table-layout: fixed; }
+    #currentArtifacts th:nth-child(1) { width: 104px; }
+    #currentArtifacts th:nth-child(2) { width: 360px; }
+    #currentArtifacts th:nth-child(3) { width: 78px; }
+    #currentArtifacts th:nth-child(4) { width: 150px; }
+    #currentArtifacts th:nth-child(5) { width: 68px; }
+    .recent-tasks { margin-top: 14px; padding-top: 12px; border-top: 1px solid #e5e7eb; }
+    .recent-tasks summary { width: fit-content; color: #1f6feb; font-size: 13px; cursor: pointer; user-select: none; }
+    .recent-tasks .table-scroll { margin-top: 10px; }
+    #recentTasks table { min-width: 850px; table-layout: fixed; }
+    #recentTasks th:nth-child(1) { width: 130px; }
+    #recentTasks th:nth-child(2) { width: 330px; }
+    #recentTasks th:nth-child(3) { width: 88px; }
+    #recentTasks th:nth-child(4) { width: 58px; }
+    #recentTasks th:nth-child(5) { width: 150px; }
+    #recentTasks th:nth-child(6) { width: 90px; }
     .queue-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
     .queue-toolbar .muted { margin-left: auto; }
     .queue-discovery { margin-top: 14px; padding-top: 14px; border-top: 1px solid #e5e7eb; }
@@ -2270,6 +2365,7 @@ def html_page() -> str:
         <div class="run-summary-item"><span>字幕来源</span><b id="runSummarySource">等待分析</b></div>
         <div class="run-summary-item"><span>模型位置</span><b id="runSummaryModel">未选择</b></div>
         <div class="run-summary-item"><span>复核策略</span><b id="runSummaryReview">标准终审</b></div>
+        <div class="run-summary-item"><span>预计工作量</span><b id="runSummaryEstimate">等待分析</b></div>
         <div class="run-summary-item output"><span>输出位置</span><b id="runSummaryOutput">等待分析</b></div>
       </div>
       <p class="preflight-message" id="preflightMessage">请先分析视频，确认字幕轨、同步音轨和处理方案。</p>
@@ -2296,6 +2392,34 @@ def html_page() -> str:
     <div class="stage-line"></div>
     <div class="stage-step" id="step-3"><span class="dot"></span><span class="step-text">完成</span></div>
   </div>
+
+  <section id="artifactsSection" hidden>
+    <div class="section-header">
+      <div>
+        <h2>交付产物</h2>
+        <span class="muted" id="artifactSummary"></span>
+      </div>
+      <div class="section-actions">
+        <button class="secondary" id="openOutputBtn" onclick="openCurrentArtifact('output_dir')" hidden>打开输出目录</button>
+        <button class="secondary" onclick="refreshRecentTasks()">刷新任务</button>
+      </div>
+    </div>
+    <div class="table-scroll" id="currentArtifacts" hidden>
+      <table>
+        <thead><tr><th>类型</th><th>文件</th><th>大小</th><th>更新时间</th><th>操作</th></tr></thead>
+        <tbody id="artifactRows"></tbody>
+      </table>
+    </div>
+    <details class="recent-tasks" id="recentTasks" hidden>
+      <summary id="recentTasksSummary">最近任务</summary>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>系列</th><th>片名/集名</th><th>状态</th><th>产物</th><th>更新时间</th><th>操作</th></tr></thead>
+          <tbody id="recentTaskRows"></tbody>
+        </table>
+      </div>
+    </details>
+  </section>
 
   <section id="qualityReview" hidden>
     <h2>成片复核</h2>
@@ -2351,7 +2475,12 @@ const state = {
   reviewPayloadOverride: null,
   queue: null,
   discoveredEpisodes: [],
-  selectedPath: ''
+  selectedPath: '',
+  currentArtifacts: [],
+  artifactContext: null,
+  recentTasks: [],
+  estimateRequestKey: '',
+  estimateTimer: 0
 };
 let settingsSaveTimer = 0;
 document.getElementById('outputRoot').value = CONFIGURED_OUTPUT_ROOT;
@@ -2587,9 +2716,12 @@ function setSelectedPath(path) {
     clearLastAnalysis();
     state.pid = 0;
     state.reviewPayloadOverride = null;
+    state.currentArtifacts = [];
+    state.artifactContext = null;
     document.getElementById('seriesName').value = '';
     document.getElementById('movieName').value = '';
     resetAnalysisPresentation('已选择新视频，请重新分析字幕轨和处理方案。');
+    renderArtifactSection();
   }
   input.value = path;
   state.selectedPath = path;
@@ -2797,6 +2929,7 @@ async function analyze() {
     setLastAnalysis(data);
     updateRunControls(data);
     saveFormState();
+    await refreshRecentTasks();
     const outputNote = data.output_root_source === 'existing'
       ? `已找到已有输出：${data.output_root}`
       : `输出根目录：${data.output_root}`;
@@ -2871,6 +3004,7 @@ async function refreshStatus() {
   render(merged);
   setLastAnalysis(merged);
   document.getElementById('log').textContent = [data.stdout_tail || '', data.stderr_tail || ''].filter(Boolean).join('\n\n--- stderr ---\n');
+  if (!merged.running) await refreshRecentTasks();
 }
 
 function setAnalyzeBusy(isBusy) {
@@ -3014,6 +3148,114 @@ function qualityIssueLabel(value) {
     .map(item => QUALITY_ISSUE_LABELS[item.trim()] || item.trim())
     .filter(Boolean)
     .join('、');
+}
+
+function artifactSizeLabel(value) {
+  const bytes = Math.max(0, Number(value || 0));
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function artifactTimeLabel(value) {
+  const date = new Date(value || '');
+  return Number.isNaN(date.getTime())
+    ? '-'
+    : date.toLocaleString('zh-CN', {hour12: false});
+}
+
+function renderArtifactSection() {
+  const section = document.getElementById('artifactsSection');
+  const currentArtifacts = state.currentArtifacts || [];
+  const recentTasks = state.recentTasks || [];
+  const context = state.artifactContext;
+  const hasCurrentOutput = Boolean(context?.output_dir_exists || currentArtifacts.length);
+  section.hidden = !hasCurrentOutput && recentTasks.length === 0;
+  document.getElementById('openOutputBtn').hidden = !hasCurrentOutput;
+  document.getElementById('currentArtifacts').hidden = currentArtifacts.length === 0;
+  document.getElementById('artifactSummary').textContent = currentArtifacts.length
+    ? `${currentArtifacts.length} 个可用产物`
+    : (hasCurrentOutput ? '输出目录已创建，交付产物尚未生成' : '当前任务尚无产物');
+  document.getElementById('artifactRows').innerHTML = currentArtifacts.map(item => `
+    <tr>
+      <td class="artifact-kind">${escapeHtml(item.label || item.key)}</td>
+      <td class="artifact-name">${escapeHtml(item.name || '')}</td>
+      <td>${escapeHtml(artifactSizeLabel(item.size_bytes))}</td>
+      <td>${escapeHtml(artifactTimeLabel(item.modified_at))}</td>
+      <td><button class="secondary compact-button" onclick="openCurrentArtifact('${escapeHtml(item.key)}')">定位</button></td>
+    </tr>
+  `).join('');
+
+  const recent = document.getElementById('recentTasks');
+  recent.hidden = recentTasks.length === 0;
+  document.getElementById('recentTasksSummary').textContent = `最近任务（${recentTasks.length}）`;
+  const statusLabels = {
+    running: '运行中', pass: '通过', review: '建议复核', fail: '未通过', partial: '未完成'
+  };
+  document.getElementById('recentTaskRows').innerHTML = recentTasks.map((item, index) => `
+    <tr>
+      <td>${escapeHtml(item.series_name || '')}</td>
+      <td class="artifact-name">${escapeHtml(item.movie_name || '')}</td>
+      <td>${escapeHtml(statusLabels[item.status] || item.status || '-')}</td>
+      <td>${escapeHtml(String(item.artifact_count || 0))}</td>
+      <td>${escapeHtml(artifactTimeLabel(item.updated_at))}</td>
+      <td><button class="secondary compact-button" onclick="openRecentTask(${index})">打开目录</button></td>
+    </tr>
+  `).join('');
+}
+
+function renderArtifacts(data) {
+  if (Array.isArray(data?.artifacts)) state.currentArtifacts = data.artifacts;
+  if (data?.output_root && data?.series_name && data?.movie_name) {
+    state.artifactContext = {
+      output_root: data.output_root,
+      series_name: data.series_name,
+      movie_name: data.movie_name,
+      output_dir_exists: Boolean(data.output_dir_exists)
+    };
+  }
+  renderArtifactSection();
+}
+
+async function openArtifactContext(context, artifactKey) {
+  if (!context) return;
+  try {
+    await api('/api/artifacts/open', {
+      output_root: context.output_root,
+      series_name: context.series_name,
+      movie_name: context.movie_name,
+      artifact_key: artifactKey
+    });
+    document.getElementById('log').textContent = artifactKey === 'output_dir'
+      ? '已在文件管理器中打开输出目录。'
+      : '已在文件管理器中定位产物。';
+  } catch (e) {
+    document.getElementById('log').textContent = `打开产物失败：${e.message}`;
+  }
+}
+
+function openCurrentArtifact(artifactKey) {
+  return openArtifactContext(state.artifactContext, artifactKey);
+}
+
+function openRecentTask(index) {
+  return openArtifactContext(state.recentTasks[index], 'output_dir');
+}
+
+async function refreshRecentTasks() {
+  const outputRoot = document.getElementById('outputRoot').value.trim();
+  if (!outputRoot) {
+    state.recentTasks = [];
+    renderArtifactSection();
+    return;
+  }
+  try {
+    const data = await api('/api/history/list', {output_root: outputRoot, limit: 20});
+    state.recentTasks = Array.isArray(data.tasks) ? data.tasks : [];
+  } catch (e) {
+    state.recentTasks = [];
+  }
+  renderArtifactSection();
 }
 
 function renderQualityReview(data) {
@@ -3250,6 +3492,75 @@ function runOutputLabel(analysis) {
   return [root.replace(/[\\/]+$/g, ''), series, movie].filter(Boolean).join(separator);
 }
 
+function selectedRunMode() {
+  return document.querySelector('input[name="runMode"]:checked')?.value || 'resume';
+}
+
+function estimateDurationLabel(minMinutes, maxMinutes) {
+  const low = Math.max(1, Number(minMinutes || 1));
+  const high = Math.max(low, Number(maxMinutes || low));
+  if (high < 60) return `${Math.ceil(low)}–${Math.ceil(high)} 分钟`;
+  if (low < 60) return `${Math.ceil(low)} 分钟–${(high / 60).toFixed(1)} 小时`;
+  return `${(low / 60).toFixed(1)}–${(high / 60).toFixed(1)} 小时`;
+}
+
+function renderRunEstimate(estimate) {
+  const element = document.getElementById('runSummaryEstimate');
+  if (!estimate?.available) {
+    element.textContent = '待取得字幕数量';
+    element.removeAttribute('title');
+    return;
+  }
+  const basis = estimate.segment_basis === 'duration'
+    ? `按片长估算 ${estimate.segment_count} 条`
+    : `${estimate.segment_count} 条字幕`;
+  const time = estimateDurationLabel(estimate.min_minutes, estimate.max_minutes);
+  element.textContent = `约 ${estimate.total_calls} 次调用 · ${time}`;
+  const calls = estimate.calls || {};
+  element.title = [
+    basis,
+    `首轮 ${calls.primary || 0}`,
+    `整片终审 ${calls.final_review || 0}`,
+    `夜间复核 ${calls.autonomous_review || 0}`,
+    '不含网络失败重试和低置信 OCR/ASR 的额外修复调用'
+  ].join('；');
+}
+
+function scheduleRunEstimate(delay = 120) {
+  const analysis = getMatchingAnalysis();
+  if (!analysis?.processing_plan) {
+    state.estimateRequestKey = '';
+    renderRunEstimate(null);
+    return;
+  }
+  const current = state.currentData || {};
+  const request = {
+    total_count: current.total_count ?? analysis.total_count,
+    completed_count: current.completed_count ?? analysis.completed_count ?? 0,
+    video_duration_seconds: current.video_duration_seconds ?? analysis.video_duration_seconds,
+    batch_size: Number(document.getElementById('batchSize').value || 5),
+    autonomous_review_rounds: document.getElementById('autonomousReview').checked ? 2 : 0,
+    llm_model: document.getElementById('llmModel').value,
+    run_mode: selectedRunMode(),
+    operations: analysis.processing_plan.operations || [],
+    source_cache_reused: Boolean(analysis.processing_plan.execution?.source_cache_reused),
+    artifact_cache: current.artifact_cache || analysis.artifact_cache || {},
+    checkpoint_compatible: current.checkpoint_compatible ?? analysis.checkpoint_compatible
+  };
+  const requestKey = JSON.stringify(request);
+  if (requestKey === state.estimateRequestKey) return;
+  state.estimateRequestKey = requestKey;
+  clearTimeout(state.estimateTimer);
+  state.estimateTimer = setTimeout(async () => {
+    try {
+      const estimate = await api('/api/estimate', request);
+      if (state.estimateRequestKey === requestKey) renderRunEstimate(estimate);
+    } catch (e) {
+      if (state.estimateRequestKey === requestKey) renderRunEstimate(null);
+    }
+  }, Math.max(0, Number(delay || 0)));
+}
+
 function runBlockReason() {
   if (state.analyzing) return '正在分析视频，请等待分析完成。';
   if (state.running || state.pid) return '任务正在运行。';
@@ -3347,6 +3658,7 @@ function updateRunControls(data = state.currentData) {
   preflightMessage.className = ready ? 'preflight-message ready' : 'preflight-message';
   runBtn.disabled = Boolean(state.running || state.analyzing || reason);
   runBtn.title = reason || '按以上设置启动任务';
+  scheduleRunEstimate();
 }
 
 function sourceAssetLabel(asset) {
@@ -3580,6 +3892,7 @@ function render(data) {
   }).join('');
   document.getElementById('preview').innerHTML = rows || '<tr><td colspan="4" class="muted">暂无 checkpoint 内容</td></tr>';
   renderQualityReview(data);
+  renderArtifacts(data);
   updateWorkflowVisibility();
   updateRunControls(data);
 }
@@ -3999,6 +4312,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('path').addEventListener('change', event => {
     setSelectedPath(event.target.value);
   });
+  document.getElementById('outputRoot').addEventListener('change', () => {
+    refreshRecentTasks();
+  });
   source.addEventListener('change', () => {
     invalidateProcessingPlanPreview();
     updateWorkflowVisibility();
@@ -4026,6 +4342,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   updateWorkflowVisibility();
   checkRemoteStatus();
   refreshQueue();
+  refreshRecentTasks();
 });
 document.addEventListener('input', saveFormState);
 document.addEventListener('change', saveFormState);
@@ -4123,6 +4440,12 @@ class Handler(BaseHTTPRequestHandler):
                 if "remote" in body:
                     settings_store.save_remote(body["remote"])
                 self.send_json(settings_store.load())
+            elif self.path == "/api/estimate":
+                self.send_json(estimate_workload_request(self.read_json_body()))
+            elif self.path == "/api/history/list":
+                self.send_json(recent_tasks_request(self.read_json_body()))
+            elif self.path == "/api/artifacts/open":
+                self.send_json(open_artifact_request(self.read_json_body()))
             elif self.path == "/api/analyze":
                 self.send_json(analyze_input(self.read_json_body()))
             elif self.path == "/api/start":

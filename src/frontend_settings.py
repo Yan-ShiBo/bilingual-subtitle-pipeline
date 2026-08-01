@@ -9,6 +9,8 @@ from ctypes import wintypes
 from pathlib import Path
 from typing import Any
 
+from process_lock import FileMutex
+
 
 SETTINGS_VERSION = 1
 MAX_FORM_FIELDS = 80
@@ -139,6 +141,7 @@ def _sanitize_remote(value: Any) -> dict[str, Any]:
 class FrontendSettingsStore:
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or default_settings_path()
+        self.lock_path = self.path.with_name(f".{self.path.name}.lock")
 
     def _read_raw(self) -> dict[str, Any]:
         if not self.path.exists():
@@ -165,7 +168,7 @@ class FrontendSettingsStore:
         finally:
             temporary.unlink(missing_ok=True)
 
-    def load(self) -> dict[str, Any]:
+    def _load_unlocked(self) -> dict[str, Any]:
         raw = self._read_raw()
         remote = _sanitize_remote(raw.get("remote"))
         protected_password = str(raw.get("protected_password") or "")
@@ -187,30 +190,36 @@ class FrontendSettingsStore:
             result["password_error"] = password_error
         return result
 
+    def load(self) -> dict[str, Any]:
+        with FileMutex(self.lock_path):
+            return self._load_unlocked()
+
     def save_form(self, form: Any) -> dict[str, Any]:
-        raw = self._read_raw()
-        raw["version"] = SETTINGS_VERSION
-        raw["form"] = _sanitize_form(form)
-        self._write_raw(raw)
-        return self.load()
+        with FileMutex(self.lock_path):
+            raw = self._read_raw()
+            raw["version"] = SETTINGS_VERSION
+            raw["form"] = _sanitize_form(form)
+            self._write_raw(raw)
+            return self._load_unlocked()
 
     def save_remote(self, remote: Any) -> dict[str, Any]:
         if not isinstance(remote, dict):
             raise ValueError("Remote settings must be an object")
-        raw = self._read_raw()
-        raw["version"] = SETTINGS_VERSION
-        raw["remote"] = _sanitize_remote(remote)
-        remember_password = (
-            str(remote.get("auth_method") or "").lower() == "password"
-            and bool(remote.get("remember_password"))
-        )
-        password = str(remote.get("password") or "")
-        if remember_password and password:
-            raw["protected_password"] = protect_password(password)
-        else:
-            raw.pop("protected_password", None)
-        self._write_raw(raw)
-        return self.load()
+        with FileMutex(self.lock_path):
+            raw = self._read_raw()
+            raw["version"] = SETTINGS_VERSION
+            raw["remote"] = _sanitize_remote(remote)
+            remember_password = (
+                str(remote.get("auth_method") or "").lower() == "password"
+                and bool(remote.get("remember_password"))
+            )
+            password = str(remote.get("password") or "")
+            if remember_password and password:
+                raw["protected_password"] = protect_password(password)
+            else:
+                raw.pop("protected_password", None)
+            self._write_raw(raw)
+            return self._load_unlocked()
 
 
 settings_store = FrontendSettingsStore()
