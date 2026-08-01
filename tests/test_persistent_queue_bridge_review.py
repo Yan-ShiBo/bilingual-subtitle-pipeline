@@ -123,6 +123,47 @@ class PersistentQueueTests(unittest.TestCase):
         self.assertEqual(payload["english_subtitle_file"], "C:/show/Episode 02.en.srt")
         self.assertEqual(payload["audio_stream"], 2)
 
+    def test_worker_distinguishes_reported_issues_from_review_samples(self) -> None:
+        with patch.object(subtitle_queue_worker, "queue_store") as store:
+            subtitle_queue_worker._finish_item(
+                "episode-1",
+                {
+                    "outcome": "success",
+                    "quality_status": "review",
+                    "quality_review_reported_count": 195,
+                    "quality_review_pending_count": 19,
+                    "quality_review_items": [{"check": "readability"}],
+                },
+            )
+
+        updates = store.update_item.call_args.kwargs
+        self.assertEqual(updates["quality_reported_count"], 195)
+        self.assertEqual(updates["review_pending_count"], 19)
+        self.assertEqual(
+            updates["stage"],
+            "已完成，质检发现 195 项（19 个代表样本待复核）",
+        )
+
+    def test_worker_reports_when_all_saved_samples_were_reviewed(self) -> None:
+        with patch.object(subtitle_queue_worker, "queue_store") as store:
+            subtitle_queue_worker._finish_item(
+                "episode-8",
+                {
+                    "outcome": "success",
+                    "quality_status": "review",
+                    "quality_review_reported_count": 174,
+                    "quality_review_reviewed_sample_count": 25,
+                    "quality_review_pending_count": 0,
+                },
+            )
+
+        updates = store.update_item.call_args.kwargs
+        self.assertEqual(updates["quality_reviewed_sample_count"], 25)
+        self.assertEqual(
+            updates["stage"],
+            "已完成，质检 174 项（25 个代表样本已复核）",
+        )
+
 
 class RemoteBridgeTests(unittest.TestCase):
     def test_remote_fingerprint_records_availability_not_password(self) -> None:

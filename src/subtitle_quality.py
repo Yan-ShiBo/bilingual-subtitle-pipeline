@@ -10,9 +10,10 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from ass_styles import ResolvedAssStyle, resolve_ass_style
+from review_workload import review_item_severity
 
 
-QUALITY_REPORT_VERSION = 2
+QUALITY_REPORT_VERSION = 3
 MAX_REPORT_SAMPLES = 20
 MIN_REVIEW_DURATION_SECONDS = 5 / 6
 ASS_OVERRIDE_RE = re.compile(r"\{[^}]*\}")
@@ -221,8 +222,6 @@ def _sample(
     segment: dict[str, Any],
     **values: Any,
 ) -> None:
-    if len(samples) >= MAX_REPORT_SAMPLES:
-        return
     samples.append(
         {
             "id": segment.get("id"),
@@ -236,6 +235,69 @@ def _sample(
             **values,
         }
     )
+
+
+def _representative_samples(
+    samples: list[dict[str, Any]],
+    check: str,
+    *,
+    status: str = "review",
+) -> list[dict[str, Any]]:
+    if len(samples) <= MAX_REPORT_SAMPLES:
+        return samples
+
+    ranked = sorted(
+        range(len(samples)),
+        key=lambda index: (
+            -review_item_severity(
+                {
+                    "check": check,
+                    "status": status,
+                    "issue": samples[index].get("issue")
+                    or samples[index].get("issues"),
+                    "details": samples[index],
+                }
+            )[1],
+            float(samples[index].get("start") or 0.0),
+            index,
+        ),
+    )
+    worst_count = math.ceil(MAX_REPORT_SAMPLES * 0.6)
+    selected = set(ranked[:worst_count])
+    timeline = sorted(
+        (index for index in ranked if index not in selected),
+        key=lambda index: (float(samples[index].get("start") or 0.0), index),
+    )
+    coverage_slots = MAX_REPORT_SAMPLES - len(selected)
+    if timeline and coverage_slots > 0:
+        for slot in range(coverage_slots):
+            position = min(
+                len(timeline) - 1,
+                math.floor((slot + 0.5) * len(timeline) / coverage_slots),
+            )
+            selected.add(timeline[position])
+    if len(selected) < MAX_REPORT_SAMPLES:
+        for index in ranked:
+            selected.add(index)
+            if len(selected) >= MAX_REPORT_SAMPLES:
+                break
+    chosen = list(selected)
+    chosen.sort(key=lambda index: (float(samples[index].get("start") or 0.0), index))
+    return [samples[index] for index in chosen]
+
+
+def _sample_fields(
+    samples: list[dict[str, Any]],
+    check: str,
+    *,
+    status: str = "review",
+) -> dict[str, Any]:
+    return {
+        "sample_count": len(samples),
+        "sample_limit": MAX_REPORT_SAMPLES,
+        "samples_truncated": len(samples) > MAX_REPORT_SAMPLES,
+        "samples": _representative_samples(samples, check, status=status),
+    }
 
 
 def _terminology_inconsistencies(
@@ -270,7 +332,7 @@ def _terminology_inconsistencies(
         for key, targets in targets_by_source.items()
         if len(targets) > 1
     ]
-    return len(samples), samples[:MAX_REPORT_SAMPLES]
+    return len(samples), samples
 
 
 def _uses_existing_subtitle_timing(
@@ -546,19 +608,18 @@ def _recognition_confidence_check(
 
         if issues:
             low_confidence_count += 1
-            if len(samples) < MAX_REPORT_SAMPLES:
-                samples.append(
-                    {
-                        "id": segment.get("id"),
-                        "start": round(float(segment.get("start") or 0.0), 3),
-                        "end": round(float(segment.get("end") or 0.0), 3),
-                        "issues": issues,
-                        "metrics": metrics,
-                        "text": _normalized_text(
-                            segment.get("text") or segment.get("en") or segment.get("zh")
-                        ),
-                    }
-                )
+            samples.append(
+                {
+                    "id": segment.get("id"),
+                    "start": round(float(segment.get("start") or 0.0), 3),
+                    "end": round(float(segment.get("end") or 0.0), 3),
+                    "issues": issues,
+                    "metrics": metrics,
+                    "text": _normalized_text(
+                        segment.get("text") or segment.get("en") or segment.get("zh")
+                    ),
+                }
+            )
     return {
         "status": "review" if low_confidence_count else (
             "pass" if assessed_count else "not_applicable"
@@ -573,7 +634,7 @@ def _recognition_confidence_check(
             "minimum_asr_word_probability": 0.35,
             "maximum_low_word_ratio": 0.25,
         },
-        "samples": samples,
+        **_sample_fields(samples, "recognition_confidence"),
     }
 
 
@@ -581,6 +642,7 @@ def _llm_artifact_check(
     artifact: dict[str, Any] | None,
     *,
     label: str,
+    check_name: str,
 ) -> dict[str, Any]:
     if not isinstance(artifact, dict):
         return {
@@ -588,7 +650,7 @@ def _llm_artifact_check(
             "review_items": 0,
             "result": "missing",
             "reasons": [],
-            "samples": [],
+            **_sample_fields([], check_name),
         }
     result = str(artifact.get("status") or "unknown").casefold()
     if result in {"skipped_short", "not_applicable"}:
@@ -597,7 +659,7 @@ def _llm_artifact_check(
             "review_items": 0,
             "result": result,
             "reasons": [str(artifact.get("reason") or "")],
-            "samples": [],
+            **_sample_fields([], check_name),
         }
     needs_review = result not in {"pass", "ready"}
     reasons: list[str] = []
@@ -611,7 +673,7 @@ def _llm_artifact_check(
         reasons.append(f"{rejected_count} subtitle events were rejected by validation.")
         needs_review = True
     for item in artifact.get("rejected_items") or []:
-        if not isinstance(item, dict) or len(samples) >= MAX_REPORT_SAMPLES:
+        if not isinstance(item, dict):
             continue
         samples.append(
             {
@@ -638,13 +700,13 @@ def _llm_artifact_check(
         reasons.append(f"{label} result requires review: {result}.")
     return {
         "status": "review" if needs_review else "pass",
-        "review_items": max(int(needs_review), len(samples)),
+        "review_items": max(int(needs_review), rejected_count, len(samples)),
         "result": result,
         "reviewed_count": int(artifact.get("reviewed_count") or 0),
         "changed_count": int(artifact.get("changed_count") or 0),
         "rejected_count": rejected_count,
         "reasons": reasons,
-        "samples": samples[:MAX_REPORT_SAMPLES],
+        **_sample_fields(samples, check_name),
     }
 
 
@@ -827,7 +889,7 @@ def build_quality_report(
             "reason": segment.get("display_guard_reason") or "",
             "text": _normalized_text(segment.get("text") or segment.get("en") or segment.get("zh")),
         }
-        for segment in guard_overrides[:MAX_REPORT_SAMPLES]
+        for segment in guard_overrides
     ]
     terminology_count, terminology_samples = _terminology_inconsistencies(processed_segments)
     existing_timing_source = _uses_existing_subtitle_timing(source_segments, source_kind)
@@ -862,14 +924,17 @@ def build_quality_report(
     movie_style = _llm_artifact_check(
         style_guide,
         label="Movie-wide style analysis",
+        check_name="movie_style",
     )
     independent_final_qa = _llm_artifact_check(
         final_qa_report,
         label="Independent final QA",
+        check_name="independent_final_qa",
     )
     delivery_render = _llm_artifact_check(
         render_validation,
         label="ASS delivery render validation",
+        check_name="delivery_render",
     )
     llm_review_items = int(movie_style["review_items"]) + int(
         independent_final_qa["review_items"]
@@ -926,7 +991,7 @@ def build_quality_report(
                 "status": "review" if pixel_overflow_count else "pass",
                 "overflow_count": pixel_overflow_count,
                 "max_width_ratio": round(max_width_ratio, 3),
-                "samples": pixel_samples,
+                **_sample_fields(pixel_samples, "pixel_width"),
             },
             "readability": {
                 "status": (
@@ -939,7 +1004,7 @@ def build_quality_report(
                 "chinese_over_target": chinese_over_cps,
                 "english_over_target": english_over_cps,
                 "east_asian_source_over_target": compact_source_over_cps,
-                "samples": cps_samples,
+                **_sample_fields(cps_samples, "readability"),
             },
             "timing": {
                 "status": "fail" if invalid_duration_count or overlap_count else (
@@ -950,7 +1015,11 @@ def build_quality_report(
                 "intentional_overlap_count": intentional_overlap_count,
                 "over_max_duration_count": over_duration_count,
                 "under_min_duration_count": under_min_duration_count,
-                "samples": timing_samples,
+                **_sample_fields(
+                    timing_samples,
+                    "timing",
+                    status="fail" if invalid_duration_count or overlap_count else "review",
+                ),
             },
             "completeness": {
                 "status": "fail" if empty_event_count else (
@@ -964,18 +1033,22 @@ def build_quality_report(
                 "missing_chinese_count": missing_chinese_count,
                 "invalid_chinese_target_count": invalid_chinese_target_count,
                 "english_contains_cjk_count": english_contains_cjk_count,
-                "samples": completeness_samples,
+                **_sample_fields(
+                    completeness_samples,
+                    "completeness",
+                    status="fail" if empty_event_count else "review",
+                ),
             },
             "model_display_guard": {
                 "status": "review" if guard_overrides else "pass",
                 "forced_visible_count": len(guard_overrides),
                 "accepted_hidden_count": len(accepted_model_hides),
-                "samples": guard_samples,
+                **_sample_fields(guard_samples, "model_display_guard"),
             },
             "terminology": {
                 "status": "review" if terminology_count else "pass",
                 "inconsistency_count": terminology_count,
-                "samples": terminology_samples,
+                **_sample_fields(terminology_samples, "terminology"),
             },
             "subtitle_sync": subtitle_sync,
             "source_completeness": source_completeness,

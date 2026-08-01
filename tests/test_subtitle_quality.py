@@ -136,6 +136,12 @@ class SubtitleQualityTests(unittest.TestCase):
         self.assertIn('<b id="qualityState">未生成</b>', page)
         self.assertIn("质检建议复核", page)
         self.assertIn('id="qualityReview"', page)
+        self.assertIn('id="qualityViewMode"', page)
+        self.assertIn('id="qualitySeverityFilter"', page)
+        self.assertIn('id="qualityGroupTable"', page)
+        self.assertIn('id="qualityReviewEmpty"', page)
+        self.assertIn("人工复核修改已保存到 checkpoint", page)
+        self.assertIn("当前没有未复核代表样本", page)
         self.assertIn("/api/checkpoint/update", page)
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -698,6 +704,91 @@ class SubtitleQualityTests(unittest.TestCase):
             check["samples"][0]["issue"],
             "source_language_changed",
         )
+
+    def test_quality_report_samples_worst_and_timeline_spread(self) -> None:
+        layout = build_layout_policy(
+            (1920, 1080),
+            profile_name="adaptive",
+            font_name="Arial",
+            font_scale=100,
+        )
+        segments = [
+            {
+                "id": index,
+                "start": float(index * 2),
+                "end": float(index * 2 + 1),
+                "text": "a" * (80 if index == 39 else 21),
+                "en": "a" * (80 if index == 39 else 21),
+                "zh": "好",
+                "display": True,
+            }
+            for index in range(40)
+        ]
+
+        report = build_quality_report(
+            segments,
+            segments,
+            segments,
+            layout,
+            max_duration=5.5,
+            target_chinese_cps=9.0,
+            target_english_cps=20.0,
+        )
+
+        readability = report["checks"]["readability"]
+        sampled_ids = [item["id"] for item in readability["samples"]]
+        self.assertEqual(readability["sample_count"], 40)
+        self.assertEqual(readability["sample_limit"], 20)
+        self.assertTrue(readability["samples_truncated"])
+        self.assertEqual(len(sampled_ids), 20)
+        self.assertIn(39, sampled_ids)
+        self.assertTrue(any(10 <= item_id <= 30 for item_id in sampled_ids))
+
+    def test_final_qa_review_count_is_not_capped_by_sample_limit(self) -> None:
+        layout = build_layout_policy(
+            (1920, 1080),
+            profile_name="adaptive",
+            font_name="Arial",
+            font_scale=100,
+        )
+        segment = {
+            "id": 0,
+            "start": 1.0,
+            "end": 3.0,
+            "text": "Hello",
+            "en": "Hello",
+            "zh": "你好",
+            "display": True,
+        }
+        rejected_items = [
+            {
+                "id": index,
+                "start": float(index),
+                "reason": "invalid_language_or_terminology",
+            }
+            for index in range(35)
+        ]
+
+        report = build_quality_report(
+            [segment],
+            [segment],
+            [segment],
+            layout,
+            max_duration=5.5,
+            target_chinese_cps=9.0,
+            target_english_cps=20.0,
+            final_qa_report={
+                "status": "review",
+                "rejected_count": 35,
+                "rejected_items": rejected_items,
+            },
+        )
+
+        check = report["checks"]["independent_final_qa"]
+        self.assertEqual(check["review_items"], 35)
+        self.assertEqual(check["sample_count"], 35)
+        self.assertTrue(check["samples_truncated"])
+        self.assertEqual(len(check["samples"]), 20)
 
     def test_japanese_source_track_is_split_and_not_reported_as_english_contamination(self) -> None:
         layout = build_layout_policy(

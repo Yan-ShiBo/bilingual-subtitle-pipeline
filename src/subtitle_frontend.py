@@ -24,6 +24,7 @@ from output_paths import resolve_output_root
 from pipeline_policy import PROCESSING_POLICY_VERSION, TERMINOLOGY_POLICY_VERSION
 from remote_bridge_manager import bridge_status, ensure_remote_bridge
 from review_evidence import generate_review_evidence
+from review_workload import build_review_workload
 from run_estimator import estimate_run_workload
 from subtitle_queue import discover_episode_files, ensure_queue_worker, queue_store
 from subtitle_sources import (
@@ -831,6 +832,8 @@ def build_review_evidence(payload: Dict[str, Any]) -> Dict[str, Any]:
 def flatten_quality_review_items(
     report: Dict[str, Any],
     checkpoint_items: List[Dict[str, Any]],
+    *,
+    include_manually_reviewed: bool = False,
 ) -> List[Dict[str, Any]]:
     segments_by_id = {
         str(item.get("id")): summarize_segment(item)
@@ -864,6 +867,7 @@ def flatten_quality_review_items(
                     "issue": normalized_reasons[0] if normalized_reasons else str(check_name),
                     "reasons": normalized_reasons,
                     "segment": None,
+                    "manual_reviewed": False,
                     "details": {
                         key: value
                         for key, value in check.items()
@@ -877,7 +881,8 @@ def flatten_quality_review_items(
                 continue
             segment_id = sample.get("checkpoint_segment_id", sample.get("id"))
             segment = segments_by_id.get(str(segment_id))
-            if segment and segment.get("manual_reviewed_at"):
+            manually_reviewed = bool(segment and segment.get("manual_reviewed_at"))
+            if manually_reviewed and not include_manually_reviewed:
                 continue
             issues = sample.get("issues")
             issue = sample.get("issue")
@@ -892,10 +897,11 @@ def flatten_quality_review_items(
                     "start": sample.get("start"),
                     "end": sample.get("end"),
                     "segment": segment,
+                    "manual_reviewed": manually_reviewed,
                     "details": sample,
                 }
             )
-    return review_items[:200]
+    return review_items
 
 
 def checkpoint_info(
@@ -929,7 +935,14 @@ def checkpoint_info(
         "preview": [],
         "checkpoint_compatible": None,
         "quality_review_items": [],
+        "quality_review_groups": [],
         "quality_review_pending_count": 0,
+        "quality_review_reported_count": 0,
+        "quality_review_input_sample_count": 0,
+        "quality_review_reviewed_sample_count": 0,
+        "quality_review_collapsed_sample_count": 0,
+        "quality_review_samples_truncated": False,
+        "manual_review_pending": False,
         "manual_reviewed_count": 0,
         "artifacts": [],
         "artifact_count": 0,
@@ -1003,12 +1016,41 @@ def checkpoint_info(
             info["quality_status"] = str(report.get("status") or "")
             info["quality_summary"] = report.get("summary") or {}
             info["quality_checks"] = report.get("checks") or {}
-            info["quality_review_items"] = flatten_quality_review_items(
+            report_review_items = flatten_quality_review_items(
                 report,
                 checkpoint_items,
+                include_manually_reviewed=True,
             )
-            info["quality_review_pending_count"] = len(
-                info["quality_review_items"]
+            manually_reviewed_count = sum(
+                bool(item.get("manual_reviewed")) for item in report_review_items
+            )
+            review_workload = build_review_workload(
+                item
+                for item in report_review_items
+                if not item.get("manual_reviewed")
+            )
+            info["quality_review_items"] = review_workload["items"]
+            info["quality_review_groups"] = review_workload["groups"]
+            info["quality_review_pending_count"] = review_workload[
+                "actionable_sample_count"
+            ]
+            info["quality_review_input_sample_count"] = len(report_review_items)
+            info["quality_review_reviewed_sample_count"] = manually_reviewed_count
+            info["quality_review_collapsed_sample_count"] = review_workload[
+                "collapsed_sample_count"
+            ]
+            reported_count = int(
+                (info["quality_summary"] or {}).get("review_items") or 0
+            )
+            info["quality_review_reported_count"] = reported_count
+            check_samples_truncated = any(
+                bool(check.get("samples_truncated"))
+                for check in (info["quality_checks"] or {}).values()
+                if isinstance(check, dict)
+            )
+            info["quality_review_samples_truncated"] = (
+                reported_count > len(report_review_items)
+                or check_samples_truncated
             )
             info["manual_review_pending"] = bool(report.get("manual_review_pending"))
         except Exception as exc:
@@ -1908,13 +1950,33 @@ def html_page() -> str:
     .run-summary-item b { display: block; font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
     .preflight-message { margin: 10px 0 0; color: #854d0e; font-size: 13px; line-height: 1.45; }
     .preflight-message.ready { color: #4f5a66; }
-    .quality-toolbar { display: flex; align-items: end; gap: 12px; margin-bottom: 10px; }
-    .quality-toolbar > div { width: min(320px, 100%); }
-    .quality-toolbar .muted { margin-left: auto; padding-bottom: 10px; }
+    .quality-toolbar { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: end; gap: 12px; margin-bottom: 10px; }
+    .quality-toolbar > div { min-width: 0; }
+    .quality-toolbar-summary { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
     .table-scroll { width: 100%; overflow-x: auto; }
     .quality-status { display: inline-block; min-width: 52px; font-weight: 600; }
     .quality-status.fail { color: #b42318; }
     .quality-status.review { color: #854d0e; }
+    .quality-severity { display: inline-block; min-width: 44px; font-weight: 700; white-space: nowrap; }
+    .quality-severity.critical { color: #b42318; }
+    .quality-severity.high { color: #9a6700; }
+    .quality-severity.medium { color: #1f6feb; }
+    .quality-severity.low { color: #66717f; }
+    .quality-root { font-weight: 600; }
+    #qualityGroupTable table { min-width: 920px; table-layout: fixed; }
+    #qualityGroupTable th:nth-child(1) { width: 78px; }
+    #qualityGroupTable th:nth-child(2) { width: 220px; }
+    #qualityGroupTable th:nth-child(3) { width: 88px; }
+    #qualityGroupTable th:nth-child(4) { width: 150px; }
+    #qualityGroupTable th:nth-child(5) { width: 300px; }
+    #qualityGroupTable th:nth-child(6) { width: 84px; }
+    #qualityItemTable table { min-width: 1050px; table-layout: fixed; }
+    #qualityItemTable th:nth-child(1) { width: 78px; }
+    #qualityItemTable th:nth-child(2) { width: 116px; }
+    #qualityItemTable th:nth-child(3) { width: 150px; }
+    #qualityItemTable th:nth-child(4) { width: 190px; }
+    #qualityItemTable th:nth-child(5) { width: 430px; }
+    #qualityItemTable th:nth-child(6) { width: 70px; }
     .compact-button { height: 30px; padding: 0 10px; white-space: nowrap; }
     .section-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
     .section-header h2 { margin: 0; }
@@ -1979,9 +2041,7 @@ def html_page() -> str:
       .stage-container { overflow-x: auto; padding: 14px; gap: 6px; }
       .stage-step { flex: 0 0 auto; white-space: nowrap; }
       .stage-line { min-width: 24px; margin: 0 6px; }
-      .quality-toolbar { align-items: stretch; flex-direction: column; }
-      .quality-toolbar > div { width: 100%; }
-      .quality-toolbar .muted { margin-left: 0; padding-bottom: 0; }
+      .quality-toolbar { grid-template-columns: 1fr 1fr; align-items: stretch; }
       .source-plan-header { align-items: flex-start; flex-direction: column; gap: 2px; }
       .source-plan-row { grid-template-columns: 1fr; gap: 3px; }
       .run-summary-grid { grid-template-columns: 1fr 1fr; }
@@ -2013,6 +2073,27 @@ def html_page() -> str:
       .review-context td[colspan] { display: block; }
       .review-context td[colspan]::before { content: none; }
       .run-summary-grid { grid-template-columns: 1fr; }
+      .quality-toolbar { grid-template-columns: 1fr; }
+      #qualityGroupTable,
+      #qualityItemTable { overflow: visible; }
+      #qualityGroupTable table,
+      #qualityGroupTable tbody,
+      #qualityItemTable table,
+      #qualityItemTable tbody { display: block; min-width: 0; width: 100%; }
+      #qualityGroupTable thead,
+      #qualityItemTable thead { display: none; }
+      #qualityGroupTable tr,
+      #qualityItemTable tr { display: grid; gap: 7px; padding: 10px 0; border-bottom: 1px solid #e5e7eb; }
+      #qualityGroupTable td,
+      #qualityItemTable td { display: grid; grid-template-columns: 82px minmax(0, 1fr); gap: 8px; padding: 0; white-space: normal; overflow-wrap: anywhere; }
+      #qualityGroupTable td::before,
+      #qualityItemTable td::before { content: attr(data-label); color: #66717f; font-weight: 600; }
+      #qualityGroupTable td[colspan],
+      #qualityItemTable td[colspan] { display: block; }
+      #qualityGroupTable td[colspan]::before,
+      #qualityItemTable td[colspan]::before { content: none; }
+      #qualityGroupTable td:last-child button,
+      #qualityItemTable td:last-child button { justify-self: start; }
       .episode-row { grid-template-columns: 28px minmax(0, 1fr) 64px; }
       .modal .actions { flex-wrap: wrap; }
       .modal .actions button { flex: 1; }
@@ -2092,8 +2173,8 @@ def html_page() -> str:
     </div>
     <p class="status-message error" id="reviewError" hidden></p>
     <div class="actions">
-      <button class="secondary" onclick="openAdjacentReview(-1)">上一条</button>
-      <button class="secondary" onclick="openAdjacentReview(1)">下一条</button>
+      <button class="secondary" id="reviewPreviousBtn" onclick="openAdjacentReview(-1)">上一条</button>
+      <button class="secondary" id="reviewNextBtn" onclick="openAdjacentReview(1)">下一条</button>
       <button class="secondary" onclick="closeReviewModal()">关闭</button>
       <button onclick="saveCheckpointReview()" id="reviewSaveBtn">保存复核</button>
     </div>
@@ -2424,17 +2505,44 @@ def html_page() -> str:
   <section id="qualityReview" hidden>
     <h2>成片复核</h2>
     <div class="quality-toolbar">
-      <div>
+      <div class="quality-filter-control">
+        <label for="qualityViewMode">查看方式</label>
+        <select id="qualityViewMode" onchange="changeQualityReviewView()">
+          <option value="groups" selected>按共同根因</option>
+          <option value="items">逐条查看</option>
+        </select>
+      </div>
+      <div class="quality-filter-control">
         <label for="qualityFilter">问题类型</label>
         <select id="qualityFilter" onchange="renderQualityReviewRows()">
           <option value="">全部问题</option>
         </select>
       </div>
-      <span class="muted" id="qualityReviewCount"></span>
+      <div class="quality-filter-control">
+        <label for="qualitySeverityFilter">优先级</label>
+        <select id="qualitySeverityFilter" onchange="renderQualityReviewRows()">
+          <option value="">全部优先级</option>
+          <option value="critical">阻断</option>
+          <option value="high">高</option>
+          <option value="medium">中</option>
+          <option value="low">低</option>
+        </select>
+      </div>
+      <div class="quality-toolbar-summary">
+        <span class="muted" id="qualityReviewCount"></span>
+        <button class="secondary compact-button" id="qualityBackToGroupsBtn" onclick="returnToQualityGroups()" hidden>返回根因分组</button>
+      </div>
     </div>
-    <div class="table-scroll">
+    <p class="muted" id="qualityReviewEmpty" hidden></p>
+    <div class="table-scroll" id="qualityGroupTable">
       <table>
-        <thead><tr><th>状态</th><th>检查</th><th>时间</th><th>问题</th><th>字幕</th><th>操作</th></tr></thead>
+        <thead><tr><th>优先级</th><th>共同根因</th><th>样本</th><th>时间分布</th><th>代表字幕</th><th>操作</th></tr></thead>
+        <tbody id="qualityGroupRows"></tbody>
+      </table>
+    </div>
+    <div class="table-scroll" id="qualityItemTable" hidden>
+      <table>
+        <thead><tr><th>优先级</th><th>检查</th><th>时间</th><th>问题</th><th>字幕</th><th>操作</th></tr></thead>
         <tbody id="qualityReviewRows"></tbody>
       </table>
     </div>
@@ -2471,6 +2579,10 @@ const state = {
   serverSettings: {form: {}, remote: {}},
   remoteStatus: {checked: false, connected: false, status: 'stopped', name: '', error: '', persistentReconnect: false},
   qualityReviewItems: [],
+  qualityReviewGroups: [],
+  qualityReviewMeta: {},
+  qualityReviewContextKey: '',
+  activeQualityGroupKey: '',
   currentReviewItem: null,
   reviewPayloadOverride: null,
   queue: null,
@@ -3139,7 +3251,17 @@ const QUALITY_ISSUE_LABELS = {
   low_word_confidence: '多个词识别不确定',
   chinese_cps: '中文阅读速度过快',
   english_cps: '英文阅读速度过快',
-  east_asian_source_cps: '源文阅读速度过快'
+  east_asian_source_cps: '源文阅读速度过快',
+  pixel_overflow: '字幕画面宽度溢出',
+  recognition_confidence: 'OCR/ASR 识别风险',
+  model_display_guard: '模型隐藏请求被保护规则拦截',
+  subtitle_sync: '字幕同步结果需确认',
+  source_completeness: '字幕源可能不完整',
+  movie_style: '整片风格分析需确认',
+  independent_final_qa: '独立终审需确认',
+  delivery_render: '成片渲染需确认',
+  source_language_changed: '终审试图改写源文',
+  invalid_language_or_terminology: '译文语言或术语不合规'
 };
 
 function qualityIssueLabel(value) {
@@ -3259,49 +3381,220 @@ async function refreshRecentTasks() {
 }
 
 function renderQualityReview(data) {
+  const previousHadGroups = state.qualityReviewGroups.length > 0;
+  const contextKey = [data.output_root || '', data.series_name || '', data.movie_name || ''].join('\u0000');
+  const contextChanged = contextKey !== state.qualityReviewContextKey;
   state.qualityReviewItems = Array.isArray(data.quality_review_items)
     ? data.quality_review_items
     : [];
+  state.qualityReviewGroups = Array.isArray(data.quality_review_groups)
+    ? data.quality_review_groups
+    : [];
+  state.qualityReviewMeta = {
+    reportedCount: Number(data.quality_review_reported_count || 0),
+    inputSampleCount: Number(data.quality_review_input_sample_count || state.qualityReviewItems.length),
+    reviewedSampleCount: Number(data.quality_review_reviewed_sample_count || 0),
+    actionableSampleCount: Number(data.quality_review_pending_count || state.qualityReviewItems.length),
+    collapsedSampleCount: Number(data.quality_review_collapsed_sample_count || 0),
+    samplesTruncated: Boolean(data.quality_review_samples_truncated),
+    manualReviewPending: Boolean(data.manual_review_pending)
+  };
+  state.qualityReviewContextKey = contextKey;
   const section = document.getElementById('qualityReview');
-  section.hidden = state.qualityReviewItems.length === 0;
+  section.hidden = state.qualityReviewItems.length === 0
+    && state.qualityReviewMeta.reviewedSampleCount === 0
+    && !(state.qualityReviewMeta.manualReviewPending && state.qualityReviewMeta.reportedCount > 0);
+  const noActionableSamples = state.qualityReviewItems.length === 0;
+  document.querySelectorAll('.quality-filter-control').forEach(control => {
+    control.hidden = noActionableSamples;
+  });
+  const emptyState = document.getElementById('qualityReviewEmpty');
+  emptyState.hidden = !noActionableSamples;
+  emptyState.textContent = state.qualityReviewMeta.manualReviewPending
+    ? '人工修改已保存，需继续任务刷新成片与质量报告。'
+    : '保存的代表样本均已人工复核，当前没有未复核代表样本。';
 
   const filter = document.getElementById('qualityFilter');
-  const selected = filter.value;
+  const selected = contextChanged ? '' : filter.value;
   const checks = [...new Set(state.qualityReviewItems.map(item => item.check).filter(Boolean))];
   filter.innerHTML = '<option value="">全部问题</option>' + checks.map(check =>
     `<option value="${escapeHtml(check)}">${escapeHtml(QUALITY_CHECK_LABELS[check] || check)}</option>`
   ).join('');
   filter.value = checks.includes(selected) ? selected : '';
+  if (contextChanged) {
+    state.activeQualityGroupKey = '';
+    document.getElementById('qualitySeverityFilter').value = '';
+  }
+  if (
+    state.activeQualityGroupKey
+    && !state.qualityReviewGroups.some(group => group.key === state.activeQualityGroupKey)
+  ) {
+    state.activeQualityGroupKey = '';
+    document.getElementById('qualityViewMode').value = 'groups';
+  }
+  if (!state.qualityReviewGroups.length) {
+    document.getElementById('qualityViewMode').value = 'items';
+  } else if (contextChanged || !previousHadGroups) {
+    state.activeQualityGroupKey = '';
+    document.getElementById('qualityViewMode').value = 'groups';
+  }
   renderQualityReviewRows();
 }
 
-function renderQualityReviewRows() {
+const QUALITY_SEVERITY_LABELS = {
+  critical: '阻断', high: '高', medium: '中', low: '低'
+};
+
+function qualitySeverityMarkup(severity) {
+  const normalized = QUALITY_SEVERITY_LABELS[severity] ? severity : 'medium';
+  return `<span class="quality-severity ${normalized}">${QUALITY_SEVERITY_LABELS[normalized]}</span>`;
+}
+
+function qualityItemText(item) {
+  const segment = item.segment;
+  return segment
+    ? [previewEnglishText(segment), segment.zh || ''].filter(Boolean).join(' / ')
+    : (item.details?.text || item.reasons?.join('；') || '-');
+}
+
+function qualityItemTime(item) {
+  const segment = item.segment;
+  const start = segment?.start ?? item.start ?? '';
+  const end = segment?.end ?? item.end ?? '';
+  return start === '' ? '-' : `${start} → ${end}`;
+}
+
+function qualityVisibleItemEntries() {
   const filter = document.getElementById('qualityFilter').value;
-  const rows = state.qualityReviewItems
+  const severity = document.getElementById('qualitySeverityFilter').value;
+  return state.qualityReviewItems
     .map((item, index) => ({item, index}))
-    .filter(entry => !filter || entry.item.check === filter);
-  document.getElementById('qualityReviewCount').textContent =
-    `${rows.length} 条待复核`;
+    .filter(entry => !filter || entry.item.check === filter)
+    .filter(entry => !severity || entry.item.severity === severity)
+    .filter(entry => !state.activeQualityGroupKey || entry.item.group_key === state.activeQualityGroupKey);
+}
+
+function qualityVisibleGroups() {
+  const filter = document.getElementById('qualityFilter').value;
+  const severity = document.getElementById('qualitySeverityFilter').value;
+  return state.qualityReviewGroups
+    .map((group, index) => ({group, index}))
+    .filter(entry => !filter || entry.group.check === filter)
+    .filter(entry => !severity || entry.group.severity === severity);
+}
+
+function qualityGroupRootLabel(group) {
+  const check = QUALITY_CHECK_LABELS[group.check] || group.check;
+  const issue = qualityIssueLabel(group.issue);
+  return !issue || issue === group.check ? check : `${check}：${issue}`;
+}
+
+function qualityGroupTimeLabel(group) {
+  const start = Number(group.first_start || 0);
+  const end = Number(group.last_start || start);
+  return Math.abs(end - start) < 0.001
+    ? formatReviewTime(start)
+    : `${formatReviewTime(start)} → ${formatReviewTime(end)}`;
+}
+
+function qualityReviewSummary(visibleCount, unit) {
+  const meta = state.qualityReviewMeta || {};
+  const parts = [];
+  if (meta.reportedCount) parts.push(`报告统计 ${meta.reportedCount} 项`);
+  if (meta.inputSampleCount) parts.push(`保存 ${meta.inputSampleCount} 个代表样本`);
+  if (meta.reviewedSampleCount) parts.push(`${meta.reviewedSampleCount} 个已人工复核`);
+  parts.push(`${meta.actionableSampleCount || 0} 个可操作样本`);
+  if (state.qualityReviewGroups.length || meta.actionableSampleCount) {
+    parts.push(`归为 ${state.qualityReviewGroups.length} 类根因`);
+  }
+  if (meta.collapsedSampleCount) parts.push(`折叠 ${meta.collapsedSampleCount} 个重复样本`);
+  if (meta.samplesTruncated) parts.push('报告仅保存代表样本');
+  if (meta.manualReviewPending && meta.actionableSampleCount === 0) {
+    parts.push('人工修改已保存，需继续任务刷新成片与报告');
+  } else if (meta.reviewedSampleCount && meta.actionableSampleCount === 0) {
+    parts.push('当前没有未复核代表样本');
+  }
+  if (visibleCount !== (unit === '组' ? state.qualityReviewGroups.length : state.qualityReviewItems.length)) {
+    parts.push(`当前显示 ${visibleCount} ${unit}`);
+  }
+  return parts.join('；');
+}
+
+function renderQualityGroupRows() {
+  const groups = qualityVisibleGroups();
+  document.getElementById('qualityReviewCount').textContent = qualityReviewSummary(groups.length, '组');
+  document.getElementById('qualityGroupRows').innerHTML = groups.map(({group, index}) => {
+    const representative = state.qualityReviewItems[group.representative_index] || {};
+    const collapsed = Number(group.collapsed_sample_count || 0);
+    const sampleLabel = collapsed
+      ? `${group.sample_count} 个，另折叠 ${collapsed} 个`
+      : `${group.sample_count} 个`;
+    return `<tr>
+      <td data-label="优先级">${qualitySeverityMarkup(group.severity)}</td>
+      <td data-label="共同根因" class="quality-root">${escapeHtml(qualityGroupRootLabel(group))}</td>
+      <td data-label="样本">${escapeHtml(sampleLabel)}</td>
+      <td data-label="时间分布">${escapeHtml(qualityGroupTimeLabel(group))}</td>
+      <td data-label="代表字幕">${escapeHtml(qualityItemText(representative))}</td>
+      <td data-label="操作"><button class="secondary compact-button" onclick="showQualityGroup(${index})">查看</button></td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="6" class="muted">当前筛选没有待复核根因</td></tr>';
+}
+
+function renderQualityItemRows() {
+  const rows = qualityVisibleItemEntries();
+  document.getElementById('qualityReviewCount').textContent = qualityReviewSummary(rows.length, '条');
   document.getElementById('qualityReviewRows').innerHTML = rows.map(({item, index}) => {
-    const segment = item.segment;
-    const start = segment?.start ?? item.start ?? '';
-    const end = segment?.end ?? item.end ?? '';
-    const time = start === '' ? '-' : `${start} → ${end}`;
-    const text = segment
-      ? [previewEnglishText(segment), segment.zh || ''].filter(Boolean).join(' / ')
-      : (item.details?.text || item.reasons?.join('；') || '-');
-    const action = segment
+    const action = item.segment
       ? `<button class="secondary compact-button" onclick="openQualityReview(${index})">复核</button>`
       : '<span class="muted">查看报告</span>';
     return `<tr>
-      <td><span class="quality-status ${escapeHtml(item.status)}">${item.status === 'fail' ? '未通过' : '复核'}</span></td>
-      <td>${escapeHtml(QUALITY_CHECK_LABELS[item.check] || item.check)}</td>
-      <td>${escapeHtml(time)}</td>
-      <td>${escapeHtml(qualityIssueLabel(item.issue))}</td>
-      <td>${escapeHtml(text)}</td>
-      <td>${action}</td>
+      <td data-label="优先级">${qualitySeverityMarkup(item.severity)}</td>
+      <td data-label="检查">${escapeHtml(QUALITY_CHECK_LABELS[item.check] || item.check)}</td>
+      <td data-label="时间">${escapeHtml(qualityItemTime(item))}</td>
+      <td data-label="问题">${escapeHtml(qualityIssueLabel(item.issue))}</td>
+      <td data-label="字幕">${escapeHtml(qualityItemText(item))}</td>
+      <td data-label="操作">${action}</td>
     </tr>`;
   }).join('') || '<tr><td colspan="6" class="muted">当前筛选没有待复核项目</td></tr>';
+}
+
+function renderQualityReviewRows() {
+  if (state.qualityReviewItems.length === 0) {
+    document.getElementById('qualityReviewCount').textContent = qualityReviewSummary(0, '条');
+    document.getElementById('qualityGroupTable').hidden = true;
+    document.getElementById('qualityItemTable').hidden = true;
+    document.getElementById('qualityBackToGroupsBtn').hidden = true;
+    return;
+  }
+  const grouped = document.getElementById('qualityViewMode').value === 'groups';
+  document.getElementById('qualityGroupTable').hidden = !grouped;
+  document.getElementById('qualityItemTable').hidden = grouped;
+  document.getElementById('qualityBackToGroupsBtn').hidden = !state.activeQualityGroupKey;
+  if (grouped) renderQualityGroupRows();
+  else renderQualityItemRows();
+}
+
+function showQualityGroup(groupIndex) {
+  const group = state.qualityReviewGroups[groupIndex];
+  if (!group) return;
+  state.activeQualityGroupKey = group.key;
+  document.getElementById('qualityFilter').value = group.check;
+  document.getElementById('qualitySeverityFilter').value = '';
+  document.getElementById('qualityViewMode').value = 'items';
+  renderQualityReviewRows();
+}
+
+function returnToQualityGroups() {
+  state.activeQualityGroupKey = '';
+  document.getElementById('qualityViewMode').value = 'groups';
+  renderQualityReviewRows();
+}
+
+function changeQualityReviewView() {
+  if (document.getElementById('qualityViewMode').value === 'groups') {
+    state.activeQualityGroupKey = '';
+  }
+  renderQualityReviewRows();
 }
 
 function formatReviewTime(value) {
@@ -3332,6 +3625,7 @@ async function openQualityReview(index) {
   if (!item?.segment) return;
   state.currentReviewItem = item;
   const segment = item.segment;
+  updateReviewNavigationButtons();
   document.getElementById('reviewIssue').textContent =
     `${QUALITY_CHECK_LABELS[item.check] || item.check}：${qualityIssueLabel(item.issue)}`;
   document.getElementById('reviewStart').value = segment.start ?? '';
@@ -3377,20 +3671,24 @@ async function openQualityReview(index) {
   }
 }
 
+function reviewNavigationEntries() {
+  return qualityVisibleItemEntries().filter(entry => entry.item?.segment);
+}
+
+function updateReviewNavigationButtons() {
+  const entries = reviewNavigationEntries();
+  const position = entries.findIndex(entry => entry.item === state.currentReviewItem);
+  document.getElementById('reviewPreviousBtn').disabled = position <= 0;
+  document.getElementById('reviewNextBtn').disabled = position < 0 || position >= entries.length - 1;
+}
+
 function openAdjacentReview(direction) {
   const current = state.currentReviewItem;
   if (!current) return;
-  const currentIndex = state.qualityReviewItems.indexOf(current);
-  for (
-    let index = currentIndex + Number(direction);
-    index >= 0 && index < state.qualityReviewItems.length;
-    index += Number(direction)
-  ) {
-    if (state.qualityReviewItems[index]?.segment) {
-      openQualityReview(index);
-      return;
-    }
-  }
+  const entries = reviewNavigationEntries();
+  const currentIndex = entries.findIndex(entry => entry.item === current);
+  const target = entries[currentIndex + Number(direction)];
+  if (target) openQualityReview(target.index);
 }
 
 function closeReviewModal() {
@@ -3839,6 +4137,12 @@ function render(data) {
     const reprocess = document.querySelector('input[name="runMode"][value="reprocess"]');
     const resume = document.querySelector('input[name="runMode"][value="resume"]');
     if (reprocess && resume?.checked) reprocess.checked = true;
+  } else if (!data.running && data.manual_review_pending) {
+    const pending = Number(data.quality_review_pending_count || 0);
+    const remaining = pending ? `，另有 ${pending} 个代表样本尚待复核` : '';
+    runMessage.textContent = `人工复核修改已保存到 checkpoint${remaining}。请使用“继续任务”重新生成成片并刷新质量报告。`;
+    runMessage.className = 'status-message';
+    runMessage.hidden = false;
   } else if (!data.running && data.quality_status === 'fail') {
     runMessage.textContent = `成片质检未通过。请先查看质检报告：${data.quality_report_path || ''}`;
     runMessage.className = 'status-message error';
@@ -3847,7 +4151,11 @@ function render(data) {
     const summary = data.quality_summary || {};
     const reviewItems = summary.review_items ?? 0;
     const hideOverrides = summary.model_hide_overrides ?? 0;
-    runMessage.textContent = `字幕已生成，质检建议复核 ${reviewItems} 项，其中模型误隐藏保护 ${hideOverrides} 项。`;
+    const pending = Number(data.quality_review_pending_count || 0);
+    const reviewed = Number(data.quality_review_reviewed_sample_count || 0);
+    runMessage.textContent = reviewed > 0 && pending === 0
+      ? `字幕已生成，报告统计 ${reviewItems} 项规则候选；保存的 ${reviewed} 个代表样本已人工复核，当前没有未复核代表样本。`
+      : `字幕已生成，质检建议复核 ${reviewItems} 项，其中模型误隐藏保护 ${hideOverrides} 项。`;
     runMessage.className = 'status-message';
     runMessage.hidden = false;
   } else {

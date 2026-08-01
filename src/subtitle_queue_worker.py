@@ -108,7 +108,22 @@ def _finish_item(item_id: str, status: dict[str, Any]) -> None:
     completed, total, percent = _progress(status)
     if outcome == "success":
         pending = int(status.get("quality_review_pending_count") or 0)
-        stage = "已完成" if pending == 0 else f"已完成，待复核 {pending} 项"
+        reported = int(status.get("quality_review_reported_count") or pending)
+        reviewed = int(status.get("quality_review_reviewed_sample_count") or 0)
+        quality_status = str(status.get("quality_status") or "")
+        manual_review_pending = bool(status.get("manual_review_pending"))
+        if manual_review_pending:
+            stage = "已完成，人工复核修改待重新生成"
+        elif pending == 0 and quality_status == "review" and reported > 0 and reviewed:
+            stage = f"已完成，质检 {reported} 项（{reviewed} 个代表样本已复核）"
+        elif pending == 0 and quality_status == "review" and reported > 0:
+            stage = f"已完成，质检报告仍建议复核 {reported} 项"
+        elif pending == 0:
+            stage = "已完成"
+        elif reported > pending:
+            stage = f"已完成，质检发现 {reported} 项（{pending} 个代表样本待复核）"
+        else:
+            stage = f"已完成，待复核 {pending} 项"
         queue_store.update_item(
             item_id,
             status="success",
@@ -116,8 +131,11 @@ def _finish_item(item_id: str, status: dict[str, Any]) -> None:
             progress_percent=100,
             completed_count=completed,
             total_count=total,
-            quality_status=str(status.get("quality_status") or ""),
+            quality_status=quality_status,
             review_pending_count=pending,
+            quality_reported_count=reported,
+            quality_reviewed_sample_count=reviewed,
+            manual_review_pending=manual_review_pending,
             quality_review_items=status.get("quality_review_items") or [],
             output_dir=str(status.get("output_dir") or ""),
             error="",
